@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { width: 280px; font-family: -apple-system, sans-serif; font-size: 13px; }
+    .header {
+      padding: 12px 16px;
+      background: #1a73e8;
+      color: white;
+    }
+    .header h3 { font-size: 14px; font-weight: 600; }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 6px;
+      font-size: 12px;
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+    }
+    .dot.connected { background: #4CAF50; }
+    .dot.connecting { background: #FF9800; animation: pulse 1s infinite; }
+    .dot.disconnected { background: #9E9E9E; }
+    @keyframes pulse { 50% { opacity: 0.4; } }
+    .retry-info {
+      font-size: 11px;
+      color: #999;
+      margin-top: 4px;
+      min-height: 16px;
+    }
+    .retry-info.error-text { color: #F44336; }
+    .retry-info.countdown-text { color: #FF9800; }
+
+    .config { padding: 12px 16px; }
+    .field { margin-bottom: 10px; }
+    .field label { display: block; font-size: 12px; color: #666; margin-bottom: 3px; }
+    .field input {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    .field input:focus { outline: none; border-color: #1a73e8; }
+    .btn-row { display: flex; gap: 6px; }
+    button {
+      flex: 1;
+      padding: 7px 12px;
+      border: none;
+      border-radius: 4px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn-primary { background: #1a73e8; color: white; }
+    .btn-primary:hover { background: #1557b0; }
+    .btn-secondary { background: #f1f3f4; color: #333; }
+    .btn-secondary:hover { background: #e8eaed; }
+    .link-row { text-align: center; margin-top: 8px; }
+    .link-row a {
+      font-size: 12px;
+      color: #1a73e8;
+      text-decoration: none;
+    }
+    .link-row a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h3>Chrome Do Action</h3>
+    <div class="status-row">
+      <span class="dot disconnected" id="statusDot"></span>
+      <span id="statusText">未连接</span>
+      <div class="retry-info" id="retryInfo"></div>
+    </div>
+  </div>
+  <div class="config">
+    <div class="field">
+      <label>节点名称</label>
+      <input type="text" id="nodeName" placeholder="如: my-mac" />
+    </div>
+    <div class="field">
+      <label>服务端地址</label>
+      <input type="text" id="serverUrl" placeholder="ws://192.168.1.100:8080" />
+    </div>
+    <div class="btn-row">
+      <button class="btn-primary" id="btnConnect">立即连接</button>
+      <button class="btn-secondary" id="btnDisconnect">断开</button>
+    </div>
+    <div class="link-row">
+      <a id="openOptions">打开配置页</a>
+    </div>
+  </div>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
