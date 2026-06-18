@@ -3,7 +3,7 @@
   "name": "Chrome Do Action",
   "version": "0.1.0",
   "description": "Remote control browser via WebSocket",
-  "permissions": ["storage", "alarms", "tabs", "tabGroups"],
+  "permissions": ["storage", "alarms", "tabs", "tabGroups", "scripting"],
   "action": {
     "default_popup": "popup/popup.html",
     "default_icon": {
