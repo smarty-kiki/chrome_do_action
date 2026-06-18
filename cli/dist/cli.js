@@ -12,19 +12,26 @@ Actions:
   list                                          List connected clients
   send <id> <cmd> [tab] [params]                Send command to a client
 
+Options:
+  --field <paths>        Comma-separated field paths to extract from response
+                         (e.g. --field "current.url,newTabs")
+                         Supported commands: click, get_page_info, open
+
 Page commands (require tab):
   click <tab> [params]        Click by selector, text, or {x,y}
+                              selector supports "css:..." and "xpath:..." prefixes
   type  <tab> {selector,text} Type text into input
   get_text   <tab> [selector] Get text content of element or page
-  get_title  <tab>            Get page title
-  get_html   <tab> [selector] Get rendered HTML
-  get_url    <tab>            Get current URL
-  scroll     <tab> {y}        Scroll page
+  get_page_info <tab> [--field ...] Get page info (url, title, iframes)
+  get_html   <tab> [selector] Get rendered HTML of element or page
+  get_js_errors <tab>         Get accumulated JS errors since page open
+  clear_js_errors <tab>       Clear accumulated JS errors
+  scroll     <tab> {y}        Scroll page (supports x for horizontal)
 
 Browser commands (no tab needed):
-  open <url>       Open URL in new tab
+  open <url>       Open URL in new tab (supports --field)
   list_tabs        List all tabs
-  close_tab <id>   Close tab (use "current" for active)
+  close_tab <id>   Close tab (use "current" for active, or numeric tabId)
 
 Examples:
   chrome-do-action --server ws://127.0.0.1:12345 list
@@ -32,8 +39,9 @@ Examples:
   chrome-do-action --server ws://127.0.0.1:12345 send abc list_tabs
   chrome-do-action --server ws://127.0.0.1:12345 send abc close_tab current
   chrome-do-action --server ws://127.0.0.1:12345 send abc close_tab 456
-  chrome-do-action --server ws://127.0.0.1:12345 send abc get_title current
+  chrome-do-action --server ws://127.0.0.1:12345 send abc get_page_info current
   chrome-do-action --server ws://127.0.0.1:12345 send abc click current '{"text":"登录"}'
+  chrome-do-action --server ws://127.0.0.1:12345 send abc click current --field "current.url,newTabs"
   chrome-do-action --server ws://127.0.0.1:12345 send abc scroll current '{"y":500}'`;
 function parseArgs(argv) {
     const raw = {};
@@ -62,7 +70,7 @@ function parseArgs(argv) {
         console.error("         chrome-do-action --help");
         process.exit(1);
     }
-    return { server, action: positional[0] || "", args: positional.slice(1) };
+    return { server, action: positional[0] || "", args: positional.slice(1), raw };
 }
 function stripQuotes(s) {
     if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith('"') && s.endsWith('"'))) {
@@ -83,9 +91,9 @@ function buildMessage(action, args) {
             console.error("Usage: chrome-do-action --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id>");
-            console.error("Page commands (tab required): click | type | get_text | get_title | get_html | get_url | scroll");
+            console.error("Page commands (tab required): click | type | get_text | get_html | get_page_info | get_js_errors | clear_js_errors | scroll");
             console.error("");
-            console.error("Example: chrome-do-action --server ws://127.0.0.1:12345 send abc123 get_title current");
+            console.error("Example: chrome-do-action --server ws://127.0.0.1:12345 send abc123 get_page_info current");
             process.exit(1);
         }
         if (BROWSER_CMDS.has(command)) {
@@ -139,12 +147,20 @@ function buildMessage(action, args) {
     process.exit(1);
 }
 // --- main ---
-const { server, action, args } = parseArgs(process.argv);
+const { server, action, args, raw } = parseArgs(process.argv);
 if (!action) {
     console.error("Error: no action specified. Use --help for usage.");
     process.exit(1);
 }
+const fields = raw.field ? raw.field.split(",").map(f => f.trim()).filter(Boolean) : [];
 const msg = buildMessage(action, args);
+// Inject _field into params so the browser extension can filter at the source
+if (fields.length > 0 && msg.type === "cli" && msg.payload?.action === "send") {
+    const sendPayload = msg.payload;
+    if (!sendPayload.params)
+        sendPayload.params = {};
+    sendPayload.params._field = fields;
+}
 const ws = new ws_1.default(server);
 ws.on("open", () => {
     ws.send(JSON.stringify(msg));
@@ -163,12 +179,10 @@ ws.on("message", (raw) => {
             const data = res.payload.data;
             if (data !== undefined && data !== null) {
                 if (Array.isArray(data)) {
-                    // list_tabs / list
                     if (data.length === 0) {
                         console.log("(empty)");
                     }
                     else if (typeof data[0] === "object" && "nodeId" in data[0]) {
-                        // list clients
                         for (const c of data) {
                             console.log(`${c.nodeId}  ${c.nodeName}  ${c.remoteAddr}  online ${c.uptime}s`);
                         }
