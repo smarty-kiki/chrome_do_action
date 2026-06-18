@@ -460,7 +460,7 @@
     if (groupId != null && groupWindowId === windowId) {
       try {
         await chrome.tabGroups.get(groupId);
-        return { groupId, windowId };
+        return groupId;
       } catch {
         groupId = null;
         groupWindowId = null;
@@ -470,12 +470,9 @@
     if (existing.length > 0) {
       groupId = existing[0].id;
       groupWindowId = windowId;
-      return { groupId, windowId };
+      return groupId;
     }
-    groupId = await chrome.tabs.group({ windowId });
-    groupWindowId = windowId;
-    await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: "grey" });
-    return { groupId, windowId };
+    return null;
   }
   async function cleanupGroupIfEmpty() {
     if (groupId == null || groupWindowId == null) return;
@@ -500,8 +497,14 @@
         case "open": {
           const url = params.url || "about:blank";
           const tab = await chrome.tabs.create({ url });
-          const { groupId: gid } = await getOrCreateGroup(tab.windowId);
-          await chrome.tabs.group({ tabIds: tab.id, groupId: gid });
+          const gid = await getOrCreateGroup(tab.windowId);
+          if (gid == null) {
+            groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+            groupWindowId = tab.windowId;
+            await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: "grey" });
+          } else {
+            await chrome.tabs.group({ tabIds: tab.id, groupId: gid });
+          }
           const fullInfo = await getFullPageInfo(tab.id);
           wsClient.send({
             type: "command_result",
