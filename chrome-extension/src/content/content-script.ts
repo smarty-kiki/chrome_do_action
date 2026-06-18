@@ -1,13 +1,53 @@
 chrome.runtime.onMessage.addListener(
   (msg: { type: string; id?: string; payload: { command: string; params?: Record<string, unknown> } },
     _sender: chrome.runtime.MessageSender,
-    sendResponse: (res: { success: boolean; data?: unknown; error?: string }) => void) => {
-    if (msg.type === "execute_command") {
-      handleCommand(msg.id!, msg.payload).then(sendResponse);
+    sendResponse: (res: { success: boolean; data?: unknown; error?: string; jsErrors?: JsError[] }) => void) => {
+    if (msg.type !== "execute_command") return;
+    const { command } = msg.payload;
+    const shouldCollect = command === "click" || command === "get_full_page_info";
+    const exec = () => handleCommand(msg.id!, msg.payload);
+    if (shouldCollect) {
+      collectErrors(exec).then(({ result, jsErrors }) => {
+        sendResponse({ ...result, jsErrors: jsErrors.length > 0 ? jsErrors : undefined });
+      });
+    } else {
+      exec().then(sendResponse);
     }
     return true;
   },
 );
+
+interface JsError {
+  message: string;
+  source: string;
+  lineno?: number;
+}
+
+function collectErrors<T>(fn: () => Promise<T>, windowMs = 5000): Promise<{ result: T; jsErrors: JsError[] }> {
+  const errors: JsError[] = [];
+
+  const onError = (ev: ErrorEvent) => {
+    errors.push({ message: ev.message, source: ev.filename, lineno: ev.lineno });
+  };
+  const onUnhandled = (ev: PromiseRejectionEvent) => {
+    const reason = ev.reason;
+    const msg = typeof reason === "string" ? reason : reason?.message ?? String(reason);
+    errors.push({ message: `Unhandled rejection: ${msg}`, source: "unhandledrejection" });
+  };
+
+  window.addEventListener("error", onError);
+  window.addEventListener("unhandledrejection", onUnhandled);
+
+  return fn().then((result) => {
+    return new Promise<{ result: T; jsErrors: JsError[] }>((resolve) => {
+      setTimeout(() => {
+        window.removeEventListener("error", onError);
+        window.removeEventListener("unhandledrejection", onUnhandled);
+        resolve({ result, jsErrors: errors });
+      }, windowMs);
+    });
+  });
+}
 
 async function handleCommand(
   _id: string,
@@ -84,6 +124,54 @@ async function handleCommand(
         const el = selector ? findElement(selector) : document.documentElement;
         if (!el) return { success: false, error: `Element not found: ${selector}` };
         return { success: true, data: (el as HTMLElement).outerHTML || el.textContent };
+      }
+
+      case "get_page_info":
+        return {
+          success: true,
+          data: {
+            url: window.location.href,
+            title: document.title,
+            html: document.documentElement.outerHTML,
+          },
+        };
+
+      case "get_full_page_info": {
+        const iframes: { index: number; src: string; sameOrigin: boolean; url?: string; html?: string }[] = [];
+        document.querySelectorAll("iframe").forEach((f, i) => {
+          const iframe = f as HTMLIFrameElement;
+          let sameOrigin = false;
+          let url: string | undefined;
+          let html: string | undefined;
+          try {
+            const doc = iframe.contentDocument;
+            if (doc) {
+              sameOrigin = true;
+              url = doc.location.href;
+              html = doc.documentElement.outerHTML;
+            }
+          } catch {
+            sameOrigin = false;
+          }
+          iframes.push({ index: i, src: iframe.src, sameOrigin, ...(sameOrigin ? { url, html } : {}) });
+        });
+        return {
+          success: true,
+          data: {
+            url: window.location.href,
+            title: document.title,
+            html: document.documentElement.outerHTML,
+            iframes,
+          },
+        };
+      }
+
+      case "get_iframes": {
+        const frames: { index: number; src: string }[] = [];
+        document.querySelectorAll("iframe").forEach((f, i) => {
+          frames.push({ index: i, src: (f as HTMLIFrameElement).src });
+        });
+        return { success: true, data: frames };
       }
 
       case "get_url":

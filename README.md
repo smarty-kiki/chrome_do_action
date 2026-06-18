@@ -86,13 +86,13 @@ chrome-do-action --server ws://127.0.0.1:12345 list
 ### 浏览器命令（无需指定标签页）
 
 ```bash
-# 打开新页面（等待加载完成后返回）
+# 打开新页面（加入 chrome_do_action 标签群组，等待加载完成后返回完整页面信息）
 chrome-do-action --server ws://127.0.0.1:12345 send <nodeId> open https://example.com
 
 # 列出所有标签页
 chrome-do-action --server ws://127.0.0.1:12345 send <nodeId> list_tabs
 
-# 关闭标签页
+# 关闭标签页（群组最后一个 tab 关闭时自动清除群组）
 chrome-do-action --server ws://127.0.0.1:12345 send <nodeId> close_tab current
 chrome-do-action --server ws://127.0.0.1:12345 send <nodeId> close_tab 456
 ```
@@ -126,10 +126,10 @@ chrome-do-action --server ws://127.0.0.1:12345 send <nodeId> scroll current '{"y
 
 | 命令 | 类型 | 说明 |
 |---|---|---|
-| `open <url>` | 浏览器 | 打开新标签页，等待加载完成 |
+| `open <url>` | 浏览器 | 打开新标签页（加入群组），等待加载完成，返回完整页面信息 |
 | `list_tabs` | 浏览器 | 列出所有标签页 |
 | `close_tab <id>` | 浏览器 | 关闭标签页，`current` 表示当前页 |
-| `click` | 页面 | 点击元素（selector / text / x,y） |
+| `click` | 页面 | 点击元素（selector / text / x,y），返回页面状态和 iframe 变化 |
 | `type` | 页面 | 输入文本（selector + text） |
 | `get_title` | 页面 | 获取页面标题 |
 | `get_url` | 页面 | 获取当前 URL |
@@ -137,30 +137,126 @@ chrome-do-action --server ws://127.0.0.1:12345 send <nodeId> scroll current '{"y
 | `get_html` | 页面 | 获取渲染后 HTML，可选 selector |
 | `scroll` | 页面 | 滚动页面，参数 `{y}` |
 
-## 协议
+## 返回格式
 
-服务端监听 WebSocket 连接，消息为 JSON 格式。
+### open
 
-### 浏览器 ↔ 服务端
+页面和所有 iframe 加载完成后返回。每个 iframe 标记是否同源，同源的 additionally 返回其内部 HTML。
 
-| 消息 | 方向 | 说明 |
+```json
+{
+  "url": "https://example.com",
+  "title": "Example Domain",
+  "html": "<!DOCTYPE html>...",
+  "iframes": [
+    {
+      "index": 0,
+      "src": "https://ads.example.com",
+      "sameOrigin": false
+    },
+    {
+      "index": 1,
+      "src": "/embedded",
+      "sameOrigin": true,
+      "url": "/embedded",
+      "html": "<html><body>...</body></html>"
+    }
+  ],
+  "jsErrors": [
+    { "message": "Failed to load resource", "source": "https://example.com/app.js", "lineno": 42 }
+  ]
+}
+```
+
+### click（不跳转）
+
+点击后返回点击描述 + 当前页面完整信息 + iframe 变化对比。
+
+```json
+{
+  "success": true,
+  "navigated": false,
+  "data": {
+    "selector": "#load-report",
+    "current": {
+      "url": "https://example.com",
+      "title": "Example",
+      "html": "<!DOCTYPE html>...",
+      "iframes": [...]
+    },
+    "iframeChanged": true,
+    "iframeChanges": [
+      {
+        "index": 1,
+        "srcChanged": false,
+        "htmlChanged": true,
+        "beforeSrc": "/report-old",
+        "afterSrc": "/report-new"
+      }
+    ],
+    "jsErrors": []
+  }
+}
+```
+
+### click（页面跳转）
+
+点击导致导航或打开新标签页时，等待页面加载完成后返回。包含原页面和新页面的完整信息。
+
+```json
+{
+  "success": true,
+  "navigated": true,
+  "data": {
+    "current": {
+      "url": "https://example.com/dashboard",
+      "title": "Dashboard",
+      "html": "...",
+      "iframes": [...]
+    },
+    "newTabs": [
+      {
+        "tabId": 456,
+        "url": "https://example.com/popped-up",
+        "title": "Popped Up",
+        "html": "...",
+        "iframes": [...]
+      }
+    ]
+  }
+}
+```
+
+### 其他页面命令（get_title、get_text、type、scroll 等）
+
+直接返回原始结果，不附带额外包装：
+
+```json
+// get_title → "Example Domain"
+// get_text  → "登录"
+// get_url   → "https://example.com"
+// type      → { "success": true }
+// scroll    → { "success": true, "data": { "scrollY": 500 } }
+```
+
+## iframe 字段说明
+
+| 字段 | 类型 | 说明 |
 |---|---|---|
-| `register` | 浏览器 → 服务端 | 注册，携带 `nodeName` |
-| `register_ack` | 服务端 → 浏览器 | 分配 `nodeId` |
-| `command` | 服务端 → 浏览器 | 下发执行指令 |
-| `command_result` | 浏览器 → 服务端 | 返回执行结果 |
-| `ping` / `pong` | 双向 | 心跳 |
+| `index` | number | iframe 在页面中的顺序索引 |
+| `src` | string | iframe 标签的 src 属性（始终存在） |
+| `sameOrigin` | boolean | 是否能读取 iframe 内部内容 |
+| `url` | string | iframe 内部最终 URL（仅 sameOrigin 时存在） |
+| `html` | string | iframe 内部完整 HTML（仅 sameOrigin 时存在） |
 
-### CLI ↔ 服务端
-
-| 消息 | 方向 | 说明 |
-|---|---|---|
-| `cli` | CLI → 服务端 | 发送指令（`list` / `send`） |
-| `cli_result` | 服务端 → CLI | 返回结果 |
+跨域 iframe 只返回 `src` 和 `sameOrigin: false`，不暴露内部内容。
 
 ## 行为特性
 
-- **点击等待导航**：点击后检测页面跳转，自动等待新页面加载完成后返回最终 URL 和标题
+- **标签群组**：`open` 打开的页面自动加入 `chrome_do_action` 标签群组，群组为空时自动清除
+- **点击等待导航**：点击后检测页面跳转，自动等待新页面加载完成后返回完整信息
+- **iframe 变化检测**：点击前后对比所有 iframe 的 `src` 和同源 HTML，标记 `srcChanged` / `htmlChanged`
+- **JS 错误收集**：`open` 和 `click` 命令收集执行期间页面产生的 JS 错误（`window.onerror` + `unhandledrejection`），错误仍正常冒泡到 DevTools
 - **滚动等待加载**：滚动后等待 DOM 稳定（MutationObserver），适用于 AJAX 分页加载场景
 - **标签页排队**：同一标签页的命令按顺序执行，不会并发
 - **断线重试**：浏览器扩展断线后每 15 秒一轮，每轮连续重试 3 次

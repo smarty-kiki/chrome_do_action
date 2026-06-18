@@ -3,12 +3,42 @@
   // src/content/content-script.ts
   chrome.runtime.onMessage.addListener(
     (msg, _sender, sendResponse) => {
-      if (msg.type === "execute_command") {
-        handleCommand(msg.id, msg.payload).then(sendResponse);
+      if (msg.type !== "execute_command") return;
+      const { command } = msg.payload;
+      const shouldCollect = command === "click" || command === "get_full_page_info";
+      const exec = () => handleCommand(msg.id, msg.payload);
+      if (shouldCollect) {
+        collectErrors(exec).then(({ result, jsErrors }) => {
+          sendResponse({ ...result, jsErrors: jsErrors.length > 0 ? jsErrors : void 0 });
+        });
+      } else {
+        exec().then(sendResponse);
       }
       return true;
     }
   );
+  function collectErrors(fn, windowMs = 5e3) {
+    const errors = [];
+    const onError = (ev) => {
+      errors.push({ message: ev.message, source: ev.filename, lineno: ev.lineno });
+    };
+    const onUnhandled = (ev) => {
+      const reason = ev.reason;
+      const msg = typeof reason === "string" ? reason : reason?.message ?? String(reason);
+      errors.push({ message: `Unhandled rejection: ${msg}`, source: "unhandledrejection" });
+    };
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onUnhandled);
+    return fn().then((result) => {
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          window.removeEventListener("error", onError);
+          window.removeEventListener("unhandledrejection", onUnhandled);
+          resolve({ result, jsErrors: errors });
+        }, windowMs);
+      });
+    });
+  }
   async function handleCommand(_id, payload) {
     const { command, params = {} } = payload;
     try {
@@ -77,6 +107,51 @@
           const el = selector ? findElement(selector) : document.documentElement;
           if (!el) return { success: false, error: `Element not found: ${selector}` };
           return { success: true, data: el.outerHTML || el.textContent };
+        }
+        case "get_page_info":
+          return {
+            success: true,
+            data: {
+              url: window.location.href,
+              title: document.title,
+              html: document.documentElement.outerHTML
+            }
+          };
+        case "get_full_page_info": {
+          const iframes = [];
+          document.querySelectorAll("iframe").forEach((f, i) => {
+            const iframe = f;
+            let sameOrigin = false;
+            let url;
+            let html;
+            try {
+              const doc = iframe.contentDocument;
+              if (doc) {
+                sameOrigin = true;
+                url = doc.location.href;
+                html = doc.documentElement.outerHTML;
+              }
+            } catch {
+              sameOrigin = false;
+            }
+            iframes.push({ index: i, src: iframe.src, sameOrigin, ...sameOrigin ? { url, html } : {} });
+          });
+          return {
+            success: true,
+            data: {
+              url: window.location.href,
+              title: document.title,
+              html: document.documentElement.outerHTML,
+              iframes
+            }
+          };
+        }
+        case "get_iframes": {
+          const frames = [];
+          document.querySelectorAll("iframe").forEach((f, i) => {
+            frames.push({ index: i, src: f.src });
+          });
+          return { success: true, data: frames };
         }
         case "get_url":
           return { success: true, data: window.location.href };

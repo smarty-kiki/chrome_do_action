@@ -189,6 +189,9 @@
     retryIntervalMs: 15e3
   });
   var BROWSER_COMMANDS = /* @__PURE__ */ new Set(["open", "list_tabs", "close_tab"]);
+  var GROUP_TITLE = "chrome_do_action";
+  var groupId = null;
+  var groupWindowId = null;
   var origConsoleError = console.error;
   console.error = (...args) => {
     const msg = args.join(" ");
@@ -222,7 +225,7 @@
     const params = { ...cmd.payload.params };
     delete params.tabId;
     if (tabId != null) {
-      sendToTab(tabId, cmd, params);
+      enqueueCommand(tabId, cmd, params);
     } else {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         const tid = tabs[0]?.id;
@@ -233,7 +236,7 @@
           });
           return;
         }
-        sendToTab(tid, cmd, params);
+        enqueueCommand(tid, cmd, params);
       });
     }
   });
@@ -266,7 +269,37 @@
       chrome.alarms.create("keepalive", { periodInMinutes: 15 / 60 });
     }
   }
-  function sendToTab(tabId, cmd, params) {
+  var tabQueues = /* @__PURE__ */ new Map();
+  function enqueueCommand(tabId, cmd, params) {
+    const entry = tabQueues.get(tabId) || [];
+    tabQueues.set(tabId, entry);
+    entry.push({ cmd, params });
+    if (entry.length === 1) {
+      dequeueNext(tabId);
+    }
+  }
+  function dequeueNext(tabId) {
+    const entry = tabQueues.get(tabId);
+    if (!entry || entry.length === 0) {
+      tabQueues.delete(tabId);
+      return;
+    }
+    const { cmd, params } = entry[0];
+    sendToTab(tabId, cmd, params, () => {
+      const e = tabQueues.get(tabId);
+      if (e) {
+        e.shift();
+        dequeueNext(tabId);
+      }
+    });
+  }
+  function sendToTab(tabId, cmd, params, onDone) {
+    const isClick = cmd.payload.command === "click";
+    const tabPromise = chrome.tabs.get(tabId);
+    const beforeTabsPromise = tabPromise.then(
+      (tab) => chrome.tabs.query({ windowId: tab.windowId })
+    );
+    const beforeFullInfoPromise = isClick ? getFullPageInfo(tabId) : Promise.resolve(null);
     chrome.tabs.sendMessage(tabId, {
       type: "execute_command",
       id: cmd.id,
@@ -282,50 +315,184 @@
             error: msg.includes("Receiving end does not exist") ? `Tab ${tabId}: no content script loaded (is it a chrome:// page or not fully loaded?)` : msg
           }
         });
+        onDone?.();
         return;
       }
-      wsClient.send({
-        type: "command_result",
-        payload: {
-          commandId: cmd.id,
-          success: response?.success ?? false,
-          data: response?.data,
-          error: response?.error
-        }
-      });
-      if (response?.navigated) {
+      const navigated = response?.navigated;
+      if (navigated) {
         try {
+          const [beforeTabs, currentTab] = await Promise.all([
+            beforeTabsPromise,
+            chrome.tabs.get(tabId)
+          ]);
+          const beforeIds = new Set(beforeTabs.map((t) => t.id));
           await waitForTabLoad(tabId);
-          const tab = await chrome.tabs.get(tabId);
+          const currentInfo = await getFullPageInfo(tabId);
+          const afterTabs = await chrome.tabs.query({ windowId: currentTab.windowId });
+          const newTabIds = afterTabs.filter((t) => !beforeIds.has(t.id)).map((t) => t.id);
+          const newTabInfos = [];
+          for (const ntid of newTabIds) {
+            try {
+              await waitForTabLoad(ntid);
+            } catch {
+              continue;
+            }
+            const info = await getFullPageInfo(ntid);
+            if (info) newTabInfos.push({ tabId: ntid, ...info });
+          }
           wsClient.send({
             type: "command_result",
             payload: {
               commandId: cmd.id,
               success: true,
-              data: { url: tab.url, title: tab.title }
+              data: {
+                navigated: true,
+                current: currentInfo,
+                newTabs: newTabInfos
+              }
             }
           });
         } catch {
+          wsClient.send({
+            type: "command_result",
+            payload: {
+              commandId: cmd.id,
+              success: true,
+              data: { navigated: true, current: null, newTabs: [] }
+            }
+          });
+        }
+      } else if (isClick) {
+        const beforeInfo = await beforeFullInfoPromise;
+        const afterInfo = await getFullPageInfo(tabId);
+        const iframeDiff = beforeInfo && afterInfo ? diffIframes(beforeInfo.iframes, afterInfo.iframes) : { changed: false, changes: [] };
+        const jsErrors = response?.jsErrors;
+        wsClient.send({
+          type: "command_result",
+          payload: {
+            commandId: cmd.id,
+            success: response?.success ?? false,
+            data: {
+              ...typeof response?.data === "object" && response?.data !== null ? response.data : {},
+              current: afterInfo,
+              iframeChanged: iframeDiff.changed,
+              iframeChanges: iframeDiff.changes,
+              ...jsErrors && jsErrors.length > 0 ? { jsErrors } : {}
+            },
+            error: response?.error
+          }
+        });
+      } else {
+        wsClient.send({
+          type: "command_result",
+          payload: {
+            commandId: cmd.id,
+            success: response?.success ?? false,
+            data: response?.data,
+            error: response?.error
+          }
+        });
+      }
+      onDone?.();
+    });
+  }
+  async function getFullPageInfo(tabId) {
+    try {
+      const resp = await new Promise((resolve) => {
+        chrome.tabs.sendMessage(tabId, {
+          type: "execute_command",
+          payload: { command: "get_full_page_info" }
+        }, (r) => {
+          if (chrome.runtime.lastError) return resolve({});
+          resolve(r);
+        });
+      });
+      return resp.data ?? null;
+    } catch {
+      return null;
+    }
+  }
+  function diffIframes(before, after) {
+    const beforeMap = new Map(before.map((f) => [f.index, f]));
+    const afterMap = new Map(after.map((f) => [f.index, f]));
+    const changes = [];
+    const allIndices = /* @__PURE__ */ new Set([...beforeMap.keys(), ...afterMap.keys()]);
+    for (const idx of allIndices) {
+      const b = beforeMap.get(idx);
+      const a = afterMap.get(idx);
+      if (!b && a) {
+        changes.push({ index: idx, srcChanged: true, htmlChanged: true, beforeSrc: "", afterSrc: a.src });
+      } else if (b && !a) {
+        changes.push({ index: idx, srcChanged: true, htmlChanged: true, beforeSrc: b.src, afterSrc: "" });
+      } else if (b && a) {
+        const srcChanged = b.src !== a.src;
+        const htmlChanged = b.sameOrigin && a.sameOrigin && b.html !== a.html;
+        if (srcChanged || htmlChanged) {
+          changes.push({ index: idx, srcChanged, htmlChanged, beforeSrc: b.src, afterSrc: a.src });
         }
       }
-    });
+    }
+    return { changed: changes.length > 0, changes };
   }
   function waitForTabLoad(tabId, timeoutMs = 3e4) {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        chrome.tabs.onUpdated.removeListener(listener);
-        reject(new Error(`Tab ${tabId} load timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
-      const listener = (tid, info) => {
-        if (tid === tabId && info.status === "complete") {
-          clearTimeout(timer);
-          chrome.tabs.onUpdated.removeListener(listener);
+      chrome.tabs.get(tabId, (tab) => {
+        if (tab.status === "complete") {
           resolve();
+          return;
         }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
+        const timer = setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(listener);
+          reject(new Error(`Tab ${tabId} load timeout after ${timeoutMs}ms`));
+        }, timeoutMs);
+        const listener = (tid, info) => {
+          if (tid === tabId && info.status === "complete") {
+            clearTimeout(timer);
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+      });
     });
   }
+  async function getOrCreateGroup(windowId) {
+    if (groupId != null && groupWindowId === windowId) {
+      try {
+        await chrome.tabGroups.get(groupId);
+        return { groupId, windowId };
+      } catch {
+        groupId = null;
+        groupWindowId = null;
+      }
+    }
+    const existing = await chrome.tabGroups.query({ windowId, title: GROUP_TITLE });
+    if (existing.length > 0) {
+      groupId = existing[0].id;
+      groupWindowId = windowId;
+      return { groupId, windowId };
+    }
+    groupId = await chrome.tabs.group({ windowId });
+    groupWindowId = windowId;
+    await chrome.tabGroups.update(groupId, { title: GROUP_TITLE, color: "grey" });
+    return { groupId, windowId };
+  }
+  async function cleanupGroupIfEmpty() {
+    if (groupId == null || groupWindowId == null) return;
+    try {
+      const tabs = await chrome.tabs.query({ groupId });
+      if (tabs.length === 0) {
+        await chrome.tabGroups.remove(groupId);
+      }
+    } catch {
+    }
+  }
+  chrome.tabGroups.onRemoved.addListener(async (gid) => {
+    if (gid === groupId) {
+      groupId = null;
+      groupWindowId = null;
+    }
+  });
   async function handleBrowserCommand(cmd) {
     const { command, params = {} } = cmd.payload;
     try {
@@ -333,14 +500,15 @@
         case "open": {
           const url = params.url || "about:blank";
           const tab = await chrome.tabs.create({ url });
-          await waitForTabLoad(tab.id);
-          const finalTab = await chrome.tabs.get(tab.id);
+          const { groupId: gid } = await getOrCreateGroup(tab.windowId);
+          await chrome.tabs.group({ tabIds: tab.id, groupId: gid });
+          const fullInfo = await getFullPageInfo(tab.id);
           wsClient.send({
             type: "command_result",
             payload: {
               commandId: cmd.id,
               success: true,
-              data: { tabId: finalTab.id, url: finalTab.url, title: finalTab.title }
+              data: fullInfo
             }
           });
           break;
@@ -379,7 +547,9 @@
             });
             return;
           }
+          tabQueues.delete(tabId);
           await chrome.tabs.remove(tabId);
+          cleanupGroupIfEmpty();
           wsClient.send({
             type: "command_result",
             payload: { commandId: cmd.id, success: true, data: { tabId } }
