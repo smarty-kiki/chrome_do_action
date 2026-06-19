@@ -101,7 +101,7 @@ npm link
 
 ```
 --server <ws_url>       服务端 WebSocket 地址（必填）
---field <paths>         逗号分隔的字段路径，浏览器端按需采集（如 --field "current.url,newTabs"）
+--field <paths>         逗号分隔的字段路径，浏览器端按需采集（如 --field "currentTab.url,newTabs"）
                         支持命令：click、get_page_info、open
 ```
 
@@ -109,7 +109,7 @@ npm link
 
 | 命令 | 用法 | 说明 |
 |---|---|---|
-| `open <url>` | `send <id> open <url>` | 打开新标签页（加入群组），等待加载完成，返回页面信息 |
+| `open <url>` | `send <id> open <url>` | 打开新标签页（加入群组），等待加载完成，返回页面信息（支持 --field） |
 | `list_tabs` | `send <id> list_tabs` | 列出所有标签页 |
 | `close_tab <id>` | `send <id> close_tab current` | 关闭标签页，`current` 表示当前页，也可传入数字 tabId |
 
@@ -168,7 +168,7 @@ npm link
     "target": "<nodeId>",
     "command": "click",
     "tabId": "current",
-    "params": { "selector": "#submit", "_field": ["current.url"] }
+    "params": { "selector": "#submit", "_field": ["currentTab.url"] }
   }
 }
 ```
@@ -183,12 +183,14 @@ npm link
 
 ```json
 {
-  "url": "https://example.com",
-  "title": "Example Domain",
-  "iframes": [
-    { "index": 0, "src": "https://ads.example.com", "sameOrigin": false },
-    { "index": 1, "src": "/embedded", "sameOrigin": true, "url": "/embedded" }
-  ]
+  "currentTab": {
+    "url": "https://example.com",
+    "title": "Example Domain",
+    "iframes": [
+      { "index": 0, "src": "https://ads.example.com", "sameOrigin": false },
+      { "index": 1, "src": "/embedded", "sameOrigin": true, "url": "/embedded" }
+    ]
+  }
 }
 ```
 
@@ -205,12 +207,11 @@ npm link
     "text": "登录",
     "tag": "button"
   },
-  "current": {
+  "currentTab": {
     "url": "https://example.com",
     "title": "Example",
     "iframes": [...]
   },
-  "iframeChanged": false,
   "iframeChanges": [],
   "newTabs": []
 }
@@ -219,9 +220,8 @@ npm link
 各字段说明：
 - `clickDesc`：点击描述对象，包含定位方式对应的字段（`text`+`tag`、`selector`+`tag`、或 `x`+`y`+`tag`）
 - `navigated`：是否发生页面跳转
-- `current`：当前页面信息，`--field` 不包含 `current` 时省略此字段
-- `iframeChanged`：是否有 iframe 变化
-- `iframeChanges`：iframe 变化详情数组
+- `currentTab`：当前页面信息，`--field` 不包含 `currentTab` 时省略此字段
+- `iframeChanges`：iframe 变化详情数组，仅在检测到变化时出现
 - `newTabs`：新打开的标签页数组，`--field` 不包含 `newTabs` 时省略此字段，无新标签页时也不出现
 
 ### click（页面跳转 / 新标签页）
@@ -231,7 +231,7 @@ npm link
 ```json
 {
   "navigated": true,
-  "current": {
+  "currentTab": {
     "url": "https://example.com/dashboard",
     "title": "Dashboard",
     "iframes": [...]
@@ -287,12 +287,11 @@ npm link
 **支持 `--field` 的命令**：`click`、`get_page_info`、`open`（通过内部 `getFullPageInfo` 调用）
 
 **字段路径语法**：逗号分隔，支持嵌套路径（点号分隔）
-- `current.url` — 当前页面 URL
-- `current` — 当前页面完整信息（url + title，不含 iframe）
-- `current.iframes` — 当前页面的 iframe 列表
+- `currentTab.url` — 当前页面 URL
+- `currentTab` — 当前页面完整信息（url + title，不含 iframe）
+- `currentTab.iframes` — 当前页面的 iframe 列表
 - `navigated` — 是否发生导航
-- `iframeChanged` — iframe 是否有变化
-- `iframeChanges` — iframe 变化详情
+- `iframeChanges` — iframe 变化详情（仅在检测到变化时出现）
 - `newTabs` — 新打开的标签页
 - `jsErrors` — 累积的 JS 错误
 
@@ -300,9 +299,9 @@ npm link
 
 | 调用 | 跳过 |
 |---|---|
-| `--field current.url` | 不读 outerHTML、不遍历 iframe |
-| `--field current` | 不遍历 iframe |
-| `--field current,iframeChanges` | 读页面信息 + 前后对比 iframe |
+| `--field currentTab.url` | 不读 outerHTML、不遍历 iframe |
+| `--field currentTab` | 不遍历 iframe |
+| `--field currentTab,iframeChanges` | 读页面信息 + 前后对比 iframe |
 | `--field navigated` | 不读页面信息、不对比 iframe |
 | 无 `--field` | 全量采集 |
 
@@ -313,7 +312,7 @@ npm link
 - **标签群组**：`open` 打开的页面自动加入 `chrome_do_action` 标签群组（灰色），群组为空时自动清除
 - **点击导航检测**：点击后 Content Script 监听 `beforeunload` 事件（300ms 窗口），设置 `navigated` 标志。服务端读取该标志判断是否发生跳转，若发生则等待新页面加载完成后返回完整信息
 - **新 tab 检测**：点击前后对比窗口中的 tab 列表，主动发现 `target="_blank"` 打开的新 tab
-- **iframe 变化检测**：点击前后分别采集页面中所有 iframe 的 `src`，标记 `srcChanged`，Service Worker 汇总为 `iframeChanged` 和 `iframeChanges`
+- **iframe 变化检测**：点击前后分别采集页面中所有 iframe 的 `src`，标记 `srcChanged`，Service Worker 汇总为 `iframeChanges`（仅在检测到变化时出现在返回中）
 - **滚动等待加载**：`scroll` 使用 `smooth` 行为滚动，然后通过 `MutationObserver` 监听 DOM 变化，等待 500ms 无变动后返回（最长 3 秒超时）
 - **DOM 稳定等待**：`wait_for_page` 先轮询检测 `readyState`，然后用 `MutationObserver` 等待 DOM 稳定
 - **Content script 自动恢复**：content script 丢失时自动通过 `chrome.scripting.executeScript` 注入并重试

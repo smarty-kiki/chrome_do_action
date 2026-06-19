@@ -11,7 +11,7 @@ Actions:
 
 Options:
   --field <paths>        Comma-separated field paths to extract from response
-                         (e.g. --field "current.url,newTabs")
+                         (e.g. --field "currentTab.url,newTabs")
                          Supported commands: click, get_page_info, open
 
 Page commands (require tab):
@@ -37,7 +37,7 @@ Examples:
   chrome-do-action --server ws://127.0.0.1:12345 send abc close_tab 456
   chrome-do-action --server ws://127.0.0.1:12345 send abc get_page_info current
   chrome-do-action --server ws://127.0.0.1:12345 send abc click current '{"text":"登录"}'
-  chrome-do-action --server ws://127.0.0.1:12345 send abc click current --field "current.url,newTabs"
+  chrome-do-action --server ws://127.0.0.1:12345 send abc click current --field "currentTab.url,newTabs"
   chrome-do-action --server ws://127.0.0.1:12345 send abc scroll current '{"y":500}'`;
 
 function parseArgs(argv: string[]): { server: string; action: string; args: string[]; raw: Record<string, string> } {
