@@ -20,7 +20,6 @@ Page commands (require tab):
   type  <tab> {selector,text} Type text into input
   get_text   <tab> [selector] Get text content of element or page
   get_page_info <tab> [--field ...] Get page info (url, title, iframes)
-  get_html   <tab> [selector] Get rendered HTML of element or page
   get_js_errors <tab>         Get accumulated JS errors since page open
   clear_js_errors <tab>       Clear accumulated JS errors
   scroll     <tab> {y}        Scroll page (supports x for horizontal)
@@ -97,7 +96,7 @@ function buildMessage(action: string, args: string[]): Record<string, unknown> {
       console.error("Usage: chrome-do-action --server <url> send <nodeId> <command> [tabId] [params]");
       console.error("");
       console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id>");
-      console.error("Page commands (tab required): click | type | get_text | get_html | get_page_info | get_js_errors | clear_js_errors | scroll");
+      console.error("Page commands (tab required): click | type | get_text | get_page_info | get_js_errors | clear_js_errors | scroll");
       console.error("");
       console.error("Example: chrome-do-action --server ws://127.0.0.1:12345 send abc123 get_page_info current");
       process.exit(1);

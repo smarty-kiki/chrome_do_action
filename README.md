@@ -120,7 +120,6 @@ npm link
 | `click` | `send <id> click <tab> <params>` | 点击元素（selector / text / x,y），返回页面状态和 iframe 变化 |
 | `type` | `send <id> type <tab> <params>` | 输入文本（selector + text） |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本内容，可选 selector |
-| `get_html` | `send <id> get_html <tab> [selector]` | 获取渲染后 HTML，可选 selector |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息（url / title / iframes），--field 按需采集 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取页面打开以来累积的 JS 错误 |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清除累积的 JS 错误 |
@@ -193,7 +192,7 @@ npm link
 }
 ```
 
-> **注意**：`open` 的返回结果中不包含 `html` 字段。如需获取页面 HTML，请使用 `get_html` 命令。
+> **注意**：`open` 的返回结果中不包含 `html` 字段。
 
 ### click（不跳转）
 
@@ -220,10 +219,10 @@ npm link
 各字段说明：
 - `clickDesc`：点击描述对象，包含定位方式对应的字段（`text`+`tag`、`selector`+`tag`、或 `x`+`y`+`tag`）
 - `navigated`：是否发生页面跳转
-- `current`：当前页面信息，`--field` 不包含 `current` 时为 `null`
+- `current`：当前页面信息，`--field` 不包含 `current` 时省略此字段
 - `iframeChanged`：是否有 iframe 变化
 - `iframeChanges`：iframe 变化详情数组
-- `newTabs`：新打开的标签页数组，无新标签页时不出现此字段
+- `newTabs`：新打开的标签页数组，`--field` 不包含 `newTabs` 时省略此字段，无新标签页时也不出现
 
 ### click（页面跳转 / 新标签页）
 
@@ -254,12 +253,12 @@ npm link
 
 - `get_page_info` → `{ "url": "...", "title": "...", "iframes": [...] }`（对象，字段由 `--field` 控制，不含 `html`）
 - `get_text` → `"登录"`（字符串）
-- `get_html` → `"<!DOCTYPE html>..."`（字符串）
 - `type` → `{ "success": true }`（对象）
 - `scroll` → `{ "success": true, "data": { "scrollX": 0, "scrollY": 500 } }`（对象）
 - `get_js_errors` → `{ "errors": [...], "count": 5 }`（对象）
 - `clear_js_errors` → `{ "success": true }`（对象）
 - `close_tab` → `{ "success": true, "data": { "tabId": 123 } }`（对象，包含关闭的 tabId）
+- `list_tabs` → `[{ "id": 1, "title": "...", "url": "...", "active": true }]`（数组）
 
 ### iframe 字段说明
 
@@ -270,7 +269,7 @@ npm link
 | `sameOrigin` | boolean | 是否能读取 iframe 内部内容 |
 | `url` | string | iframe 内部最终 URL（仅 sameOrigin 时存在） |
 
-跨域 iframe 只返回 `src` 和 `sameOrigin: false`，不暴露内部内容。iframe 不再返回 `html` 字段。如需获取特定元素内容，使用 `get_html` / `get_text` 配合 selector。
+跨域 iframe 只返回 `src` 和 `sameOrigin: false`，不暴露内部内容。iframe 不再返回 `html` 字段。如需获取特定元素内容，使用 `get_text` 配合 selector。
 
 ## JS 错误收集
 
@@ -307,7 +306,7 @@ npm link
 | `--field navigated` | 不读页面信息、不对比 iframe |
 | 无 `--field` | 全量采集 |
 
-> **注意**：`--field html` 在 `get_page_info` 和 `open` 中会被 Content Script 采集，但服务端在转发时会剥离 `html` 字段，不会传递给 CLI。如需获取页面 HTML，请使用 `get_html` 命令。
+> **注意**：`--field html` 在 `get_page_info` 和 `open` 中会被 Content Script 采集，但服务端在转发时会剥离 `html` 字段，不会传递给 CLI。
 
 ## 行为特性
 
