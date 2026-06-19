@@ -21,6 +21,90 @@ chrome-do-action --server ws://127.0.0.1:12345 list
 
 返回类似 `OfficePC  Chrome  192.168.1.5  online 123s`，记下节点名称（如 `OfficePC`），后续命令用它指定目标浏览器。
 
+## 返回结构
+
+### open 返回
+
+```json
+{
+  "url": "http://example.com",
+  "title": "页面标题",
+  "iframes": [
+    { "index": 0, "src": "...", "sameOrigin": true, "url": "..." }
+  ]
+}
+```
+
+### click 返回
+
+点击后返回以下字段，根据操作结果动态组装：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `navigated` | boolean | 当前标签页是否发生了跳转 |
+| `clickDesc` | object | 点击描述（`selector`/`text`/`x,y` + `tag`） |
+| `currentTab` | object | 当前标签页信息（`url`、`title`、`iframes`） |
+| `newTabs` | array | 新打开的标签页列表（每个包含 `tabId`、`url`、`title`、`iframes`） |
+| `iframeChanges` | array | iframe 变化列表，仅在检测到变化时出现 |
+
+`currentTab` 和 `newTabs` 中的 `iframes` 是该页面当前的 iframe 列表，结构同 `open` 的 `iframes`。
+
+### iframeChanges
+
+每个变化项：
+
+```json
+{
+  "index": 0,
+  "srcChanged": true,
+  "beforeSrc": "https://a.com",
+  "afterSrc": "https://b.com"
+}
+```
+
+通过 `index` 定位 iframe 在页面中的序号，`srcChanged` 和前后 `src` 描述具体变化。没有变化时 `iframeChanges` 不会出现在返回中。
+
+### newTabs
+
+点击 `target="_blank"` 的链接时，新标签页信息：
+
+```json
+{
+  "tabId": 1020842254,
+  "url": "http://example.com/new",
+  "title": "新页面",
+  "iframes": []
+}
+```
+
+## _field 过滤
+
+通过 `--field` 指定需要的字段，减少不必要的 DOM 操作。
+
+### 支持的字段路径
+
+| 字段 | 说明 |
+|------|------|
+| `currentTab` | 当前标签页完整信息（url、title、iframes） |
+| `currentTab.url` | 仅 url |
+| `currentTab.title` | 仅 title |
+| `currentTab.iframes` | 仅 iframe 列表 |
+| `newTabs` | 新标签页完整信息（含 iframes） |
+| `iframeChanges` | 仅返回 iframe 变化数组 |
+
+### 使用示例
+
+```bash
+# 只看当前页 url
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#submit"}' --field "currentTab.url"
+
+# 只看新标签页
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"打开"}' --field "newTabs"
+
+# 只看 iframe 变化
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges"
+```
+
 ## 常用场景
 
 ### 打开页面并确认加载成功
@@ -29,12 +113,10 @@ chrome-do-action --server ws://127.0.0.1:12345 list
 chrome-do-action --server ws://127.0.0.1:12345 send OfficePC open https://example.com
 ```
 
-返回页面 url、title 和 iframe 列表。如果页面需要登录或有弹窗，返回的 iframe 信息能帮你发现嵌入的跨域框架。
-
-需要只看 URL 和标题，用 `--field` 减少返回量：
+返回页面 url、title 和 iframe 列表。需要只看 URL 和标题：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC open https://example.com --field "current.url,current.title"
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC open https://example.com --field "currentTab.url,currentTab.title"
 ```
 
 ### 登录表单（type + click）
@@ -54,12 +136,12 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC type current '{"sel
 chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"登录"}'
 ```
 
-点击登录后如果页面跳转，返回中 `navigated: true`，并包含新页面的 `current` 信息。如果弹出了新标签页，返回中会出现 `newTabs` 数组。
+点击登录后如果页面跳转，返回中 `navigated: true`，并包含新页面的 `currentTab` 信息。如果弹出了新标签页，返回中会出现 `newTabs` 数组。
 
 只看登录后跳转到了哪个 URL：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"登录"}' --field "current.url,navigated"
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"登录"}' --field "currentTab.url,navigated"
 ```
 
 ### 提取页面内容
@@ -156,7 +238,7 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_text current '{
 ### 浏览器命令
 
 | 命令 | 用法 | 说明 |
-|---|---|---|
+|------|------|------|
 | `open <url>` | `send <id> open <url>` | 打开新标签页，等待加载完成 |
 | `list_tabs` | `send <id> list_tabs` | 列出所有标签页 |
 | `close_tab <id>` | `send <id> close_tab current` | 关闭标签页 |
@@ -164,7 +246,7 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_text current '{
 ### 页面命令
 
 | 命令 | 用法 | 说明 |
-|---|---|---|
+|------|------|------|
 | `click` | `send <id> click <tab> <params>` | 点击元素 |
 | `type` | `send <id> type <tab> <params>` | 输入文本 |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本内容 |

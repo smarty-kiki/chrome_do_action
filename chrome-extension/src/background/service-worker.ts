@@ -149,10 +149,9 @@ function sendToTab(
 ): void {
   const isClick = cmd.payload.command === "click";
   const fieldFilter = ((cmd.payload.params as Record<string, string[]> | undefined)?._field) || [];
-  // 判断 _field 是否需要页面信息或 iframe 变化
-  const needCurrent = fieldFilter.length === 0 || fieldFilter.some(f => f === "current" || f.startsWith("current."));
-  const needIframeDiff = fieldFilter.length === 0 || fieldFilter.some(f => f === "iframeChanged" || f === "iframeChanges");
-  const needBeforeInfo = isClick && needIframeDiff;
+  const needCurrent = fieldFilter.length === 0 || fieldFilter.some(f => f === "currentTab" || f.startsWith("currentTab."));
+  const needIframe = fieldFilter.length === 0 || fieldFilter.some(f => f === "iframeChanges" || f.startsWith("iframeChanges."));
+  const needBeforeInfo = isClick && needIframe;
 
   const tabPromise = chrome.tabs.get(tabId);
   const beforeTabsPromise = tabPromise.then((tab) =>
@@ -176,6 +175,34 @@ function sendToTab(
     }, async (response) => {
       if (chrome.runtime.lastError) {
         const msg = chrome.runtime.lastError.message || "";
+
+        // 点击导致页面导航：内容脚本在返回前被销毁，消息通道关闭
+        // 不重试（避免在新页面上重复执行 click），直接获取新页面信息
+        const NAV_ERROR = "The page keeping the extension port is moved into back/forward cache";
+        if (isClick && msg.includes(NAV_ERROR)) {
+          try {
+            const currentInfo = needCurrent
+              ? await getFullPageInfo(targetTabId, cmd.payload.params as Record<string, string[]> | undefined)
+              : null;
+            sendResult({
+              commandId: cmd.id!,
+              success: true,
+              data: {
+                navigated: true,
+                ...(needCurrent ? { currentTab: currentInfo } : { currentTab: null }),
+              },
+            });
+          } catch {
+            sendResult({
+              commandId: cmd.id!,
+              success: true,
+              data: { navigated: true, currentTab: null },
+            });
+          }
+          onDone?.();
+          return;
+        }
+
         if (!retrying.value && msg.includes("Receiving end does not exist")) {
           retrying.value = true;
           try {
@@ -227,15 +254,18 @@ function sendToTab(
             if (info) newTabInfos.push({ tabId: ntid, ...info });
           }
 
-          sendResult({
-            commandId: cmd.id!,
-            success: true,
-            data: {
-              navigated: true,
-              ...(needCurrent ? { current: currentInfo } : { current: null }),
-              ...(needNewTabs && newTabInfos.length > 0 ? { newTabs: newTabInfos } : {}),
-            },
-          });
+        const navResult: Record<string, unknown> = {
+          navigated: true,
+        };
+        if (needCurrent) {
+          navResult.currentTab = currentInfo;
+        }
+        if (needNewTabs && newTabInfos.length > 0) navResult.newTabs = newTabInfos;
+        sendResult({
+          commandId: cmd.id!,
+          success: true,
+          data: navResult,
+        });
         } catch {
           sendResult({
             commandId: cmd.id!,
@@ -248,9 +278,6 @@ function sendToTab(
         const afterInfo = needCurrent
           ? await getFullPageInfo(targetTabId, cmd.payload.params as Record<string, string[]> | undefined)
           : null;
-        const iframeDiff = beforeInfo && afterInfo
-          ? diffIframes(beforeInfo.iframes, afterInfo.iframes)
-          : { changed: false, changes: [] };
 
         let newTabInfos: { tabId: number; url: string; title: string; iframes: FullPageInfo["iframes"] }[] = [];
         const navigated = (response?.data as Record<string, unknown> | undefined)?.navigated as boolean | undefined;
@@ -275,10 +302,14 @@ function sendToTab(
           navigated: navigated ?? false,
           ...(typeof response?.data === "object" && response?.data !== null ? response.data : {}),
         };
-        if (needCurrent) result.current = afterInfo;
-        if (needIframeDiff) {
-          result.iframeChanged = iframeDiff.changed;
-          result.iframeChanges = iframeDiff.changes;
+        if (needCurrent) {
+          result.currentTab = afterInfo;
+        }
+        if (needIframe) {
+          const iframeChanges = beforeInfo && afterInfo
+            ? diffIframes(beforeInfo.iframes, afterInfo.iframes)
+            : [];
+          if (iframeChanges.length > 0) result.iframeChanges = iframeChanges;
         }
         if (needNewTabs && newTabInfos.length > 0) result.newTabs = newTabInfos;
 
@@ -312,39 +343,56 @@ interface FullPageInfo {
 
 async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown>): Promise<FullPageInfo | null> {
   try {
-    await waitForTabLoad(tabId);
-    await new Promise<void>((resolve) => {
-      chrome.tabs.sendMessage(tabId, {
-        type: "execute_command",
-        payload: { command: "wait_for_page", params: { timeout: 10000 } },
-      }, () => {
-        if (chrome.runtime.lastError) return resolve();
-        resolve();
-      });
-    });
-    const fields = (cmdParams as Record<string, string[]> | undefined)?._field;
-    const resp = await new Promise<{ data?: FullPageInfo }>((resolve) => {
-      chrome.tabs.sendMessage(tabId, {
-        type: "execute_command",
-        payload: { command: "get_page_info", params: fields ? { _field: fields } : {} },
-      }, (r) => {
-        if (chrome.runtime.lastError) return resolve({});
-        resolve(r as { data?: FullPageInfo });
-      });
-    });
-    const data = resp.data ?? null;
-    if (data) {
-      const { html: _h, ...rest } = data as Record<string, unknown>;
-      const result = rest as Omit<FullPageInfo, "iframes"> & { iframes: FullPageInfo["iframes"] };
-      if (result.iframes) {
-        result.iframes = result.iframes.map((f) => {
-          const { html: _fh, ...restF } = f as Record<string, unknown>;
-          return restF as FullPageInfo["iframes"][number];
-        });
-      }
-      return result as FullPageInfo;
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status !== "complete" || !tab.url) {
+      await waitForTabLoad(tabId);
     }
-    return null;
+    const t = await chrome.tabs.get(tabId);
+    const result: FullPageInfo = {
+      url: t.url || "",
+      title: t.title || "",
+      iframes: [],
+    };
+
+    // 将 currentTab.xxx 映射为 xxx 传给 content script
+    const fields = (cmdParams as Record<string, string[]> | undefined)?._field || [];
+    const mappedFields = fields.map(f => f.replace(/^currentTab\./, ""));
+    const needContentScript = mappedFields.some(f => f === "iframes" || f === "html" || f === "jsErrors");
+
+    if (needContentScript) {
+      await waitForTabLoad(tabId);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 300));
+        const resp = await new Promise<{ data?: FullPageInfo }>((resolve) => {
+          const timer = setTimeout(() => resolve({}), 2000);
+          chrome.tabs.sendMessage(tabId, {
+            type: "execute_command",
+            payload: { command: "get_page_info", params: { _field: mappedFields } },
+          }, (r) => {
+            clearTimeout(timer);
+            if (chrome.runtime.lastError) return resolve({});
+            resolve(r as { data?: FullPageInfo });
+          });
+        });
+        if (resp.data?.iframes && resp.data.iframes.length > 0) {
+          result.iframes = resp.data.iframes;
+          break;
+        }
+      }
+    }
+
+    // 根据 _field 过滤返回字段
+    if (fields.length > 0) {
+      const filtered: Record<string, unknown> = {};
+      const hasField = (name: string) => fields.some(f => f === name || f === `currentTab.${name}`);
+      if (hasField("url")) filtered.url = result.url;
+      if (hasField("title")) filtered.title = result.title;
+      if (hasField("iframes")) filtered.iframes = result.iframes;
+      if (hasField("html")) filtered.html = result.html;
+      return filtered as FullPageInfo;
+    }
+
+    return result;
   } catch {
     return null;
   }
@@ -353,7 +401,7 @@ async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown
 function diffIframes(
   before: FullPageInfo["iframes"],
   after: FullPageInfo["iframes"],
-): { changed: boolean; changes: { index: number; srcChanged: boolean; beforeSrc: string; afterSrc: string }[] } {
+): { index: number; srcChanged: boolean; beforeSrc: string; afterSrc: string }[] {
   const beforeMap = new Map(before.map((f) => [f.index, f]));
   const afterMap = new Map(after.map((f) => [f.index, f]));
   const changes: { index: number; srcChanged: boolean; beforeSrc: string; afterSrc: string }[] = [];
@@ -374,13 +422,13 @@ function diffIframes(
     }
   }
 
-  return { changed: changes.length > 0, changes };
+  return changes;
 }
 
 function waitForTabLoad(tabId: number, timeoutMs = 30000): Promise<void> {
   return new Promise((resolve, reject) => {
     chrome.tabs.get(tabId, (tab) => {
-      if (tab.status === "complete") {
+      if (tab.status === "complete" && tab.url) {
         resolve();
         return;
       }
@@ -390,9 +438,13 @@ function waitForTabLoad(tabId: number, timeoutMs = 30000): Promise<void> {
       }, timeoutMs);
       const listener = (tid: number, info: chrome.tabs.TabChangeInfo) => {
         if (tid === tabId && info.status === "complete") {
-          clearTimeout(timer);
-          chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
+          chrome.tabs.get(tabId, (t) => {
+            if (t.url) {
+              clearTimeout(timer);
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          });
         }
       };
       chrome.tabs.onUpdated.addListener(listener);

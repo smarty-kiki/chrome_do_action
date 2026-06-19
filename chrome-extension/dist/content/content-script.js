@@ -38,9 +38,10 @@
   }
   async function collectPageInfo(fields) {
     const info = {};
-    if (fields.length === 0 || fields.includes("url")) info.url = window.location.href;
-    if (fields.length === 0 || fields.includes("title")) info.title = document.title;
-    if (fields.length === 0 || fields.includes("html")) info.html = document.documentElement.outerHTML;
+    const has = (name) => fields.length === 0 || fields.some((f) => f === name || f === `currentTab.${name}`);
+    if (has("url")) info.url = window.location.href;
+    if (has("title")) info.title = document.title;
+    if (has("html")) info.html = document.documentElement.outerHTML;
     return info;
   }
   async function collectIframes(fields) {

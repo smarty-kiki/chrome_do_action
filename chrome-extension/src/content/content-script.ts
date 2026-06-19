@@ -61,9 +61,10 @@ function needsField(fields: string[], ...candidates: string[]): boolean {
 // Collect page info fields only if requested by _field
 async function collectPageInfo(fields: string[]): Promise<{ url?: string; title?: string; html?: string }> {
   const info: { url?: string; title?: string; html?: string } = {};
-  if (fields.length === 0 || fields.includes("url")) info.url = window.location.href;
-  if (fields.length === 0 || fields.includes("title")) info.title = document.title;
-  if (fields.length === 0 || fields.includes("html")) info.html = document.documentElement.outerHTML;
+  const has = (name: string) => fields.length === 0 || fields.some(f => f === name || f === `currentTab.${name}`);
+  if (has("url")) info.url = window.location.href;
+  if (has("title")) info.title = document.title;
+  if (has("html")) info.html = document.documentElement.outerHTML;
   return info;
 }
 
