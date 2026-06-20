@@ -16,6 +16,7 @@
     (msg, _sender, sendResponse) => {
       if (msg.type !== "execute_command") return;
       const { command } = msg.payload;
+      const fields = msg.payload.params?._field || [];
       const includeJsErrors = fields.includes("jsErrors");
       const exec = () => handleCommand(msg.payload);
       const promise = exec().then((result) => {
@@ -36,20 +37,20 @@
   function getFieldFilter(params) {
     return params._field || [];
   }
-  function needsField(fields2, ...candidates) {
-    if (fields2.length === 0) return true;
-    return candidates.some((c) => fields2.includes(c));
+  function needsField(fields, ...candidates) {
+    if (fields.length === 0) return true;
+    return candidates.some((c) => fields.includes(c));
   }
-  async function collectPageInfo(fields2) {
+  async function collectPageInfo(fields) {
     const info = {};
-    const has = (name) => fields2.length === 0 || fields2.some((f) => f === name || f === `currentTab.${name}`);
+    const has = (name) => fields.length === 0 || fields.some((f) => f === name || f === `currentTab.${name}`);
     if (has("url")) info.url = window.location.href;
     if (has("title")) info.title = document.title;
     if (has("html")) info.html = document.documentElement.outerHTML;
     return info;
   }
-  async function collectIframes(fields2) {
-    if (fields2.length > 0 && !fields2.includes("iframes")) return [];
+  async function collectIframes(fields) {
+    if (fields.length > 0 && !fields.includes("iframes")) return [];
     const iframes = [];
     document.querySelectorAll("iframe").forEach((f, i) => {
       const iframe = f;
@@ -72,7 +73,7 @@
   }
   async function handleCommand(payload) {
     const { command, params = {} } = payload;
-    const fields2 = getFieldFilter(params);
+    const fields = getFieldFilter(params);
     try {
       switch (command) {
         case "click": {
@@ -116,16 +117,16 @@
           await new Promise((r) => setTimeout(r, 300));
           window.removeEventListener("beforeunload", onBeforeUnload);
           const data = { clickDesc };
-          if (fields2.length === 0 || needsField(fields2, "navigated")) data.navigated = navigated;
-          if (fields2.length === 0 || needsField(fields2, "current")) {
-            const pageInfo = await collectPageInfo(fields2);
+          if (fields.length === 0 || needsField(fields, "navigated")) data.navigated = navigated;
+          if (fields.length === 0 || needsField(fields, "current")) {
+            const pageInfo = await collectPageInfo(fields);
             data.current = pageInfo;
           }
-          if (fields2.length === 0 || needsField(fields2, "iframeChanged", "iframeChanges")) {
+          if (fields.length === 0 || needsField(fields, "iframeChanged", "iframeChanges")) {
             data.iframeChanged = false;
             data.iframeChanges = [];
           }
-          if (fields2.length === 0 || needsField(fields2, "newTabs")) {
+          if (fields.length === 0 || needsField(fields, "newTabs")) {
             data.newTabs = [];
           }
           return { success: true, data };
@@ -147,11 +148,11 @@
         }
         case "get_page_info": {
           const [pageInfo, iframes] = await Promise.all([
-            collectPageInfo(fields2),
-            collectIframes(fields2)
+            collectPageInfo(fields),
+            collectIframes(fields)
           ]);
           const data = { ...pageInfo };
-          if (fields2.length === 0 || fields2.includes("iframes")) data.iframes = iframes;
+          if (fields.length === 0 || fields.includes("iframes")) data.iframes = iframes;
           return { success: true, data };
         }
         case "get_js_errors": {
@@ -165,26 +166,34 @@
           const timeout = params.timeout ?? 1e4;
           const start = Date.now();
           return new Promise((resolve) => {
-            const CHECK_INTERVAL = 200;
-            let timer;
-            const check = () => {
-              const elapsed = Date.now() - start;
-              if (elapsed >= timeout) {
-                cleanup();
-                resolve({ success: true, data: { readyState: document.readyState, elapsed } });
-                return;
-              }
+            let settled = false;
+            const cleanup = () => {
+              document.removeEventListener("readystatechange", onChange);
+              clearTimeout(timer);
+            };
+            const onChange = () => {
               if (document.readyState === "complete") {
+                settled = true;
                 cleanup();
-                waitForDomSettle(Math.min(timeout - (Date.now() - start), 3e3)).then(() => {
+                waitForDomStable(3e3).then(() => {
                   resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
                 });
-                return;
               }
-              timer = window.setTimeout(check, CHECK_INTERVAL);
             };
-            const cleanup = () => window.clearTimeout(timer);
-            timer = window.setTimeout(check, CHECK_INTERVAL);
+            document.addEventListener("readystatechange", onChange);
+            if (document.readyState === "complete") {
+              settled = true;
+              cleanup();
+              waitForDomStable(3e3).then(() => {
+                resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
+              });
+            } else {
+              const timer2 = setTimeout(() => {
+                if (settled) return;
+                cleanup();
+                resolve({ success: true, data: { readyState: document.readyState, elapsed: Date.now() - start } });
+              }, timeout);
+            }
           });
         }
         case "scroll": {
@@ -219,35 +228,6 @@
       setTimeout(() => {
         observer.disconnect();
         clearTimeout(quietTimer);
-        resolve();
-      }, maxWaitMs);
-    });
-  }
-  function waitForDomSettle(maxWaitMs) {
-    return new Promise((resolve) => {
-      const INTERVAL = 200;
-      const QUIET_MS = 500;
-      let lastHtml = document.body.innerHTML;
-      let stableSince = Date.now();
-      let timer;
-      const check = () => {
-        const now = Date.now();
-        if (now - stableSince >= QUIET_MS) {
-          cleanup();
-          resolve();
-          return;
-        }
-        const currentHtml = document.body.innerHTML;
-        if (currentHtml !== lastHtml) {
-          lastHtml = currentHtml;
-          stableSince = now;
-        }
-        timer = window.setTimeout(check, INTERVAL);
-      };
-      const cleanup = () => window.clearTimeout(timer);
-      timer = window.setTimeout(check, INTERVAL);
-      setTimeout(() => {
-        cleanup();
         resolve();
       }, maxWaitMs);
     });

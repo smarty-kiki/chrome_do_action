@@ -124,12 +124,12 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC open https://exampl
 两步操作，先输入账号密码，再点击登录按钮：
 
 ```bash
-# 输入用户名
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#username","text":"type"}'
+# 点击聚焦用户名输入框并输入
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#username"}'
 chrome-do-action --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#username","text":"admin"}'
 
-# 输入密码
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#password","text":"type"}'
+# 点击聚焦密码输入框并输入
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#password"}'
 chrome-do-action --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#password","text":"secret"}'
 
 # 点击登录

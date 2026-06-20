@@ -134,8 +134,6 @@ interface PendingEntry {
 }
 const pending = new Map<string, PendingEntry>();
 
-const BROWSER_CMDS = new Set(["open", "list_tabs", "close_tab"]);
-
 const wss = new WebSocketServer({ port });
 
 function sendWs(ws: WebSocket, msg: Record<string, unknown>): void {
@@ -279,6 +277,16 @@ wss.on("connection", (ws: WebSocket, req) => {
             cliMsgId: cliMsg.id,
             cliConnId: connId,
           });
+          const PENDING_TIMEOUT = 60000;
+          setTimeout(() => {
+            const p = pending.get(cmdId);
+            if (!p) return;
+            log(`[timeout] ${p.command} → ${p.target} (no response after ${PENDING_TIMEOUT}ms)`);
+            if (p.cliWs && p.cliMsgId) {
+              sendWs(p.cliWs, { type: "cli_result", id: p.cliMsgId, payload: { success: false, error: "Command timed out" } });
+            }
+            pending.delete(cmdId);
+          }, PENDING_TIMEOUT);
           log(`[send #${connId}] ${command} → ${c.nodeName}${cliTabId ? ` tab=${cliTabId}` : ""}`);
           // result will be sent back when command_result arrives
           break;
@@ -296,6 +304,16 @@ wss.on("connection", (ws: WebSocket, req) => {
 
   ws.on("close", (code: number) => {
     if (client) {
+      // Clean up pending commands for this browser
+      for (const [cmdId, p] of pending) {
+        if (p.target.startsWith(`${client.nodeId}(`)) {
+          log(`[cleanup] ${p.command} → ${p.target} (browser offline)`);
+          if (p.cliWs && p.cliMsgId) {
+            sendWs(p.cliWs, { type: "cli_result", id: p.cliMsgId, payload: { success: false, error: "Browser went offline" } });
+          }
+          pending.delete(cmdId);
+        }
+      }
       clients.delete(client.nodeId);
       const uptime = Math.round((Date.now() - client.connectedAt) / 1000);
       log(`[offline #${connId}] ${client.nodeId}=${client.nodeName} code=${code} uptime=${uptime}s | online=${clients.size}`);

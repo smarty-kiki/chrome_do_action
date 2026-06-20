@@ -25,6 +25,7 @@ chrome.runtime.onMessage.addListener(
     sendResponse: (res: { success: boolean; data?: unknown; error?: string; jsErrors?: JsError[] }) => void) => {
     if (msg.type !== "execute_command") return;
     const { command } = msg.payload;
+    const fields = ((msg.payload.params?._field) as string[] | undefined) || [];
 
     const includeJsErrors = fields.includes("jsErrors");
     const exec = () => handleCommand(msg.payload);
@@ -197,28 +198,34 @@ async function handleCommand(
         const timeout = (params.timeout as number) ?? 10000;
         const start = Date.now();
         return new Promise<{ success: boolean; data: { readyState: string; elapsed: number } }>((resolve) => {
-          const CHECK_INTERVAL = 200;
-          let timer: number;
-
-          const check = () => {
-            const elapsed = Date.now() - start;
-            if (elapsed >= timeout) {
-              cleanup();
-              resolve({ success: true, data: { readyState: document.readyState, elapsed } });
-              return;
-            }
+          let settled = false;
+          const cleanup = () => {
+            document.removeEventListener("readystatechange", onChange);
+            clearTimeout(timer);
+          };
+          const onChange = () => {
             if (document.readyState === "complete") {
+              settled = true;
               cleanup();
-              waitForDomSettle(Math.min(timeout - (Date.now() - start), 3000)).then(() => {
+              waitForDomStable(3000).then(() => {
                 resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
               });
-              return;
             }
-            timer = window.setTimeout(check, CHECK_INTERVAL);
           };
-
-          const cleanup = () => window.clearTimeout(timer);
-          timer = window.setTimeout(check, CHECK_INTERVAL);
+          document.addEventListener("readystatechange", onChange);
+          if (document.readyState === "complete") {
+            settled = true;
+            cleanup();
+            waitForDomStable(3000).then(() => {
+              resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
+            });
+          } else {
+            const timer = setTimeout(() => {
+              if (settled) return;
+              cleanup();
+              resolve({ success: true, data: { readyState: document.readyState, elapsed: Date.now() - start } });
+            }, timeout);
+          }
         });
       }
 
@@ -256,40 +263,6 @@ function waitForDomStable(maxWaitMs: number): Promise<void> {
     setTimeout(() => {
       observer.disconnect();
       clearTimeout(quietTimer);
-      resolve();
-    }, maxWaitMs);
-  });
-}
-
-/** Wait for DOM to stop changing by polling innerHTML every 200ms */
-function waitForDomSettle(maxWaitMs: number): Promise<void> {
-  return new Promise((resolve) => {
-    const INTERVAL = 200;
-    const QUIET_MS = 500;
-    let lastHtml = document.body.innerHTML;
-    let stableSince = Date.now();
-    let timer: number;
-
-    const check = () => {
-      const now = Date.now();
-      if (now - stableSince >= QUIET_MS) {
-        cleanup();
-        resolve();
-        return;
-      }
-      const currentHtml = document.body.innerHTML;
-      if (currentHtml !== lastHtml) {
-        lastHtml = currentHtml;
-        stableSince = now;
-      }
-      timer = window.setTimeout(check, INTERVAL);
-    };
-
-    const cleanup = () => window.clearTimeout(timer);
-    timer = window.setTimeout(check, INTERVAL);
-
-    setTimeout(() => {
-      cleanup();
       resolve();
     }, maxWaitMs);
   });

@@ -189,6 +189,7 @@
     retryIntervalMs: 15e3
   });
   var BROWSER_COMMANDS = /* @__PURE__ */ new Set(["open", "list_tabs", "close_tab"]);
+  var BLOCKED_COMMANDS = /* @__PURE__ */ new Set(["wait_for_page"]);
   var GROUP_TITLE = "chrome_do_action";
   var groupId = null;
   var groupWindowId = null;
@@ -219,6 +220,13 @@
     const cmd = msg;
     if (BROWSER_COMMANDS.has(cmd.payload.command)) {
       handleBrowserCommand(cmd);
+      return;
+    }
+    if (BLOCKED_COMMANDS.has(cmd.payload.command)) {
+      wsClient.send({
+        type: "command_result",
+        payload: { commandId: cmd.id, success: false, error: `Command "${cmd.payload.command}" is not available` }
+      });
       return;
     }
     const tabId = cmd.payload.params?.tabId;
@@ -471,12 +479,12 @@
         for (let attempt = 0; attempt < 3; attempt++) {
           if (attempt > 0) await new Promise((r) => setTimeout(r, 300));
           const resp = await new Promise((resolve) => {
-            const timer = setTimeout(() => resolve({}), 2e3);
+            const timer2 = setTimeout(() => resolve({}), 2e3);
             chrome.tabs.sendMessage(tabId, {
               type: "execute_command",
               payload: { command: "get_page_info", params: { _field: mappedFields } }
             }, (r) => {
-              clearTimeout(timer);
+              clearTimeout(timer2);
               if (chrome.runtime.lastError) return resolve({});
               resolve(r);
             });
@@ -529,7 +537,7 @@
           resolve();
           return;
         }
-        const timer = setTimeout(() => {
+        const timer2 = setTimeout(() => {
           chrome.tabs.onUpdated.removeListener(listener);
           reject(new Error(`Tab ${tabId} load timeout after ${timeoutMs}ms`));
         }, timeoutMs);
@@ -537,7 +545,7 @@
           if (tid === tabId && info.status === "complete") {
             chrome.tabs.get(tabId, (t) => {
               if (t.url) {
-                clearTimeout(timer);
+                clearTimeout(timer2);
                 chrome.tabs.onUpdated.removeListener(listener);
                 resolve();
               }
@@ -551,13 +559,13 @@
   async function injectContentScript(tabId) {
     const INJECT_TIMEOUT = 5e3;
     const ready = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const timer2 = setTimeout(() => {
         chrome.runtime.onMessage.removeListener(listener);
         reject(new Error(`Content script injection timed out after ${INJECT_TIMEOUT}ms`));
       }, INJECT_TIMEOUT);
       const listener = (_msg) => {
         if (_msg.type === "cs_injected") {
-          clearTimeout(timer);
+          clearTimeout(timer2);
           chrome.runtime.onMessage.removeListener(listener);
           resolve();
         }
@@ -588,7 +596,7 @@
           });
           chrome.runtime.sendMessage({ type: "cs_injected" }).catch(() => {
           });
-          async function handleCommand(_id, payload) {
+          async function handleCommand(payload) {
             const { command, params = {} } = payload;
             try {
               switch (command) {
@@ -689,26 +697,34 @@
                   const timeout = params.timeout ?? 1e4;
                   const start = Date.now();
                   return new Promise((resolve) => {
-                    const CHECK_INTERVAL = 200;
-                    let timer;
-                    const check = () => {
-                      const elapsed = Date.now() - start;
-                      if (elapsed >= timeout) {
-                        cleanup();
-                        resolve({ success: true, data: { readyState: document.readyState, elapsed } });
-                        return;
-                      }
+                    let settled = false;
+                    const cleanup = () => {
+                      document.removeEventListener("readystatechange", onChange);
+                      clearTimeout(timer);
+                    };
+                    const onChange = () => {
                       if (document.readyState === "complete") {
+                        settled = true;
                         cleanup();
-                        waitForDomSettle(Math.min(timeout - (Date.now() - start), 3e3)).then(() => {
+                        waitForDomStable(3e3).then(() => {
                           resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
                         });
-                        return;
                       }
-                      timer = window.setTimeout(check, CHECK_INTERVAL);
                     };
-                    const cleanup = () => window.clearTimeout(timer);
-                    timer = window.setTimeout(check, CHECK_INTERVAL);
+                    document.addEventListener("readystatechange", onChange);
+                    if (document.readyState === "complete") {
+                      settled = true;
+                      cleanup();
+                      waitForDomStable(3e3).then(() => {
+                        resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
+                      });
+                    } else {
+                      const timer2 = setTimeout(() => {
+                        if (settled) return;
+                        cleanup();
+                        resolve({ success: true, data: { readyState: document.readyState, elapsed: Date.now() - start } });
+                      }, timeout);
+                    }
                   });
                 }
                 case "scroll": {
@@ -743,35 +759,6 @@
               setTimeout(() => {
                 observer.disconnect();
                 clearTimeout(quietTimer);
-                resolve();
-              }, maxWaitMs);
-            });
-          }
-          function waitForDomSettle(maxWaitMs) {
-            return new Promise((resolve) => {
-              const INTERVAL = 200;
-              const QUIET_MS = 500;
-              let lastHtml = document.body.innerHTML;
-              let stableSince = Date.now();
-              let timer;
-              const check = () => {
-                const now = Date.now();
-                if (now - stableSince >= QUIET_MS) {
-                  cleanup();
-                  resolve();
-                  return;
-                }
-                const currentHtml = document.body.innerHTML;
-                if (currentHtml !== lastHtml) {
-                  lastHtml = currentHtml;
-                  stableSince = now;
-                }
-                timer = window.setTimeout(check, INTERVAL);
-              };
-              const cleanup = () => window.clearTimeout(timer);
-              timer = window.setTimeout(check, INTERVAL);
-              setTimeout(() => {
-                cleanup();
                 resolve();
               }, maxWaitMs);
             });

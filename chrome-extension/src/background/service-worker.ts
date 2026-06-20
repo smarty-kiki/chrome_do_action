@@ -15,6 +15,9 @@ const wsClient = new WsClient({
 // Browser-level commands handled directly in background (no content script needed)
 const BROWSER_COMMANDS = new Set(["open", "list_tabs", "close_tab"]);
 
+// Commands that exist in content script but are not exposed via remote control
+const BLOCKED_COMMANDS = new Set(["wait_for_page"]);
+
 const GROUP_TITLE = "chrome_do_action";
 let groupId: number | null = null;
 let groupWindowId: number | null = null;
@@ -52,6 +55,14 @@ wsClient.onMessage("command", (msg: Message) => {
 
   if (BROWSER_COMMANDS.has(cmd.payload.command)) {
     handleBrowserCommand(cmd);
+    return;
+  }
+
+  if (BLOCKED_COMMANDS.has(cmd.payload.command)) {
+    wsClient.send({
+      type: "command_result",
+      payload: { commandId: cmd.id!, success: false, error: `Command "${cmd.payload.command}" is not available` },
+    });
     return;
   }
 
@@ -510,7 +521,6 @@ async function injectContentScript(tabId: number): Promise<void> {
         chrome.runtime.sendMessage({ type: "cs_injected" }).catch(() => {});
 
         async function handleCommand(
-          _id: string,
           payload: { command: string; params?: Record<string, unknown> },
         ): Promise<{ success: boolean; data?: unknown; error?: string }> {
           const { command, params = {} } = payload;
@@ -606,29 +616,35 @@ async function injectContentScript(tabId: number): Promise<void> {
               case "wait_for_page": {
                 const timeout = (params.timeout as number) ?? 10000;
                 const start = Date.now();
-                // Poll every 200ms for readyState === 'complete'
                 return new Promise<{ success: boolean; data: { readyState: string; elapsed: number } }>((resolve) => {
-                  const CHECK_INTERVAL = 200;
-                  let timer: number;
-                  const check = () => {
-                    const elapsed = Date.now() - start;
-                    if (elapsed >= timeout) {
-                      cleanup();
-                      resolve({ success: true, data: { readyState: document.readyState, elapsed } });
-                      return;
-                    }
+                  let settled = false;
+                  const cleanup = () => {
+                    document.removeEventListener("readystatechange", onChange);
+                    clearTimeout(timer);
+                  };
+                  const onChange = () => {
                     if (document.readyState === "complete") {
+                      settled = true;
                       cleanup();
-                      // Wait for DOM to settle after readyState complete
-                      waitForDomSettle(Math.min(timeout - (Date.now() - start), 3000)).then(() => {
+                      waitForDomStable(3000).then(() => {
                         resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
                       });
-                      return;
                     }
-                    timer = window.setTimeout(check, CHECK_INTERVAL);
                   };
-                  const cleanup = () => window.clearTimeout(timer);
-                  timer = window.setTimeout(check, CHECK_INTERVAL);
+                  document.addEventListener("readystatechange", onChange);
+                  if (document.readyState === "complete") {
+                    settled = true;
+                    cleanup();
+                    waitForDomStable(3000).then(() => {
+                      resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
+                    });
+                  } else {
+                    const timer = setTimeout(() => {
+                      if (settled) return;
+                      cleanup();
+                      resolve({ success: true, data: { readyState: document.readyState, elapsed: Date.now() - start } });
+                    }, timeout);
+                  }
                 });
               }
               case "scroll": {
@@ -664,39 +680,6 @@ async function injectContentScript(tabId: number): Promise<void> {
             setTimeout(() => {
               observer.disconnect();
               clearTimeout(quietTimer);
-              resolve();
-            }, maxWaitMs);
-          });
-        }
-
-        function waitForDomSettle(maxWaitMs: number): Promise<void> {
-          return new Promise((resolve) => {
-            const INTERVAL = 200;
-            const QUIET_MS = 500;
-            let lastHtml = document.body.innerHTML;
-            let stableSince = Date.now();
-            let timer: number;
-
-            const check = () => {
-              const now = Date.now();
-              if (now - stableSince >= QUIET_MS) {
-                cleanup();
-                resolve();
-                return;
-              }
-              const currentHtml = document.body.innerHTML;
-              if (currentHtml !== lastHtml) {
-                lastHtml = currentHtml;
-                stableSince = now;
-              }
-              timer = window.setTimeout(check, INTERVAL);
-            };
-
-            const cleanup = () => window.clearTimeout(timer);
-            timer = window.setTimeout(check, INTERVAL);
-
-            setTimeout(() => {
-              cleanup();
               resolve();
             }, maxWaitMs);
           });

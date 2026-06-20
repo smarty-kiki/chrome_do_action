@@ -9,28 +9,28 @@ const ws_1 = __importDefault(require("ws"));
 const FULL_HELP = `Usage: chrome-do-action --server <ws_url> <action> [args...]
 
 Actions:
-  list                                          List connected clients
-  send <id> <cmd> [tab] [params]                Send command to a client
+  list                              List connected clients
+  send <id> <cmd> [tab] [params]    Send command to a client
 
 Options:
-  --field <paths>        Comma-separated field paths to extract from response
-                         (e.g. --field "currentTab.url,newTabs")
-                         Supported commands: click, get_page_info, open
+  --field <paths>        Comma-separated field paths to filter response
+                          (e.g. --field "currentTab.url,newTabs")
+                          Supported commands: open, click, get_page_info
 
-Page commands (require tab):
-  click <tab> [params]        Click by selector, text, or {x,y}
-                              selector supports "css:..." and "xpath:..." prefixes
-  type  <tab> {selector,text} Type text into input
-  get_text   <tab> [selector] Get text content of element or page
-  get_page_info <tab> [--field ...] Get page info (url, title, iframes)
-  get_js_errors <tab>         Get accumulated JS errors since page open
-  clear_js_errors <tab>       Clear accumulated JS errors
-  scroll     <tab> {y}        Scroll page (supports x for horizontal)
+Browser commands (no tab):
+  open <url>              Open URL in new tab (supports --field)
+  list_tabs               List all tabs
+  close_tab <id>          Close tab ("current" for active, or numeric tabId)
 
-Browser commands (no tab needed):
-  open <url>       Open URL in new tab (supports --field)
-  list_tabs        List all tabs
-  close_tab <id>   Close tab (use "current" for active, or numeric tabId)
+Page commands (tab required):
+  click <tab> [params]    Click by selector, text, or {x,y}
+                           selector prefixes: "css:" for CSS, "xpath:" for XPath
+  type <tab> <params>     Type text into input ({selector,text})
+  get_text <tab> [params] Get text of element ({selector}) or entire page
+  get_page_info <tab>     Get page info (url, title, iframes), supports --field
+  get_js_errors <tab>     Get accumulated JS errors
+  clear_js_errors <tab>   Clear accumulated JS errors
+  scroll <tab> <params>   Scroll page ({y} or {x,y})
 
 Examples:
   chrome-do-action --server ws://127.0.0.1:12345 list
