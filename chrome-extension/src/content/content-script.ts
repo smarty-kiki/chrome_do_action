@@ -26,13 +26,16 @@ chrome.runtime.onMessage.addListener(
     if (msg.type !== "execute_command") return;
     const { command } = msg.payload;
 
-    // jsErrors are returned inline when explicitly requested via _field
-    const fields = getFieldFilter(msg.payload.params as Record<string, string[]> | undefined);
-    const includeJsErrors = fields.length === 0 || fields.includes("jsErrors");
+    const includeJsErrors = fields.includes("jsErrors");
     const exec = () => handleCommand(msg.payload);
     const promise = exec().then((result) => {
       if (includeJsErrors && jsErrors.length > 0) {
-        return { ...result, jsErrors: [...jsErrors] };
+        const withErrors = { ...result, jsErrors: [...jsErrors] };
+        if (command === "click") {
+          const { jsErrors: _, ...rest } = withErrors;
+          return rest;
+        }
+        return withErrors;
       }
       return result;
     });

@@ -192,12 +192,6 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_js_errors curre
 chrome-do-action --server ws://127.0.0.1:12345 send OfficePC clear_js_errors current
 ```
 
-在点击等操作的同时附带当前累积的错误：
-
-```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"提交"}' --field "jsErrors"
-```
-
 ### 管理标签页
 
 查看当前所有标签页：
