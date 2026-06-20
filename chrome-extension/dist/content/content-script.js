@@ -16,12 +16,16 @@
     (msg, _sender, sendResponse) => {
       if (msg.type !== "execute_command") return;
       const { command } = msg.payload;
-      const fields = getFieldFilter(msg.payload.params);
-      const includeJsErrors = fields.length === 0 || fields.includes("jsErrors");
+      const includeJsErrors = fields.includes("jsErrors");
       const exec = () => handleCommand(msg.payload);
       const promise = exec().then((result) => {
         if (includeJsErrors && jsErrors.length > 0) {
-          return { ...result, jsErrors: [...jsErrors] };
+          const withErrors = { ...result, jsErrors: [...jsErrors] };
+          if (command === "click") {
+            const { jsErrors: _, ...rest } = withErrors;
+            return rest;
+          }
+          return withErrors;
         }
         return result;
       });
@@ -32,20 +36,20 @@
   function getFieldFilter(params) {
     return params._field || [];
   }
-  function needsField(fields, ...candidates) {
-    if (fields.length === 0) return true;
-    return candidates.some((c) => fields.includes(c));
+  function needsField(fields2, ...candidates) {
+    if (fields2.length === 0) return true;
+    return candidates.some((c) => fields2.includes(c));
   }
-  async function collectPageInfo(fields) {
+  async function collectPageInfo(fields2) {
     const info = {};
-    const has = (name) => fields.length === 0 || fields.some((f) => f === name || f === `currentTab.${name}`);
+    const has = (name) => fields2.length === 0 || fields2.some((f) => f === name || f === `currentTab.${name}`);
     if (has("url")) info.url = window.location.href;
     if (has("title")) info.title = document.title;
     if (has("html")) info.html = document.documentElement.outerHTML;
     return info;
   }
-  async function collectIframes(fields) {
-    if (fields.length > 0 && !fields.includes("iframes")) return [];
+  async function collectIframes(fields2) {
+    if (fields2.length > 0 && !fields2.includes("iframes")) return [];
     const iframes = [];
     document.querySelectorAll("iframe").forEach((f, i) => {
       const iframe = f;
@@ -68,7 +72,7 @@
   }
   async function handleCommand(payload) {
     const { command, params = {} } = payload;
-    const fields = getFieldFilter(params);
+    const fields2 = getFieldFilter(params);
     try {
       switch (command) {
         case "click": {
@@ -112,16 +116,16 @@
           await new Promise((r) => setTimeout(r, 300));
           window.removeEventListener("beforeunload", onBeforeUnload);
           const data = { clickDesc };
-          if (fields.length === 0 || needsField(fields, "navigated")) data.navigated = navigated;
-          if (fields.length === 0 || needsField(fields, "current")) {
-            const pageInfo = await collectPageInfo(fields);
+          if (fields2.length === 0 || needsField(fields2, "navigated")) data.navigated = navigated;
+          if (fields2.length === 0 || needsField(fields2, "current")) {
+            const pageInfo = await collectPageInfo(fields2);
             data.current = pageInfo;
           }
-          if (fields.length === 0 || needsField(fields, "iframeChanged", "iframeChanges")) {
+          if (fields2.length === 0 || needsField(fields2, "iframeChanged", "iframeChanges")) {
             data.iframeChanged = false;
             data.iframeChanges = [];
           }
-          if (fields.length === 0 || needsField(fields, "newTabs")) {
+          if (fields2.length === 0 || needsField(fields2, "newTabs")) {
             data.newTabs = [];
           }
           return { success: true, data };
@@ -143,11 +147,11 @@
         }
         case "get_page_info": {
           const [pageInfo, iframes] = await Promise.all([
-            collectPageInfo(fields),
-            collectIframes(fields)
+            collectPageInfo(fields2),
+            collectIframes(fields2)
           ]);
           const data = { ...pageInfo };
-          if (fields.length === 0 || fields.includes("iframes")) data.iframes = iframes;
+          if (fields2.length === 0 || fields2.includes("iframes")) data.iframes = iframes;
           return { success: true, data };
         }
         case "get_js_errors": {
