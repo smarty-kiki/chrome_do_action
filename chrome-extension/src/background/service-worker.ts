@@ -577,6 +577,24 @@ async function injectContentScript(tabId: number): Promise<void> {
                 if (!el) return { success: false, error: `Element not found: ${selector}` };
                 return { success: true, data: el.textContent?.trim() };
               }
+              case "get_css": {
+                const selector = params.selector as string;
+                if (!selector) return { success: false, error: "selector is required" };
+                const isCss = selector.startsWith("css:");
+                const query = isCss ? selector.slice(4) : selector;
+                const nodes = isCss ? document.querySelectorAll(query) : [findElement(selector)].filter(Boolean) as Element[];
+                if (nodes.length === 0) return { success: false, error: `Element not found: ${selector}` };
+                const results = Array.from(nodes).map((el, i) => {
+                  const computed = window.getComputedStyle(el);
+                  const css: Record<string, string> = {};
+                  for (let j = 0; j < computed.length; j++) {
+                    const prop = computed[j];
+                    css[prop] = computed.getPropertyValue(prop);
+                  }
+                  return { index: i, css };
+                });
+                return { success: true, data: { selector, count: nodes.length, results } };
+              }
               case "get_page_info": {
                 const fields = ((params as Record<string, string[]> | undefined)._field) || [];
                 const data: Record<string, unknown> = {};

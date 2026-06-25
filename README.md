@@ -120,6 +120,7 @@ npm link
 | `click` | `send <id> click <tab> <params>` | 点击元素（selector / text / x,y），返回页面状态和 iframe 变化 |
 | `type` | `send <id> type <tab> <params>` | 输入文本（selector + text） |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本内容，可选 selector |
+| `get_css` | `send <id> get_css <tab> <selector>` | 获取所有匹配元素的 computed style，返回 `{selector, count, results}` |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息（url / title / iframes），--field 按需采集 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取页面打开以来累积的 JS 错误 |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清除累积的 JS 错误 |
@@ -138,6 +139,12 @@ npm link
 ```json
 {"y": 500}                   // 垂直滚动
 {"x": 300, "y": 500}         // 水平 + 垂直
+```
+
+`get_css` 的 selector 支持 `css:` 和 `xpath:` 前缀：
+
+```bash
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_css current "css:#submit-btn"
 ```
 
 ## 通信协议
@@ -253,6 +260,7 @@ npm link
 
 - `get_page_info` → `{ "url": "...", "title": "...", "iframes": [...] }`（对象，字段由 `--field` 控制，不含 `html`）
 - `get_text` → `"登录"`（字符串）
+- `get_css` → `{ "selector": ".item", "count": 3, "results": [{ "index": 0, "css": { "display": "block", ... } }, ...] }`（对象，包含所有匹配元素的 computed style）
 - `type` → `{ "success": true }`（对象）
 - `scroll` → `{ "success": true, "data": { "scrollX": 0, "scrollY": 500 } }`（对象）
 - `get_js_errors` → `{ "errors": [...], "count": 5 }`（对象）

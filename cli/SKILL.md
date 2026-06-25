@@ -244,6 +244,7 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_text current '{
 | `click` | `send <id> click <tab> <params>` | 点击元素 |
 | `type` | `send <id> type <tab> <params>` | 输入文本 |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本内容 |
+| `get_css` | `send <id> get_css <tab> <selector>` | 获取所有匹配元素的 computed style，返回 `{selector, count, results}` |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取 JS 错误 |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空 JS 错误 |

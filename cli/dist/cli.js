@@ -27,6 +27,7 @@ Page commands (tab required):
                            selector prefixes: "css:" for CSS, "xpath:" for XPath
   type <tab> <params>     Type text into input ({selector,text})
   get_text <tab> [params] Get text of element ({selector}) or entire page
+  get_css <tab> <selector> Get computed CSS of element ({selector})
   get_page_info <tab>     Get page info (url, title, iframes), supports --field
   get_js_errors <tab>     Get accumulated JS errors
   clear_js_errors <tab>   Clear accumulated JS errors
@@ -41,7 +42,8 @@ Examples:
   chrome-do-action --server ws://127.0.0.1:12345 send abc get_page_info current
   chrome-do-action --server ws://127.0.0.1:12345 send abc click current '{"text":"登录"}'
   chrome-do-action --server ws://127.0.0.1:12345 send abc click current --field "currentTab.url,newTabs"
-  chrome-do-action --server ws://127.0.0.1:12345 send abc scroll current '{"y":500}'`;
+  chrome-do-action --server ws://127.0.0.1:12345 send abc scroll current '{"y":500}'
+  chrome-do-action --server ws://127.0.0.1:12345 send abc get_css current "h1.title"`;
 function parseArgs(argv) {
     const raw = {};
     const positional = [];
@@ -90,7 +92,7 @@ function buildMessage(action, args) {
             console.error("Usage: chrome-do-action --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id>");
-            console.error("Page commands (tab required): click | type | get_text | get_page_info | get_js_errors | clear_js_errors | scroll");
+            console.error("Page commands (tab required): click | type | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | scroll");
             console.error("");
             console.error("Example: chrome-do-action --server ws://127.0.0.1:12345 send abc123 get_page_info current");
             process.exit(1);
@@ -126,14 +128,25 @@ function buildMessage(action, args) {
             process.exit(1);
         }
         let params = {};
-        const raw = args[3] || "";
-        if (raw) {
-            try {
-                params = JSON.parse(stripQuotes(raw));
-            }
-            catch {
-                console.error(`Invalid params JSON: ${raw}`);
+        if (command === "get_css") {
+            const selector = args[3];
+            if (!selector) {
+                console.error(`Error: "get_css" requires a selector argument.`);
+                console.error(`Usage: chrome-do-action --server <url> send ${nodeId} get_css <tabId> <selector>`);
                 process.exit(1);
+            }
+            params = { selector };
+        }
+        else {
+            const raw = args[3] || "";
+            if (raw) {
+                try {
+                    params = JSON.parse(stripQuotes(raw));
+                }
+                catch {
+                    console.error(`Invalid params JSON: ${raw}`);
+                    process.exit(1);
+                }
             }
         }
         return {
