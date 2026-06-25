@@ -188,7 +188,7 @@
     maxRetries: 3,
     retryIntervalMs: 15e3
   });
-  var BROWSER_COMMANDS = /* @__PURE__ */ new Set(["open", "list_tabs", "close_tab"]);
+  var BROWSER_COMMANDS = /* @__PURE__ */ new Set(["open", "list_tabs", "close_tab", "refresh"]);
   var BLOCKED_COMMANDS = /* @__PURE__ */ new Set(["wait_for_page"]);
   var GROUP_TITLE = "chrome_do_action";
   var groupId = null;
@@ -657,6 +657,24 @@
                   if (!el) return { success: false, error: `Element not found: ${selector}` };
                   return { success: true, data: el.textContent?.trim() };
                 }
+                case "get_css": {
+                  const selector = params.selector;
+                  if (!selector) return { success: false, error: "selector is required" };
+                  const isCss = selector.startsWith("css:");
+                  const query = isCss ? selector.slice(4) : selector;
+                  const nodes = isCss ? document.querySelectorAll(query) : [findElement(selector)].filter(Boolean);
+                  if (nodes.length === 0) return { success: false, error: `Element not found: ${selector}` };
+                  const results = Array.from(nodes).map((el, i) => {
+                    const computed = window.getComputedStyle(el);
+                    const css = {};
+                    for (let j = 0; j < computed.length; j++) {
+                      const prop = computed[j];
+                      css[prop] = computed.getPropertyValue(prop);
+                    }
+                    return { index: i, css };
+                  });
+                  return { success: true, data: { selector, count: nodes.length, results } };
+                }
                 case "get_page_info": {
                   const fields = params._field || [];
                   const data = {};
@@ -875,6 +893,27 @@
             success: true,
             data: tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active }))
           });
+          break;
+        }
+        case "refresh": {
+          let tabId;
+          if (params.tabId === "current") {
+            const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (!tabs[0]?.id) {
+              sendResult({ commandId: cmd.id, success: false, error: "No active tab" });
+              return;
+            }
+            tabId = tabs[0].id;
+          } else {
+            tabId = params.tabId;
+          }
+          if (tabId == null) {
+            sendResult({ commandId: cmd.id, success: false, error: "Missing tabId parameter" });
+            return;
+          }
+          await chrome.tabs.reload(tabId);
+          await waitForTabLoad(tabId);
+          sendResult({ commandId: cmd.id, success: true });
           break;
         }
         case "close_tab": {

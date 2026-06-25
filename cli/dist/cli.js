@@ -21,6 +21,7 @@ Browser commands (no tab):
   open <url>              Open URL in new tab (supports --field)
   list_tabs               List all tabs
   close_tab <id>          Close tab ("current" for active, or numeric tabId)
+  refresh <id>            Reload tab ("current" for active, or numeric tabId)
 
 Page commands (tab required):
   click <tab> [params]    Click by selector, text, or {x,y}
@@ -79,7 +80,7 @@ function stripQuotes(s) {
     }
     return s;
 }
-const BROWSER_CMDS = new Set(["open", "list_tabs", "close_tab"]);
+const BROWSER_CMDS = new Set(["open", "list_tabs", "close_tab", "refresh"]);
 // --- build CLI message ---
 function buildMessage(action, args) {
     if (action === "list") {
@@ -91,7 +92,7 @@ function buildMessage(action, args) {
         if (!nodeId || !command) {
             console.error("Usage: chrome-do-action --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
-            console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id>");
+            console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
             console.error("Page commands (tab required): click | type | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | scroll");
             console.error("");
             console.error("Example: chrome-do-action --server ws://127.0.0.1:12345 send abc123 get_page_info current");
@@ -106,6 +107,9 @@ function buildMessage(action, args) {
                         params = { url: raw };
                         break;
                     case "close_tab":
+                        params = { tabId: parseInt(raw, 10) || raw };
+                        break;
+                    case "refresh":
                         params = { tabId: parseInt(raw, 10) || raw };
                         break;
                 }

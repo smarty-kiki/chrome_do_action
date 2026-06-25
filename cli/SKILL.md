@@ -212,6 +212,25 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC close_tab current
 chrome-do-action --server ws://127.0.0.1:12345 send OfficePC close_tab 456
 ```
 
+刷新指定标签页，`current` 表示当前活跃页：
+
+```bash
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC refresh current
+```
+
+也可传入数字 tabId 刷新非活跃页：
+
+```bash
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC refresh 456
+```
+
+刷新后等待页面完全加载再返回，配合 `get_page_info` 确认加载结果：
+
+```bash
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC refresh current
+chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_page_info current
+```
+
 ### 组合场景：抓取表格数据
 
 ```bash
@@ -236,6 +255,7 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_text current '{
 | `open <url>` | `send <id> open <url>` | 打开新标签页，等待加载完成 |
 | `list_tabs` | `send <id> list_tabs` | 列出所有标签页 |
 | `close_tab <id>` | `send <id> close_tab current` | 关闭标签页 |
+| `refresh <id>` | `send <id> refresh current` | 刷新标签页，等待加载完成 |
 
 ### 页面命令
 

@@ -13,7 +13,7 @@ const wsClient = new WsClient({
 });
 
 // Browser-level commands handled directly in background (no content script needed)
-const BROWSER_COMMANDS = new Set(["open", "list_tabs", "close_tab"]);
+const BROWSER_COMMANDS = new Set(["open", "list_tabs", "close_tab", "refresh"]);
 
 // Commands that exist in content script but are not exposed via remote control
 const BLOCKED_COMMANDS = new Set(["wait_for_page"]);
@@ -830,6 +830,28 @@ async function handleBrowserCommand(cmd: CommandMessage): Promise<void> {
           success: true,
           data: tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active })),
         });
+        break;
+      }
+
+      case "refresh": {
+        let tabId: number;
+        if (params.tabId === "current") {
+          const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (!tabs[0]?.id) {
+            sendResult({ commandId: cmd.id!, success: false, error: "No active tab" });
+            return;
+          }
+          tabId = tabs[0].id;
+        } else {
+          tabId = params.tabId as number;
+        }
+        if (tabId == null) {
+          sendResult({ commandId: cmd.id!, success: false, error: "Missing tabId parameter" });
+          return;
+        }
+        await chrome.tabs.reload(tabId);
+        await waitForTabLoad(tabId);
+        sendResult({ commandId: cmd.id!, success: true });
         break;
       }
 
