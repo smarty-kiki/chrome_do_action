@@ -3,7 +3,7 @@ import WebSocket from "ws";
 
 // --- argument parsing ---
 
-const FULL_HELP = `Usage: chrome-do-action --server <ws_url> <action> [args...]
+const FULL_HELP = `Usage: cda --server <ws_url> <action> [args...]
 
 Actions:
   list                              List connected clients
@@ -32,16 +32,16 @@ Page commands (tab required):
   scroll <tab> <params>   Scroll page ({y} or {x,y})
 
 Examples:
-  chrome-do-action list
-  chrome-do-action send abc open https://example.com
-  chrome-do-action send abc list_tabs
-  chrome-do-action send abc close_tab current
-  chrome-do-action send abc close_tab 456
-  chrome-do-action send abc get_page_info current
-  chrome-do-action send abc click current '{"text":"登录"}'
-  chrome-do-action send abc click current --field "currentTab.url,newTabs"
-  chrome-do-action send abc scroll current '{"y":500}'
-  chrome-do-action send abc get_css current "h1.title"`;
+  cda list
+  cda send abc open https://example.com
+  cda send abc list_tabs
+  cda send abc close_tab current
+  cda send abc close_tab 456
+  cda send abc get_page_info current
+  cda send abc click current '{"text":"登录"}'
+  cda send abc click current --field "currentTab.url,newTabs"
+  cda send abc scroll current '{"y":500}'
+  cda send abc get_css current "h1.title"`;
 
 function parseArgs(argv: string[]): { server: string; action: string; args: string[]; raw: Record<string, string> } {
   const raw: Record<string, string> = {};
@@ -89,12 +89,12 @@ function buildMessage(action: string, args: string[]): Record<string, unknown> {
     const nodeId = args[0];
     const command = args[1];
     if (!nodeId || !command) {
-      console.error("Usage: chrome-do-action --server <url> send <nodeId> <command> [tabId] [params]");
+      console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
       console.error("");
       console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
       console.error("Page commands (tab required): click | type | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | scroll");
       console.error("");
-      console.error("Example: chrome-do-action send abc123 get_page_info current");
+      console.error("Example: cda send abc123 get_page_info current");
       process.exit(1);
     }
 
@@ -124,8 +124,8 @@ function buildMessage(action: string, args: string[]): Record<string, unknown> {
     const tabId = args[2];
     if (!tabId) {
       console.error(`Error: page command "${command}" requires a tab.`);
-      console.error(`Usage: chrome-do-action --server <url> send ${nodeId} ${command} current|<tabId> [params]`);
-      console.error(`Example: chrome-do-action --server ws://127.0.0.1:12345 send ${nodeId} ${command} current`);
+      console.error(`Usage: cda --server <url> send ${nodeId} ${command} current|<tabId> [params]`);
+      console.error(`Example: cda --server ws://127.0.0.1:12345 send ${nodeId} ${command} current`);
       process.exit(1);
     }
     if (tabId !== "current" && !/^\d+$/.test(tabId)) {
@@ -138,7 +138,7 @@ function buildMessage(action: string, args: string[]): Record<string, unknown> {
       const selector = args[3];
       if (!selector) {
         console.error(`Error: "get_css" requires a selector argument.`);
-        console.error(`Usage: chrome-do-action --server <url> send ${nodeId} get_css <tabId> <selector>`);
+        console.error(`Usage: cda --server <url> send ${nodeId} get_css <tabId> <selector>`);
         process.exit(1);
       }
       params = { selector };
