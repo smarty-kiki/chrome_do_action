@@ -13,10 +13,12 @@ node dist/server.js --port 12345 --log-dir /tmp/chrome/
 # 2. Chrome 加载扩展（chrome-extension/dist/），在弹出窗填写服务端地址
 ```
 
+`--server` 默认为 `ws://127.0.0.1:12345`，本地运行时可省略。
+
 确认浏览器已在线：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 list
+chrome-do-action list
 ```
 
 返回类似 `OfficePC  Chrome  192.168.1.5  online 123s`，记下节点名称（如 `OfficePC`），后续命令用它指定目标浏览器。
@@ -110,13 +112,13 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"se
 ### 打开页面并确认加载成功
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC open https://example.com
+chrome-do-action send OfficePC open https://example.com
 ```
 
 返回页面 url、title 和 iframe 列表。需要只看 URL 和标题：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC open https://example.com --field "currentTab.url,currentTab.title"
+chrome-do-action send OfficePC open https://example.com --field "currentTab.url,currentTab.title"
 ```
 
 ### 登录表单（type + click）
@@ -125,15 +127,15 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC open https://exampl
 
 ```bash
 # 点击聚焦用户名输入框并输入
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#username"}'
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#username","text":"admin"}'
+chrome-do-action send OfficePC click current '{"selector":"#username"}'
+chrome-do-action send OfficePC type current '{"selector":"#username","text":"admin"}'
 
 # 点击聚焦密码输入框并输入
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#password"}'
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#password","text":"secret"}'
+chrome-do-action send OfficePC click current '{"selector":"#password"}'
+chrome-do-action send OfficePC type current '{"selector":"#password","text":"secret"}'
 
 # 点击登录
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"登录"}'
+chrome-do-action send OfficePC click current '{"text":"登录"}'
 ```
 
 点击登录后如果页面跳转，返回中 `navigated: true`，并包含新页面的 `currentTab` 信息。如果弹出了新标签页，返回中会出现 `newTabs` 数组。
@@ -141,7 +143,7 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"te
 只看登录后跳转到了哪个 URL：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"登录"}' --field "currentTab.url,navigated"
+chrome-do-action send OfficePC click current '{"text":"登录"}' --field "currentTab.url,navigated"
 ```
 
 ### 提取页面内容
@@ -149,20 +151,20 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"te
 按文字查找按钮并获取页面文本：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"提交"}'
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_text current
+chrome-do-action send OfficePC click current '{"text":"提交"}'
+chrome-do-action send OfficePC get_text current
 ```
 
 获取特定元素的文本：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_text current '{"selector":".result"}'
+chrome-do-action send OfficePC get_text current '{"selector":".result"}'
 ```
 
 提取后通过管道传给其他工具处理：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_text current '{"selector":"#price"}' | xargs echo "价格："
+chrome-do-action send OfficePC get_text current '{"selector":"#price"}' | xargs echo "价格："
 ```
 
 ### 滚动加载长页面
@@ -170,7 +172,7 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_text current '{
 滚动到底部等待内容加载（如懒加载的列表）：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC scroll current '{"y": 99999}'
+chrome-do-action send OfficePC scroll current '{"y": 99999}'
 ```
 
 滚动后等 DOM 稳定再返回，适合配合 `get_text` 提取新加载的内容。
@@ -180,8 +182,8 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC scroll current '{"y
 打开页面后检查是否有前端报错：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC open https://example.com
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_js_errors current
+chrome-do-action send OfficePC open https://example.com
+chrome-do-action send OfficePC get_js_errors current
 ```
 
 返回 `{ errors: [...], count: N }`，每条错误包含 `message`、`source`（文件名）、`lineno`（行号）。
@@ -189,7 +191,7 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_js_errors curre
 查看错误后清空，方便下一次操作重新计数：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC clear_js_errors current
+chrome-do-action send OfficePC clear_js_errors current
 ```
 
 ### 管理标签页
@@ -197,51 +199,51 @@ chrome-do-action --server ws://127.0.0.1:12345 send OfficePC clear_js_errors cur
 查看当前所有标签页：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC list_tabs
+chrome-do-action send OfficePC list_tabs
 ```
 
 关闭指定标签页，`current` 表示当前活跃页：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC close_tab current
+chrome-do-action send OfficePC close_tab current
 ```
 
 也可传入数字 tabId 关闭非活跃页：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC close_tab 456
+chrome-do-action send OfficePC close_tab 456
 ```
 
 刷新指定标签页，`current` 表示当前活跃页：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC refresh current
+chrome-do-action send OfficePC refresh current
 ```
 
 也可传入数字 tabId 刷新非活跃页：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC refresh 456
+chrome-do-action send OfficePC refresh 456
 ```
 
 刷新后等待页面完全加载再返回，配合 `get_page_info` 确认加载结果：
 
 ```bash
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC refresh current
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_page_info current
+chrome-do-action send OfficePC refresh current
+chrome-do-action send OfficePC get_page_info current
 ```
 
 ### 组合场景：抓取表格数据
 
 ```bash
 # 打开页面
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC open https://example.com/data
+chrome-do-action send OfficePC open https://example.com/data
 
 # 滚动到底部加载全部数据
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC scroll current '{"y": 99999}'
+chrome-do-action send OfficePC scroll current '{"y": 99999}'
 
 # 提取表格文本
-chrome-do-action --server ws://127.0.0.1:12345 send OfficePC get_text current '{"selector":"table"}'
+chrome-do-action send OfficePC get_text current '{"selector":"table"}'
 ```
 
 ## 命令速查

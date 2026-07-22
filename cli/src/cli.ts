@@ -32,16 +32,16 @@ Page commands (tab required):
   scroll <tab> <params>   Scroll page ({y} or {x,y})
 
 Examples:
-  chrome-do-action --server ws://127.0.0.1:12345 list
-  chrome-do-action --server ws://127.0.0.1:12345 send abc open https://example.com
-  chrome-do-action --server ws://127.0.0.1:12345 send abc list_tabs
-  chrome-do-action --server ws://127.0.0.1:12345 send abc close_tab current
-  chrome-do-action --server ws://127.0.0.1:12345 send abc close_tab 456
-  chrome-do-action --server ws://127.0.0.1:12345 send abc get_page_info current
-  chrome-do-action --server ws://127.0.0.1:12345 send abc click current '{"text":"登录"}'
-  chrome-do-action --server ws://127.0.0.1:12345 send abc click current --field "currentTab.url,newTabs"
-  chrome-do-action --server ws://127.0.0.1:12345 send abc scroll current '{"y":500}'
-  chrome-do-action --server ws://127.0.0.1:12345 send abc get_css current "h1.title"`;
+  chrome-do-action list
+  chrome-do-action send abc open https://example.com
+  chrome-do-action send abc list_tabs
+  chrome-do-action send abc close_tab current
+  chrome-do-action send abc close_tab 456
+  chrome-do-action send abc get_page_info current
+  chrome-do-action send abc click current '{"text":"登录"}'
+  chrome-do-action send abc click current --field "currentTab.url,newTabs"
+  chrome-do-action send abc scroll current '{"y":500}'
+  chrome-do-action send abc get_css current "h1.title"`;
 
 function parseArgs(argv: string[]): { server: string; action: string; args: string[]; raw: Record<string, string> } {
   const raw: Record<string, string> = {};
@@ -64,14 +64,7 @@ function parseArgs(argv: string[]): { server: string; action: string; args: stri
     process.exit(0);
   }
 
-  const server = raw.server;
-  if (!server) {
-    console.error("Error: --server <ws_url> is required. Use --help for usage.");
-    console.error("");
-    console.error("Example: chrome-do-action --server ws://127.0.0.1:12345 list");
-    console.error("         chrome-do-action --help");
-    process.exit(1);
-  }
+  const server = raw.server || "ws://127.0.0.1:12345";
 
   return { server, action: positional[0] || "", args: positional.slice(1), raw };
 }
@@ -101,7 +94,7 @@ function buildMessage(action: string, args: string[]): Record<string, unknown> {
       console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
       console.error("Page commands (tab required): click | type | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | scroll");
       console.error("");
-      console.error("Example: chrome-do-action --server ws://127.0.0.1:12345 send abc123 get_page_info current");
+      console.error("Example: chrome-do-action send abc123 get_page_info current");
       process.exit(1);
     }
 
