@@ -373,9 +373,9 @@ async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown
     if (needContentScript) {
       await waitForTabLoad(tabId);
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (attempt > 0) await new Promise(r => setTimeout(r, 300));
+        if (attempt > 0) await new Promise(r => setTimeout(r, 100));
         const resp = await new Promise<{ data?: FullPageInfo }>((resolve) => {
-          const timer = setTimeout(() => resolve({}), 2000);
+          const timer = setTimeout(() => resolve({}), 800);
           chrome.tabs.sendMessage(tabId, {
             type: "execute_command",
             payload: { command: "get_page_info", params: { _field: mappedFields } },
@@ -558,7 +558,7 @@ async function injectContentScript(tabId: number): Promise<void> {
                 let navigated = false;
                 const onBeforeUnload = () => { navigated = true; };
                 window.addEventListener("beforeunload", onBeforeUnload, { once: true });
-                await new Promise((r) => setTimeout(r, 300));
+                await new Promise((r) => setTimeout(r, 200));
                 window.removeEventListener("beforeunload", onBeforeUnload);
                 return { success: true, navigated, data: clickDesc };
               }
@@ -688,13 +688,13 @@ async function injectContentScript(tabId: number): Promise<void> {
               quietTimer = window.setTimeout(() => {
                 observer.disconnect();
                 resolve();
-              }, 500);
+              }, 250);
             });
             observer.observe(document.body, { childList: true, subtree: true });
             quietTimer = window.setTimeout(() => {
               observer.disconnect();
               resolve();
-            }, 500);
+            }, 250);
             setTimeout(() => {
               observer.disconnect();
               clearTimeout(quietTimer);

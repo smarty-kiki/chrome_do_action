@@ -114,7 +114,7 @@
             navigated = true;
           };
           window.addEventListener("beforeunload", onBeforeUnload, { once: true });
-          await new Promise((r) => setTimeout(r, 300));
+          await new Promise((r) => setTimeout(r, 200));
           window.removeEventListener("beforeunload", onBeforeUnload);
           const data = { clickDesc };
           if (fields.length === 0 || needsField(fields, "navigated")) data.navigated = navigated;
@@ -236,7 +236,7 @@
         quietTimer = window.setTimeout(() => {
           observer.disconnect();
           resolve();
-        }, 500);
+        }, 250);
       });
       observer.observe(document.body, { childList: true, subtree: true });
       quietTimer = window.setTimeout(() => {
