@@ -298,6 +298,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取 JS 错误 |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空 JS 错误 |
+| `screenshot` | `send <id> screenshot <tab> <params>` | CDP 截图当前页面（只读，不注入代码）；`{"path":"/tmp/shot.png"}` 保存到本地 |
 | `scroll` | `send <id> scroll <tab> <params>` | 滚动页面 |
 
 ### click 定位方式
@@ -362,6 +363,17 @@ cda send OfficePC get_text current '{"selector":"table"}'
 {"y": 500}                   // 垂直滚动
 {"x": 300, "y": 500}         // 水平 + 垂直
 ```
+
+### screenshot
+
+```json
+{"path": "/tmp/shot.png"}    // 截图保存路径（默认 screenshot.png）
+```
+
+- 通过 CDP `Page.captureScreenshot` 截取当前标签页（PNG），返回 base64，CLI 自动解码保存到 `path`
+- 只读能力（等同 DevTools 截图），不注入代码、不修改页面
+- 用于确认页面真实视觉状态（元素遮挡、浮层、滚动位置），避免仅凭 DOM 快照盲猜坐标
+- 适用：操作前确认页面状态、排查点击无响应（如浮层遮罩挡住目标元素）
 
 ## 注意事项
 

@@ -16,7 +16,7 @@ const wsClient = new WsClient({
 const BROWSER_COMMANDS = new Set(["open", "list_tabs", "close_tab", "refresh"]);
 
 // Commands that need a real trusted click via chrome.debugger
-const REAL_CLICK_COMMANDS = new Set(["real_click"]);
+const REAL_CLICK_COMMANDS = new Set(["real_click", "screenshot"]);
 
 // CDP 模拟鼠标的当前位置（跨调用保留，模拟真实鼠标在页面上的持续位置）
 let lastMouseX = 0;
@@ -1026,6 +1026,20 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
   try {
     if (tabId == null) {
       sendResult({ success: false, error: "Missing tabId parameter" });
+      return;
+    }
+
+    // screenshot: 通过 CDP Page.captureScreenshot 截取当前页面（只读，不注入代码）
+    if (cmd.payload.command === "screenshot") {
+      await chrome.debugger.attach({ tabId }, "1.3");
+      try {
+        const result = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", {
+          format: "png",
+        });
+        sendResult({ success: true, data: result?.data ?? null });
+      } finally {
+        await chrome.debugger.detach({ tabId }).catch(() => {});
+      }
       return;
     }
 

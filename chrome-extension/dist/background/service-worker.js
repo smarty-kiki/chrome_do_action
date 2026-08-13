@@ -189,7 +189,7 @@
     retryIntervalMs: 15e3
   });
   var BROWSER_COMMANDS = /* @__PURE__ */ new Set(["open", "list_tabs", "close_tab", "refresh"]);
-  var REAL_CLICK_COMMANDS = /* @__PURE__ */ new Set(["real_click"]);
+  var REAL_CLICK_COMMANDS = /* @__PURE__ */ new Set(["real_click", "screenshot"]);
   var lastMouseX = 0;
   var lastMouseY = 0;
   async function moveMouseInSteps(tabId, tx, ty) {
@@ -1066,6 +1066,19 @@
     try {
       if (tabId == null) {
         sendResult({ success: false, error: "Missing tabId parameter" });
+        return;
+      }
+      if (cmd.payload.command === "screenshot") {
+        await chrome.debugger.attach({ tabId }, "1.3");
+        try {
+          const result = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", {
+            format: "png"
+          });
+          sendResult({ success: true, data: result?.data ?? null });
+        } finally {
+          await chrome.debugger.detach({ tabId }).catch(() => {
+          });
+        }
         return;
       }
       let x = params.x;

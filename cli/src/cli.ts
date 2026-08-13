@@ -39,6 +39,8 @@ Page commands (tab required):
   get_page_info <tab>         Get page info (url, title, iframes), supports --field
   get_js_errors <tab>         Get accumulated JS errors
   clear_js_errors <tab>       Clear accumulated JS errors
+  screenshot <tab> <params>   Capture page screenshot via CDP
+                              ({path: "/tmp/shot.png"} saves PNG locally)
   scroll <tab> <params>       Scroll page ({y} or {x,y})
 
 Examples:
@@ -105,7 +107,7 @@ function buildMessage(action: string, args: string[]): Record<string, unknown> {
       console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
       console.error("");
       console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
-      console.error("Page commands (tab required): click | real_click | type | upload_file | paste_rich | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | scroll");
+      console.error("Page commands (tab required): click | real_click | type | upload_file | paste_rich | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | screenshot | scroll");
       console.error("");
       console.error("Example: cda send abc123 get_page_info current");
       process.exit(1);
@@ -190,6 +192,10 @@ if (!action) {
 const fields = raw.field ? raw.field.split(",").map(f => f.trim()).filter(Boolean) : [];
 const msg = buildMessage(action, args);
 
+// Extract command name + params for special handling (e.g. screenshot file save)
+const cmdName = (msg as { payload?: { command?: string } }).payload?.command;
+const cmdParams = ((msg as { payload?: { params?: Record<string, unknown> } }).payload?.params || {}) as Record<string, unknown>;
+
 // Inject _field into params so the browser extension can filter at the source
 if (fields.length > 0 && msg.type === "cli" && (msg.payload as { action?: string } | undefined)?.action === "send") {
   const sendPayload = msg.payload as { params?: Record<string, unknown> };
@@ -215,7 +221,14 @@ ws.on("message", (raw: Buffer) => {
   if (res.type === "cli_result" && res.payload) {
     if (res.payload.success) {
       const data = res.payload.data;
-      if (data !== undefined && data !== null) {
+      // screenshot 命令：data 是 base64 PNG，解码写文件
+      if (cmdName === "screenshot" && typeof data === "string" && data.length > 0) {
+        const outPath = (cmdParams.path as string) || "screenshot.png";
+        const fs = require("fs") as typeof import("fs");
+        const buf = Buffer.from(data, "base64");
+        fs.writeFileSync(outPath, buf);
+        console.log(`Screenshot saved: ${outPath} (${buf.length} bytes)`);
+      } else if (data !== undefined && data !== null) {
         if (Array.isArray(data)) {
           if (data.length === 0) {
             console.log("(empty)");
