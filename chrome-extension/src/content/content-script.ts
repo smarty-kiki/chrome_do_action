@@ -108,13 +108,24 @@ async function handleCommand(
         let el: Element;
         let clickDesc: Record<string, unknown> = {};
 
+        // 派发完整鼠标事件序列（mousedown/mouseup/click），对 Vue/React 事件委托更可靠
+        const dispatchFullClick = (target: Element, x?: number, y?: number) => {
+          const rect = (target as HTMLElement).getBoundingClientRect();
+          const cx = x ?? rect.left + rect.width / 2;
+          const cy = y ?? rect.top + rect.height / 2;
+          const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
+          target.dispatchEvent(new MouseEvent("mousedown", opts));
+          target.dispatchEvent(new MouseEvent("mouseup", opts));
+          target.dispatchEvent(new MouseEvent("click", opts));
+        };
+
         if (params.text) {
           const text = params.text as string;
           const found = findByText(text);
           if (!found) return { success: false, error: `No element found with text: ${text}` };
           el = found;
           clickDesc = { text, tag: (el as HTMLElement).tagName.toLowerCase() };
-          (el as HTMLElement).click();
+          dispatchFullClick(el);
         } else if (params.x !== undefined && params.y !== undefined) {
           const x = params.x as number;
           const y = params.y as number;
@@ -122,9 +133,7 @@ async function handleCommand(
           if (!found) return { success: false, error: `No element at (${x}, ${y})` };
           el = found;
           clickDesc = { x, y, tag: (el as HTMLElement).tagName.toLowerCase() };
-          el.dispatchEvent(new MouseEvent("click", {
-            bubbles: true, cancelable: true, clientX: x, clientY: y, view: window,
-          }));
+          dispatchFullClick(el, x, y);
         } else {
           const selector = params.selector as string;
           if (!selector) return { success: false, error: "Need text, selector, or {x,y}" };
@@ -132,7 +141,7 @@ async function handleCommand(
           if (!found) return { success: false, error: `Element not found: ${selector}` };
           el = found;
           clickDesc = { selector, tag: (el as HTMLElement).tagName.toLowerCase() };
-          (el as HTMLElement).click();
+          dispatchFullClick(el);
         }
 
         let navigated = false;

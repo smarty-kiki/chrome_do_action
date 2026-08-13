@@ -603,13 +603,22 @@
                 case "click": {
                   let el;
                   let clickDesc = {};
+                  const dispatchFullClick = (target, x, y) => {
+                    const rect = target.getBoundingClientRect();
+                    const cx = x ?? rect.left + rect.width / 2;
+                    const cy = y ?? rect.top + rect.height / 2;
+                    const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
+                    target.dispatchEvent(new MouseEvent("mousedown", opts));
+                    target.dispatchEvent(new MouseEvent("mouseup", opts));
+                    target.dispatchEvent(new MouseEvent("click", opts));
+                  };
                   if (params.text) {
                     const text = params.text;
                     const found = findByText(text);
                     if (!found) return { success: false, error: `No element found with text: ${text}` };
                     el = found;
                     clickDesc = { text, tag: el.tagName.toLowerCase() };
-                    el.click();
+                    dispatchFullClick(el);
                   } else if (params.x !== void 0 && params.y !== void 0) {
                     const x = params.x;
                     const y = params.y;
@@ -617,13 +626,7 @@
                     if (!found) return { success: false, error: `No element at (${x}, ${y})` };
                     el = found;
                     clickDesc = { x, y, tag: el.tagName.toLowerCase() };
-                    el.dispatchEvent(new MouseEvent("click", {
-                      bubbles: true,
-                      cancelable: true,
-                      clientX: x,
-                      clientY: y,
-                      view: window
-                    }));
+                    dispatchFullClick(el, x, y);
                   } else {
                     const selector = params.selector;
                     if (!selector) return { success: false, error: "Need text, selector, or {x,y}" };
@@ -631,7 +634,7 @@
                     if (!found) return { success: false, error: `Element not found: ${selector}` };
                     el = found;
                     clickDesc = { selector, tag: el.tagName.toLowerCase() };
-                    el.click();
+                    dispatchFullClick(el);
                   }
                   let navigated = false;
                   const onBeforeUnload = () => {
