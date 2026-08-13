@@ -365,10 +365,14 @@ cda send OfficePC get_text current '{"selector":"table"}'
 send <id> show <tabId> '.js_imagedialog'      // selector 直接位置参数
 ```
 
+**设计动机**：hover 才显示的工具条/菜单（如微信后台封面菜单「从图片库选择」）是自动化里的老大难——用 `real_click` + `approach` 模拟 hover 链需要精确坐标和时序，`get_rect` 还可能因页面隐藏模板返回错误坐标；更糟的是，**移动鼠标去 hover 可能触发已打开菜单的 `mouseleave` 使其关闭**（这正是 `noMove` 方案想解决、最终被 show 取代的原因）。
+
+`show` 换个思路：不模拟 hover，而是把元素**直接焊成常驻可见**，让简单命令也能命中：
+
 - **只改 CSS 样式，不执行代码**：将所有匹配元素的 `visibility` 置为 `visible`、`opacity` 置为 `1`、`display` 若为 `none` 则置为 `block`
+- inline style 优先级最高，不会被 hover CSS 覆盖 → 元素**常驻可见**，不需要模拟鼠标轨迹，也不会因鼠标移动触发 mouseleave
 - **默认作用于所有匹配元素**（无需 all 参数）
-- inline style 优先级最高，不会被 hover CSS 覆盖 → 元素**常驻可见**
-- 用途：hover 才显示的工具条/菜单（如微信后台封面菜单"从图片库选择"等），强制显示后可被 `click` 或 `real_click` 命中
+- 效果：强制显示后，普通 `click`（合成事件）或 `real_click` 都能直接命中菜单项，绕开坐标/时序/鼠标移动的整条脆弱链
 - 组合用法：`show` 显示菜单项 → `click`（或 `real_click`）点击 → 后续流程 → `hide` 还原
 
 ### hide
