@@ -1055,11 +1055,7 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
         type: "mouseReleased", ...clickPoint,
       });
-      // 3.5 移开鼠标（还原 hover 状态，模拟真实点击后离开）
-      await new Promise((r) => setTimeout(r, 80));
-      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
-        type: "mouseMoved", x: x + 1, y: y + 1, button: "none",
-      });
+      // 鼠标保持在目标上（不移开），保留 hover 状态供后续操作（如点击 hover 工具条子项）
     } finally {
       await chrome.debugger.detach({ tabId }).catch(() => {});
     }

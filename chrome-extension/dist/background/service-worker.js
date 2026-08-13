@@ -1089,13 +1089,6 @@
           type: "mouseReleased",
           ...clickPoint
         });
-        await new Promise((r) => setTimeout(r, 80));
-        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
-          type: "mouseMoved",
-          x: x + 1,
-          y: y + 1,
-          button: "none"
-        });
       } finally {
         await chrome.debugger.detach({ tabId }).catch(() => {
         });
