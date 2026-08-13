@@ -23,9 +23,11 @@ Browser commands (no tab):
 Page commands (tab required):
   click <tab> [params]        Click by selector, text, or {x,y}
                               selector prefixes: "css:" for CSS, "xpath:" for XPath
-  real_click <tab> <params>   Full trusted click chain via CDP (move/hover, mousedown,
-                              mouseup, click; isTrusted=true) for sites that ignore
-                              synthetic events (e.g. WeChat MP); same params as click
+  real_click <tab> <params>   Trusted click chain via CDP (isTrusted=true) for sites
+                              that ignore synthetic events (e.g. WeChat MP).
+                              Params: {selector} or {x,y}; optional {approach} =
+                              [[x,y],...] path to move through progressively,
+                              triggering hover chains before clicking
   type <tab> <params>         Type text ({selector,text}); supports input/textarea
                               and contenteditable (rich text, splits by newline)
   upload_file <tab> <params>  Inject base64 image into file input

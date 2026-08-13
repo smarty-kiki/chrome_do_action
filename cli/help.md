@@ -289,7 +289,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | 命令 | 用法 | 说明 |
 |------|------|------|
 | `click` | `send <id> click <tab> <params>` | 点击元素（合成事件） |
-| `real_click` | `send <id> real_click <tab> <params>` | 真实点击（CDP，isTrusted=true），参数同 click；用于合成事件无效的站点（如微信后台） |
+| `real_click` | `send <id> real_click <tab> <params>` | 真实点击（CDP，isTrusted=true），参数 {selector} 或 {x,y}，可选 {approach} 渐进移动路径；用于合成事件无效的站点（如微信后台）及 hover 工具条 |
 | `type` | `send <id> type <tab> <params>` | 输入文本（{selector,text}），支持 input/textarea 与 contenteditable 富文本，富文本按换行分段 |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入本地图片（{selector,base64,filename,mime}），触发 change 事件完成上传 |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | 向 contenteditable 富文本编辑器粘贴带样式的 HTML（{selector,html}），等价于粘贴排好版的文档 |
@@ -312,12 +312,18 @@ cda send OfficePC get_text current '{"selector":"table"}'
 
 ### real_click
 
-- 与 `click` 参数完全相同（selector/text/x,y），但通过 chrome.debugger（CDP）发送**完整真实鼠标事件链**（isTrusted=true）
-- 事件链：`mouseMoved`（触发 mouseover/mouseenter，激活 hover 状态）→ `mousePressed`(mousedown+focus) → `mouseReleased`(mouseup，浏览器自动合成 click) → 移开鼠标
-- 原理：content script 获取元素中心坐标 → 激活窗口 → CDP `Input.dispatchMouseEvent` 发送完整序列
+- 与 `click` 参数基本相同（selector 或 x/y），但通过 chrome.debugger（CDP）发送**完整真实鼠标事件链**（isTrusted=true）
+- 事件链：`mouseMoved`（触发 mouseover/mouseenter，激活 hover 状态）→ `mousePressed`(mousedown+focus) → `mouseReleased`(mouseup，浏览器自动合成 click)
+- 鼠标移动采用**渐进步进**（每步 10px）而非瞬移，能真实触发途经元素的 hover 链；点击后鼠标**停留在目标上**，保持 hover 状态供连续操作
+- **approach 参数**：模拟"先移到触发点、再移到目标"的多级 hover 场景（如微信封面 hover 工具条：先移向封面预览，再移向"换一张"图标，最后点击工具条里的菜单项）
+  ```json
+  // 先渐进经过封面预览和换一张图标（触发 hover 链），最后点击"从图片库选择"
+  {"selector": ".js_imagedialog", "approach": [[720, 224], [767, 201], [811, 200], [830, 240]]}
+  ```
+- 原理：content script 获取元素中心坐标（或直接给 x/y）→ 激活窗口 → CDP `Input.dispatchMouseEvent` 发送完整序列
 - 适用：对合成事件免疫的站点（如微信公众平台后台 Vue 组件）、hover 才显示的工具条元素
 - 副作用：attach 瞬间 Chrome 顶部会出现"正在调试此浏览器"横幅，随即消失
-- 使用：`send <id> real_click <tab> '{"selector":"#submit"}'`
+- 使用：`send <id> real_click <tab> '{"selector":"#submit"}'` 或 `'{"x":100,"y":200}'`
 
 ### type 参数
 

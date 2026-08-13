@@ -190,6 +190,27 @@
   });
   var BROWSER_COMMANDS = /* @__PURE__ */ new Set(["open", "list_tabs", "close_tab", "refresh"]);
   var REAL_CLICK_COMMANDS = /* @__PURE__ */ new Set(["real_click"]);
+  var lastMouseX = 0;
+  var lastMouseY = 0;
+  async function moveMouseInSteps(tabId, tx, ty) {
+    const dx = tx - lastMouseX;
+    const dy = ty - lastMouseY;
+    const dist = Math.max(Math.abs(dx), Math.abs(dy));
+    const steps = Math.max(1, Math.ceil(dist / 10));
+    for (let i = 1; i <= steps; i++) {
+      const px = Math.round(lastMouseX + dx * i / steps);
+      const py = Math.round(lastMouseY + dy * i / steps);
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: px,
+        y: py,
+        button: "none"
+      });
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    lastMouseX = tx;
+    lastMouseY = ty;
+  }
   var BLOCKED_COMMANDS = /* @__PURE__ */ new Set(["wait_for_page"]);
   var GROUP_TITLE = "chrome_do_action";
   var groupId = null;
@@ -1038,6 +1059,7 @@
     const params = cmd.payload.params || {};
     const tabId = params.tabId;
     const selector = params.selector;
+    const approach = params.approach;
     function sendResult(payload) {
       wsClient.send({ type: "command_result", payload: { commandId: cmd.id, ...payload } });
     }
@@ -1046,21 +1068,25 @@
         sendResult({ success: false, error: "Missing tabId parameter" });
         return;
       }
-      const rectResp = await new Promise((resolve) => {
-        const timer2 = setTimeout(() => resolve({}), 8e3);
-        chrome.tabs.sendMessage(tabId, {
-          type: "execute_command",
-          payload: { command: "get_rect", params: { selector } }
-        }, (r) => {
-          clearTimeout(timer2);
-          if (chrome.runtime.lastError) return resolve({});
-          resolve(r);
-        });
-      });
-      const x = rectResp.data?.x;
-      const y = rectResp.data?.y;
+      let x = params.x;
+      let y = params.y;
       if (x == null || y == null) {
-        sendResult({ success: false, error: `Could not locate element: ${selector}` });
+        const rectResp = await new Promise((resolve) => {
+          const timer2 = setTimeout(() => resolve({}), 8e3);
+          chrome.tabs.sendMessage(tabId, {
+            type: "execute_command",
+            payload: { command: "get_rect", params: { selector } }
+          }, (r) => {
+            clearTimeout(timer2);
+            if (chrome.runtime.lastError) return resolve({});
+            resolve(r);
+          });
+        });
+        x = rectResp.data?.x;
+        y = rectResp.data?.y;
+      }
+      if (x == null || y == null) {
+        sendResult({ success: false, error: `Could not locate element: ${selector || `(${x},${y})`}` });
         return;
       }
       await chrome.debugger.attach({ tabId }, "1.3");
@@ -1074,13 +1100,14 @@
         } catch {
         }
         const clickPoint = { x, y, button: "left", clickCount: 1 };
-        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
-          type: "mouseMoved",
-          x,
-          y,
-          button: "none"
-        });
-        await new Promise((r) => setTimeout(r, 120));
+        if (approach && approach.length) {
+          for (const [ax, ay] of approach) {
+            await moveMouseInSteps(tabId, ax, ay);
+            await new Promise((r) => setTimeout(r, 150));
+          }
+        }
+        await moveMouseInSteps(tabId, x, y);
+        await new Promise((r) => setTimeout(r, approach && approach.length ? 400 : 120));
         await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
           type: "mousePressed",
           ...clickPoint

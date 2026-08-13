@@ -18,6 +18,30 @@ const BROWSER_COMMANDS = new Set(["open", "list_tabs", "close_tab", "refresh"]);
 // Commands that need a real trusted click via chrome.debugger
 const REAL_CLICK_COMMANDS = new Set(["real_click"]);
 
+// CDP 模拟鼠标的当前位置（跨调用保留，模拟真实鼠标在页面上的持续位置）
+let lastMouseX = 0;
+let lastMouseY = 0;
+
+// 从当前模拟鼠标位置渐进移动到目标点：分小步连续移动，触发途经元素的
+// mouseover/mouseenter（真实 hover 链）。瞬移（单次 mouseMoved）不会触发
+// weui popover 等依赖逐级 hover 的组件。
+async function moveMouseInSteps(tabId: number, tx: number, ty: number): Promise<void> {
+  const dx = tx - lastMouseX;
+  const dy = ty - lastMouseY;
+  const dist = Math.max(Math.abs(dx), Math.abs(dy));
+  const steps = Math.max(1, Math.ceil(dist / 10));
+  for (let i = 1; i <= steps; i++) {
+    const px = Math.round(lastMouseX + (dx * i) / steps);
+    const py = Math.round(lastMouseY + (dy * i) / steps);
+    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x: px, y: py, button: "none",
+    });
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  lastMouseX = tx;
+  lastMouseY = ty;
+}
+
 // Commands that exist in content script but are not exposed via remote control
 const BLOCKED_COMMANDS = new Set(["wait_for_page"]);
 
@@ -73,7 +97,6 @@ wsClient.onMessage("command", (msg: Message) => {
     handleRealClick(cmd);
     return;
   }
-
   // Page-level command: forward to target tab (or active tab if not specified)
   const tabId = cmd.payload.params?.tabId as number | undefined;
   const params = { ...cmd.payload.params };
@@ -993,6 +1016,8 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
   const params = cmd.payload.params || {};
   const tabId = params.tabId as number | undefined;
   const selector = params.selector as string;
+  // approach: 渐进移动路径 [[x,y],...]，模拟真实鼠标轨迹逐级触发 hover
+  const approach = params.approach as [number, number][] | undefined;
 
   function sendResult(payload: { success: boolean; data?: unknown; error?: string }): void {
     wsClient.send({ type: "command_result", payload: { commandId: cmd.id!, ...payload } });
@@ -1003,23 +1028,27 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       sendResult({ success: false, error: "Missing tabId parameter" });
       return;
     }
-    // 1. content script 获取元素中心坐标
-    const rectResp = await new Promise<{ data?: { x?: number; y?: number } }>((resolve) => {
-      const timer = setTimeout(() => resolve({}), 8000);
-      chrome.tabs.sendMessage(tabId, {
-        type: "execute_command",
-        payload: { command: "get_rect", params: { selector } },
-      }, (r) => {
-        clearTimeout(timer);
-        if (chrome.runtime.lastError) return resolve({});
-        resolve(r as { data?: { x?: number; y?: number } });
-      });
-    });
 
-    const x = rectResp.data?.x;
-    const y = rectResp.data?.y;
+    // 1. 确定点击目标坐标：优先直接 x/y，否则 content script 取元素中心坐标
+    let x = params.x as number | undefined;
+    let y = params.y as number | undefined;
     if (x == null || y == null) {
-      sendResult({ success: false, error: `Could not locate element: ${selector}` });
+      const rectResp = await new Promise<{ data?: { x?: number; y?: number } }>((resolve) => {
+        const timer = setTimeout(() => resolve({}), 8000);
+        chrome.tabs.sendMessage(tabId, {
+          type: "execute_command",
+          payload: { command: "get_rect", params: { selector } },
+        }, (r) => {
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) return resolve({});
+          resolve(r as { data?: { x?: number; y?: number } });
+        });
+      });
+      x = rectResp.data?.x;
+      y = rectResp.data?.y;
+    }
+    if (x == null || y == null) {
+      sendResult({ success: false, error: `Could not locate element: ${selector || `(${x},${y})`}` });
       return;
     }
 
@@ -1041,12 +1070,18 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       //    CDP 的 mousePressed+mouseReleased 会自动产生 click，无需显式发 click
       const clickPoint = { x, y, button: "left" as const, clickCount: 1 };
 
-      // 3.1 鼠标移动到元素中心（触发 mouseover/mouseenter/mousemove，激活 hover 状态）
-      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
-        type: "mouseMoved", x, y, button: "none",
-      });
-      // 3.2 短暂停留，让 hover/样式生效
-      await new Promise((r) => setTimeout(r, 120));
+      // 3.0 渐进移动到 approach 路径各点（模拟真实鼠标轨迹，逐级触发 hover）
+      if (approach && approach.length) {
+        for (const [ax, ay] of approach) {
+          await moveMouseInSteps(tabId, ax, ay);
+          await new Promise((r) => setTimeout(r, 150));
+        }
+      }
+
+      // 3.1 鼠标渐进移动到元素中心（触发 mouseover/mouseenter/mousemove，激活 hover 状态）
+      await moveMouseInSteps(tabId, x, y);
+      // 3.2 短暂停留，让 hover/样式生效（有 approach 时等 popover 展开）
+      await new Promise((r) => setTimeout(r, approach && approach.length ? 400 : 120));
       // 3.3 按下（触发 mousedown + focus）
       await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
         type: "mousePressed", ...clickPoint,
