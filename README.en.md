@@ -143,6 +143,17 @@ cda send OfficePC open https://example.com
 
 ---
 
+## Documentation & integration
+
+Two documents in the repo complement this README:
+
+- **`SKILL.md`** — a **Skill definition** for AI assistants (Claude Code / WorkBuddy, …). Once wired into an AI tool, the AI can drive your local Chrome through `cda` directly — reusing your logged-in session to open pages, fill forms, lay out WeChat MP articles, upload covers, and confirm with screenshots. Setup and the self-check flow live in the "安装 / Install" section inside.
+- **`cli/help.md`** — the **complete CLI reference**: parameter formats, return structures, `--field` paths, plus the **design rationale** behind `show`/`hide`, `real_click` and other commands.
+
+> ⚠️ **Planning to install this project as a skill for your agent? Read both files thoroughly first.** `SKILL.md` defines the skill's trigger scenarios and standard flow (server self-check, node ID lookup, command syntax); `cli/help.md` captures hard-won field experience (confirm coordinates with a screenshot, use `show` for hover menus, the edge cases of rich text and uploads, …). Jumping in with only the README, an agent is likely to trip on the same pitfalls. For everyday manual use, the command reference below covers it.
+
+---
+
 ## Common examples
 
 ### Open a page & confirm it loaded

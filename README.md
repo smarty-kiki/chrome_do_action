@@ -142,6 +142,17 @@ cda send OfficePC open https://example.com
 
 ---
 
+## 文档与集成
+
+仓库里有两份与 README 互补的深度文档：
+
+- **`SKILL.md`** — 面向 AI 助手（Claude Code / WorkBuddy 等）的 **Skill 定义**。接入 AI 工具后，AI 可直接调用 `cda` 操控本机 Chrome：复用你的登录态，帮你打开网页、填表单、给公众号排版、上传封面、截图确认。安装与自检流程见文件内「安装」章节。
+- **`cli/help.md`** — CLI 的**完整命令手册**：每个命令的参数格式、返回结构、`--field` 字段路径，以及 `show`/`hide`、`real_click` 等命令的**设计动机**与适用场景。
+
+> ⚠️ **打算把本项目装成你 Agent 的 skill？请务必通读这两个文件**——`SKILL.md` 定义 skill 的触发场景与标准流程（服务自检、拿节点 ID、命令写法），`cli/help.md` 沉淀了实战踩坑经验（坐标要截图确认、hover 菜单用 `show`、富文本与上传的边界行为等）。只读 README 就上手，Agent 大概率会踩同样的坑。日常手动用 CLI 则看下面「命令速查」即可。
+
+---
+
 ## 常见用法示例
 
 ### 打开页面 & 确认加载
