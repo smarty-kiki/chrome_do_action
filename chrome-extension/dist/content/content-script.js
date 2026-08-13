@@ -136,9 +136,27 @@
           const text = params.text;
           const el = findElement(selector);
           if (!el) return { success: false, error: `Element not found: ${selector}` };
-          el.value = text;
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-          return { success: true };
+          if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+            el.value = text;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            return { success: true };
+          }
+          if (el.isContentEditable) {
+            el.focus();
+            const sel = window.getSelection();
+            if (sel) {
+              const range = document.createRange();
+              range.selectNodeContents(el);
+              sel.removeAllRanges();
+              sel.addRange(range);
+              document.execCommand("delete", false);
+            }
+            document.execCommand("insertText", false, text);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            return { success: true };
+          }
+          return { success: false, error: `Element not typeable: ${selector} (tag=${el.tagName}, contentEditable=${el.contentEditable})` };
         }
         case "get_text": {
           const selector = params.selector;
