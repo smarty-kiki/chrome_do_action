@@ -316,13 +316,15 @@ cda send OfficePC get_text current '{"selector":"table"}'
 - 与 `click` 参数基本相同（selector 或 x/y），但通过 chrome.debugger（CDP）发送**完整真实鼠标事件链**（isTrusted=true）
 - 事件链：`mouseMoved`（触发 mouseover/mouseenter，激活 hover 状态）→ `mousePressed`(mousedown+focus) → `mouseReleased`(mouseup，浏览器自动合成 click)
 - 鼠标移动采用**渐进步进**（每步 10px）而非瞬移，能真实触发途经元素的 hover 链；点击后鼠标**停留在目标上**，保持 hover 状态供连续操作
-- **approach 参数**：模拟"先移到触发点、再移到目标"的多级 hover 场景（如微信封面 hover 工具条：先移向封面预览，再移向"换一张"图标，最后点击工具条里的菜单项）
+- **approach 参数**：模拟"先移到触发点、再移到目标"的多级 hover 场景（如微信封面 hover 工具条：先移向封面按钮，再点击工具条里的菜单项）
   ```json
-  // 先渐进经过封面预览和换一张图标（触发 hover 链），最后点击"从图片库选择"
-  {"selector": ".js_imagedialog", "approach": [[720, 224], [767, 201], [811, 200], [830, 240]]}
+  // 先渐进经过封面按钮（触发 hover 菜单），最后点击"从图片库选择"菜单项
+  {"x": 500, "y": 343, "approach": [[360, 360], [420, 330], [470, 325]]}
   ```
+- **noMove 参数**：`{"x":500, "y":343, "noMove": true}`——跳过鼠标移动，直接在目标坐标 press/release。用于**菜单已显示**的场景：不移动内部鼠标位置，避免触发触发器 mouseleave 导致 popover 关闭（菜单显示后用 noMove 点菜单项，成功率高）
 - 原理：content script 获取元素中心坐标（或直接给 x/y）→ 激活窗口 → CDP `Input.dispatchMouseEvent` 发送完整序列
 - 适用：对合成事件免疫的站点（如微信公众平台后台 Vue 组件）、hover 才显示的工具条元素
+- 注意：**坐标必须是元素真实位置**（用截图确认），DOM 快照里可能有顶部隐藏模板导致 get_rect 返回错误坐标（如把 y=824 误报成 y=224）
 - 副作用：attach 瞬间 Chrome 顶部会出现"正在调试此浏览器"横幅，随即消失
 - 使用：`send <id> real_click <tab> '{"selector":"#submit"}'` 或 `'{"x":100,"y":200}'`
 
