@@ -216,6 +216,30 @@ async function handleCommand(
         return { success: true, data: { filename, size: bytes.length, mime } };
       }
 
+      case "paste_rich": {
+        // 向富文本编辑器(contenteditable)粘贴带样式的 HTML 内容，等价于粘贴一份排好版的文档
+        const selector = params.selector as string;
+        const html = params.html as string;
+        const el = findElement(selector) as HTMLElement | null;
+        if (!el) return { success: false, error: `Element not found: ${selector}` };
+        if (!el.isContentEditable) {
+          return { success: false, error: `Element is not contenteditable: ${selector} (tag=${el.tagName})` };
+        }
+        el.focus();
+        const sel = window.getSelection();
+        if (sel) {
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          document.execCommand("delete", false);
+        }
+        // 直接操作 clipboardData 不可行，用 execCommand insertHTML 保留样式
+        document.execCommand("insertHTML", false, html);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        return { success: true, data: { inserted: true } };
+      }
+
       case "get_text": {
         const selector = params.selector as string;
         const el = selector ? findElement(selector) : document.body;

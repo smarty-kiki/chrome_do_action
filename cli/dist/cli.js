@@ -24,15 +24,20 @@ Browser commands (no tab):
   refresh <id>            Reload tab ("current" for active, or numeric tabId)
 
 Page commands (tab required):
-  click <tab> [params]    Click by selector, text, or {x,y}
-                           selector prefixes: "css:" for CSS, "xpath:" for XPath
-  type <tab> <params>     Type text into input ({selector,text})
-  get_text <tab> [params] Get text of element ({selector}) or entire page
-  get_css <tab> <selector> Get computed CSS of element ({selector})
-  get_page_info <tab>     Get page info (url, title, iframes), supports --field
-  get_js_errors <tab>     Get accumulated JS errors
-  clear_js_errors <tab>   Clear accumulated JS errors
-  scroll <tab> <params>   Scroll page ({y} or {x,y})
+  click <tab> [params]        Click by selector, text, or {x,y}
+                              selector prefixes: "css:" for CSS, "xpath:" for XPath
+  type <tab> <params>         Type text ({selector,text}); supports input/textarea
+                              and contenteditable (rich text, splits by newline)
+  upload_file <tab> <params>  Inject base64 image into file input
+                              ({selector,base64,filename,mime}), triggers change
+  paste_rich <tab> <params>   Paste styled HTML into contenteditable
+                              ({selector,html}); clears existing content first
+  get_text <tab> [params]     Get text of element ({selector}) or entire page
+  get_css <tab> <selector>    Get computed CSS of element ({selector})
+  get_page_info <tab>         Get page info (url, title, iframes), supports --field
+  get_js_errors <tab>         Get accumulated JS errors
+  clear_js_errors <tab>       Clear accumulated JS errors
+  scroll <tab> <params>       Scroll page ({y} or {x,y})
 
 Examples:
   cda list
@@ -43,6 +48,9 @@ Examples:
   cda send abc get_page_info current
   cda send abc click current '{"text":"登录"}'
   cda send abc click current --field "currentTab.url,newTabs"
+  cda send abc type current '{"selector":"#title","text":"hello"}'
+  cda send abc paste_rich current '{"selector":".ProseMirror","html":"<section><span>hi</span></section>"}'
+  cda send abc upload_file current '{"selector":"input[type=file]","base64":"<b64>","filename":"a.jpg","mime":"image/jpeg"}'
   cda send abc scroll current '{"y":500}'
   cda send abc get_css current "h1.title"`;
 function parseArgs(argv) {
@@ -86,7 +94,7 @@ function buildMessage(action, args) {
             console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
-            console.error("Page commands (tab required): click | type | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | scroll");
+            console.error("Page commands (tab required): click | type | upload_file | paste_rich | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | scroll");
             console.error("");
             console.error("Example: cda send abc123 get_page_info current");
             process.exit(1);

@@ -183,6 +183,27 @@
           el.dispatchEvent(new Event("change", { bubbles: true }));
           return { success: true, data: { filename, size: bytes.length, mime } };
         }
+        case "paste_rich": {
+          const selector = params.selector;
+          const html = params.html;
+          const el = findElement(selector);
+          if (!el) return { success: false, error: `Element not found: ${selector}` };
+          if (!el.isContentEditable) {
+            return { success: false, error: `Element is not contenteditable: ${selector} (tag=${el.tagName})` };
+          }
+          el.focus();
+          const sel = window.getSelection();
+          if (sel) {
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            sel.removeAllRanges();
+            sel.addRange(range);
+            document.execCommand("delete", false);
+          }
+          document.execCommand("insertHTML", false, html);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          return { success: true, data: { inserted: true } };
+        }
         case "get_text": {
           const selector = params.selector;
           const el = selector ? findElement(selector) : document.body;

@@ -291,6 +291,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | `click` | `send <id> click <tab> <params>` | 点击元素 |
 | `type` | `send <id> type <tab> <params>` | 输入文本（{selector,text}），支持 input/textarea 与 contenteditable 富文本，富文本按换行分段 |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入本地图片（{selector,base64,filename,mime}），触发 change 事件完成上传 |
+| `paste_rich` | `send <id> paste_rich <tab> <params>` | 向 contenteditable 富文本编辑器粘贴带样式的 HTML（{selector,html}），等价于粘贴排好版的文档 |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本内容 |
 | `get_css` | `send <id> get_css <tab> <selector>` | 获取所有匹配元素的 computed style，返回 `{selector, count, results}` |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息 |
@@ -327,6 +328,17 @@ cda send OfficePC get_text current '{"selector":"table"}'
 - 将 base64 图片注入 file input 并触发 `change` 事件，页面监听到后自动上传
 - 适用于无法手动操作系统文件对话框的场景（如无辅助功能权限时上传公众号封面）
 - 图片建议先压缩（如 900x383 JPEG、<100KB），避免 base64 过大
+
+### paste_rich 参数
+
+```json
+{"selector": ".ProseMirror", "html": "<section style=\"text-align:center\"><span style=\"font-weight:bold;font-size:17px\">小标题</span></section>"}
+```
+
+- 向 contenteditable 富文本编辑器（ProseMirror、UEditor 等）粘贴带内联样式的 HTML，保留字号/颜色/加粗/间距等格式
+- 会先清空目标编辑器现有内容再插入（等价于"全选删除后粘贴"）
+- 与 `type`（纯文本）互补：type 写字，paste_rich 粘贴排版
+- 不修改页面源代码，仅向编辑器内容区插入富文本
 
 ### scroll 参数
 
