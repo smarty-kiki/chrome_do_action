@@ -27,7 +27,9 @@ Page commands (tab required):
                               that ignore synthetic events (e.g. WeChat MP).
                               Params: {selector} or {x,y}; optional {approach} =
                               [[x,y],...] path to move through progressively,
-                              triggering hover chains before clicking
+                              triggering hover chains before clicking;
+                              {noMove:true} skips mouse movement (press/release
+                              at target only, keeps popover open)
   type <tab> <params>         Type text ({selector,text}); supports input/textarea
                               and contenteditable (rich text, splits by newline)
   upload_file <tab> <params>  Inject base64 image into file input

@@ -1113,13 +1113,15 @@
         } catch {
         }
         const clickPoint = { x, y, button: "left", clickCount: 1 };
-        if (approach && approach.length) {
-          for (const [ax, ay] of approach) {
-            await moveMouseInSteps(tabId, ax, ay);
-            await new Promise((r) => setTimeout(r, 150));
+        if (!params.noMove) {
+          if (approach && approach.length) {
+            for (const [ax, ay] of approach) {
+              await moveMouseInSteps(tabId, ax, ay);
+              await new Promise((r) => setTimeout(r, 150));
+            }
           }
+          await moveMouseInSteps(tabId, x, y);
         }
-        await moveMouseInSteps(tabId, x, y);
         await new Promise((r) => setTimeout(r, approach && approach.length ? 400 : 120));
         await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
           type: "mousePressed",
