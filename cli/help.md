@@ -146,6 +146,31 @@ cda send OfficePC click current '{"text":"登录"}'
 cda send OfficePC click current '{"text":"登录"}' --field "currentTab.url,navigated"
 ```
 
+### 富文本编辑器输入（公众号/后台系统）
+
+富文本编辑器（ProseMirror、UEditor 等 contenteditable）直接用 type 输入，按换行自动分段：
+
+```bash
+cda send OfficePC click current '{"selector":".ProseMirror"}'
+cda send OfficePC type current '{"selector":".ProseMirror","text":"第一段内容。\n\n第二段内容。"}'
+```
+
+注意：一次传入完整内容，不要分多次 type 追加（会覆盖）。
+
+### 图片上传（file input）
+
+向页面的 file input 注入 base64 图片，触发页面上传逻辑：
+
+```bash
+# 图片先压缩并转 base64（macOS 示例）
+sips -z 383 900 cover.png --out cover.jpg
+B64=$(base64 -i cover.jpg | tr -d '\n')
+
+cda send OfficePC upload_file current "{\"selector\":\"input[type=file]\",\"base64\":\"$B64\",\"filename\":\"cover.jpg\",\"mime\":\"image/jpeg\"}"
+```
+
+适用于无法操作系统文件对话框的场景（如无辅助功能权限时上传公众号封面）。
+
 ### 提取页面内容
 
 按文字查找按钮并获取页面文本：
@@ -264,7 +289,8 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | 命令 | 用法 | 说明 |
 |------|------|------|
 | `click` | `send <id> click <tab> <params>` | 点击元素 |
-| `type` | `send <id> type <tab> <params>` | 输入文本 |
+| `type` | `send <id> type <tab> <params>` | 输入文本（{selector,text}），支持 input/textarea 与 contenteditable 富文本，富文本按换行分段 |
+| `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入本地图片（{selector,base64,filename,mime}），触发 change 事件完成上传 |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本内容 |
 | `get_css` | `send <id> get_css <tab> <selector>` | 获取所有匹配元素的 computed style，返回 `{selector, count, results}` |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息 |
@@ -282,6 +308,26 @@ cda send OfficePC get_text current '{"selector":"table"}'
 {"selector": "xpath://btn"}          // XPath 前缀
 ```
 
+### type 参数
+
+```json
+{"selector": "#username", "text": "admin"}     // input/textarea：直接设置 value
+{"selector": ".ProseMirror", "text": "第一段\n\n第二段"}  // contenteditable：按换行分段插入
+```
+
+- input/textarea：设置 `value` 并触发 `input` + `change` 事件
+- contenteditable（如 ProseMirror 富文本）：聚焦后按 `\n` 分段插入，保留段落结构；一次调用传入完整内容，不要多次追加（会覆盖）
+
+### upload_file 参数
+
+```json
+{"selector": "input[type=file]", "base64": "<base64内容>", "filename": "cover.jpg", "mime": "image/jpeg"}
+```
+
+- 将 base64 图片注入 file input 并触发 `change` 事件，页面监听到后自动上传
+- 适用于无法手动操作系统文件对话框的场景（如无辅助功能权限时上传公众号封面）
+- 图片建议先压缩（如 900x383 JPEG、<100KB），避免 base64 过大
+
 ### scroll 参数
 
 ```json
@@ -296,3 +342,5 @@ cda send OfficePC get_text current '{"selector":"table"}'
 - `--field html` 会被 Content Script 采集但被服务端剥离，不会出现在返回中；如需页面 HTML 内容，用 `get_text` 配合 selector 获取
 - 同一标签页的命令串行执行，前一条完成后下一条才执行，不需要手动等待
 - 点击后如果页面跳转，会自动等待新页面加载完成再返回结果
+- `get_text` 对 textarea 返回空（textContent 不含 value），验证 textarea 输入用 `get_page_info --field "currentTab.html"` 抓 HTML 检查
+- 扩展更新代码后需在 `chrome://extensions` 刷新扩展，且已打开页面需刷新才会重新注入新脚本

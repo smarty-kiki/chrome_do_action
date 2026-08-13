@@ -152,11 +152,36 @@
               sel.addRange(range);
               document.execCommand("delete", false);
             }
-            document.execCommand("insertText", false, text);
+            const paragraphs = text.split(/\n+/).filter((s) => s.length > 0);
+            paragraphs.forEach((para, i) => {
+              document.execCommand("insertText", false, para);
+              if (i < paragraphs.length - 1) document.execCommand("insertParagraph", false);
+            });
             el.dispatchEvent(new Event("input", { bubbles: true }));
             return { success: true };
           }
           return { success: false, error: `Element not typeable: ${selector} (tag=${el.tagName}, contentEditable=${el.contentEditable})` };
+        }
+        case "upload_file": {
+          const selector = params.selector;
+          const base64 = params.base64;
+          const filename = params.filename || "upload.png";
+          const mime = params.mime || "image/png";
+          const el = findElement(selector);
+          if (!el) return { success: false, error: `Element not found: ${selector}` };
+          if (!(el instanceof HTMLInputElement) || el.type !== "file") {
+            return { success: false, error: `Element is not a file input: ${selector}` };
+          }
+          const clean = base64.replace(/^data:[^;]+;base64,/, "");
+          const bin = atob(clean);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          const file = new File([bytes], filename, { type: mime });
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          el.files = dt.files;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return { success: true, data: { filename, size: bytes.length, mime } };
         }
         case "get_text": {
           const selector = params.selector;
