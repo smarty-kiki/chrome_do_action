@@ -134,6 +134,22 @@
           }
           return { success: true, data };
         }
+        case "get_rect": {
+          const selector = params.selector;
+          const el = findElement(selector);
+          if (!el) return { success: false, error: `Element not found: ${selector}` };
+          const rect = el.getBoundingClientRect();
+          return {
+            success: true,
+            data: {
+              selector,
+              x: Math.round(rect.left + rect.width / 2),
+              y: Math.round(rect.top + rect.height / 2),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height)
+            }
+          };
+        }
         case "type": {
           const selector = params.selector;
           const text = params.text;

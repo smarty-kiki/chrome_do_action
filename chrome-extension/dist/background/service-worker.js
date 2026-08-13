@@ -189,6 +189,7 @@
     retryIntervalMs: 15e3
   });
   var BROWSER_COMMANDS = /* @__PURE__ */ new Set(["open", "list_tabs", "close_tab", "refresh"]);
+  var REAL_CLICK_COMMANDS = /* @__PURE__ */ new Set(["real_click"]);
   var BLOCKED_COMMANDS = /* @__PURE__ */ new Set(["wait_for_page"]);
   var GROUP_TITLE = "chrome_do_action";
   var groupId = null;
@@ -227,6 +228,10 @@
         type: "command_result",
         payload: { commandId: cmd.id, success: false, error: `Command "${cmd.payload.command}" is not available` }
       });
+      return;
+    }
+    if (REAL_CLICK_COMMANDS.has(cmd.payload.command)) {
+      handleRealClick(cmd);
       return;
     }
     const tabId = cmd.payload.params?.tabId;
@@ -1027,6 +1032,77 @@
     const config = result;
     if (config.autoConnect && config.serverUrl && config.nodeName) {
       wsClient.connect(config.serverUrl, config.nodeName);
+    }
+  }
+  async function handleRealClick(cmd) {
+    const params = cmd.payload.params || {};
+    const tabId = params.tabId;
+    const selector = params.selector;
+    function sendResult(payload) {
+      wsClient.send({ type: "command_result", payload: { commandId: cmd.id, ...payload } });
+    }
+    try {
+      if (tabId == null) {
+        sendResult({ success: false, error: "Missing tabId parameter" });
+        return;
+      }
+      const rectResp = await new Promise((resolve) => {
+        const timer2 = setTimeout(() => resolve({}), 8e3);
+        chrome.tabs.sendMessage(tabId, {
+          type: "execute_command",
+          payload: { command: "get_rect", params: { selector } }
+        }, (r) => {
+          clearTimeout(timer2);
+          if (chrome.runtime.lastError) return resolve({});
+          resolve(r);
+        });
+      });
+      const x = rectResp.data?.x;
+      const y = rectResp.data?.y;
+      if (x == null || y == null) {
+        sendResult({ success: false, error: `Could not locate element: ${selector}` });
+        return;
+      }
+      await chrome.debugger.attach({ tabId }, "1.3");
+      try {
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          if (tab.windowId != null) {
+            await chrome.windows.update(tab.windowId, { focused: true });
+          }
+          await chrome.tabs.update(tabId, { active: true });
+        } catch {
+        }
+        const clickPoint = { x, y, button: "left", clickCount: 1 };
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+          type: "mouseMoved",
+          x,
+          y,
+          button: "none"
+        });
+        await new Promise((r) => setTimeout(r, 120));
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+          type: "mousePressed",
+          ...clickPoint
+        });
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+          type: "mouseReleased",
+          ...clickPoint
+        });
+        await new Promise((r) => setTimeout(r, 80));
+        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+          type: "mouseMoved",
+          x: x + 1,
+          y: y + 1,
+          button: "none"
+        });
+      } finally {
+        await chrome.debugger.detach({ tabId }).catch(() => {
+        });
+      }
+      sendResult({ success: true, data: { x, y, trusted: true } });
+    } catch (err) {
+      sendResult({ success: false, error: String(err) });
     }
   }
   chrome.storage.onChanged.addListener(

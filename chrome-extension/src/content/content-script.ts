@@ -167,6 +167,24 @@ async function handleCommand(
         return { success: true, data };
       }
 
+      case "get_rect": {
+        // 获取元素在视口中的坐标（供 real_click 真实点击使用）
+        const selector = params.selector as string;
+        const el = findElement(selector) as HTMLElement | null;
+        if (!el) return { success: false, error: `Element not found: ${selector}` };
+        const rect = el.getBoundingClientRect();
+        return {
+          success: true,
+          data: {
+            selector,
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          },
+        };
+      }
+
       case "type": {
         const selector = params.selector as string;
         const text = params.text as string;

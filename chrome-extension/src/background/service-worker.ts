@@ -15,6 +15,9 @@ const wsClient = new WsClient({
 // Browser-level commands handled directly in background (no content script needed)
 const BROWSER_COMMANDS = new Set(["open", "list_tabs", "close_tab", "refresh"]);
 
+// Commands that need a real trusted click via chrome.debugger
+const REAL_CLICK_COMMANDS = new Set(["real_click"]);
+
 // Commands that exist in content script but are not exposed via remote control
 const BLOCKED_COMMANDS = new Set(["wait_for_page"]);
 
@@ -63,6 +66,11 @@ wsClient.onMessage("command", (msg: Message) => {
       type: "command_result",
       payload: { commandId: cmd.id!, success: false, error: `Command "${cmd.payload.command}" is not available` },
     });
+    return;
+  }
+
+  if (REAL_CLICK_COMMANDS.has(cmd.payload.command)) {
+    handleRealClick(cmd);
     return;
   }
 
@@ -964,7 +972,6 @@ async function autoConnect(): Promise<void> {
   if (wsClient.getStatus() === "connected" || wsClient.getStatus() === "connecting") {
     return;
   }
-  // 如果已有定时重试在排队，不干扰 WsClient 自身的重试节奏
   const retry = wsClient.getRetryState();
   if (retry.nextRetryAt && retry.nextRetryAt > Date.now()) {
     return;
@@ -973,6 +980,93 @@ async function autoConnect(): Promise<void> {
   const config = result as Partial<StoredConfig>;
   if (config.autoConnect && config.serverUrl && config.nodeName) {
     wsClient.connect(config.serverUrl, config.nodeName);
+  }
+}
+
+/**
+ * real_click: 通过 chrome.debugger 发送完整真实鼠标事件（isTrusted=true），
+ * 解决微信后台等对合成 click 免疫的 Vue/React 组件点击问题。
+ * 事件链：mouseMoved（触发 mouseover/mouseenter/hover）-> mousePressed(mousedown) -> mouseReleased(mouseup+click) -> mouseMoved(移开)
+ * 流程：content script 获取元素中心坐标 -> debugger 附加页面 -> Input.dispatchMouseEvent 发送完整序列。
+ */
+async function handleRealClick(cmd: CommandMessage): Promise<void> {
+  const params = cmd.payload.params || {};
+  const tabId = params.tabId as number | undefined;
+  const selector = params.selector as string;
+
+  function sendResult(payload: { success: boolean; data?: unknown; error?: string }): void {
+    wsClient.send({ type: "command_result", payload: { commandId: cmd.id!, ...payload } });
+  }
+
+  try {
+    if (tabId == null) {
+      sendResult({ success: false, error: "Missing tabId parameter" });
+      return;
+    }
+    // 1. content script 获取元素中心坐标
+    const rectResp = await new Promise<{ data?: { x?: number; y?: number } }>((resolve) => {
+      const timer = setTimeout(() => resolve({}), 8000);
+      chrome.tabs.sendMessage(tabId, {
+        type: "execute_command",
+        payload: { command: "get_rect", params: { selector } },
+      }, (r) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) return resolve({});
+        resolve(r as { data?: { x?: number; y?: number } });
+      });
+    });
+
+    const x = rectResp.data?.x;
+    const y = rectResp.data?.y;
+    if (x == null || y == null) {
+      sendResult({ success: false, error: `Could not locate element: ${selector}` });
+      return;
+    }
+
+    // 2. 附加 debugger
+    await chrome.debugger.attach({ tabId }, "1.3");
+    try {
+      // 2.1 激活窗口和标签页（CDP 鼠标事件需要窗口在前台才触发页面交互）
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.windowId != null) {
+          await chrome.windows.update(tab.windowId, { focused: true });
+        }
+        await chrome.tabs.update(tabId, { active: true });
+      } catch {
+        // 窗口激活失败不阻断，继续尝试点击
+      }
+      // 3. 发送完整真实鼠标事件序列（模拟真实物理点击的事件链）
+      //    真实点击：mouseover/mouseenter（由 mouseMoved 触发）-> mousedown -> mouseup -> click
+      //    CDP 的 mousePressed+mouseReleased 会自动产生 click，无需显式发 click
+      const clickPoint = { x, y, button: "left" as const, clickCount: 1 };
+
+      // 3.1 鼠标移动到元素中心（触发 mouseover/mouseenter/mousemove，激活 hover 状态）
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x, y, button: "none",
+      });
+      // 3.2 短暂停留，让 hover/样式生效
+      await new Promise((r) => setTimeout(r, 120));
+      // 3.3 按下（触发 mousedown + focus）
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        type: "mousePressed", ...clickPoint,
+      });
+      // 3.4 松开（触发 mouseup，浏览器自动合成 click）
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        type: "mouseReleased", ...clickPoint,
+      });
+      // 3.5 移开鼠标（还原 hover 状态，模拟真实点击后离开）
+      await new Promise((r) => setTimeout(r, 80));
+      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x: x + 1, y: y + 1, button: "none",
+      });
+    } finally {
+      await chrome.debugger.detach({ tabId }).catch(() => {});
+    }
+
+    sendResult({ success: true, data: { x, y, trusted: true } });
+  } catch (err) {
+    sendResult({ success: false, error: String(err) });
   }
 }
 

@@ -26,6 +26,9 @@ Browser commands (no tab):
 Page commands (tab required):
   click <tab> [params]        Click by selector, text, or {x,y}
                               selector prefixes: "css:" for CSS, "xpath:" for XPath
+  real_click <tab> <params>   Full trusted click chain via CDP (move/hover, mousedown,
+                              mouseup, click; isTrusted=true) for sites that ignore
+                              synthetic events (e.g. WeChat MP); same params as click
   type <tab> <params>         Type text ({selector,text}); supports input/textarea
                               and contenteditable (rich text, splits by newline)
   upload_file <tab> <params>  Inject base64 image into file input
@@ -94,7 +97,7 @@ function buildMessage(action, args) {
             console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
-            console.error("Page commands (tab required): click | type | upload_file | paste_rich | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | scroll");
+            console.error("Page commands (tab required): click | real_click | type | upload_file | paste_rich | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | scroll");
             console.error("");
             console.error("Example: cda send abc123 get_page_info current");
             process.exit(1);
