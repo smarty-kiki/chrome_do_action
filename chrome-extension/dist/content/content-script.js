@@ -107,7 +107,7 @@
           if (params.text) {
             const text = params.text;
             const found = findByText(text);
-            if (!found) return { success: false, error: `No element found with text: ${text}` };
+            if (!found) return { success: false, notFound: true, error: `No element found with text: ${text}` };
             el = found;
             clickDesc = { text, tag: el.tagName.toLowerCase() };
             dispatchFullClick(el);
@@ -115,7 +115,7 @@
             const x = params.x;
             const y = params.y;
             const found = document.elementFromPoint(x, y);
-            if (!found) return { success: false, error: `No element at (${x}, ${y})` };
+            if (!found) return { success: false, notFound: true, error: `No element at (${x}, ${y})` };
             el = found;
             clickDesc = { x, y, tag: el.tagName.toLowerCase() };
             dispatchFullClick(el, x, y);
@@ -123,7 +123,7 @@
             const selector = params.selector;
             if (!selector) return { success: false, error: "Need text, selector, or {x,y}" };
             const found = findElement(selector);
-            if (!found) return { success: false, error: `Element not found: ${selector}` };
+            if (!found) return { success: false, notFound: true, error: `Element not found: ${selector}` };
             el = found;
             clickDesc = { selector, tag: el.tagName.toLowerCase() };
             dispatchFullClick(el);
@@ -153,23 +153,41 @@
         case "get_rect": {
           const selector = params.selector;
           const el = findElement(selector);
-          if (!el) return { success: false, error: `Element not found: ${selector}` };
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           const rect = el.getBoundingClientRect();
+          const lx = rect.left + rect.width / 2;
+          const ly = rect.top + rect.height / 2;
+          let x = lx;
+          let y = ly;
+          let crossOrigin = false;
+          let win = window;
+          while (win.frameElement) {
+            try {
+              const fr = win.frameElement.getBoundingClientRect();
+              x += fr.left;
+              y += fr.top;
+            } catch {
+              crossOrigin = true;
+              break;
+            }
+            win = win.parent;
+          }
           return {
             success: true,
             data: {
               selector,
-              x: Math.round(rect.left + rect.width / 2),
-              y: Math.round(rect.top + rect.height / 2),
+              x: Math.round(x),
+              y: Math.round(y),
               width: Math.round(rect.width),
-              height: Math.round(rect.height)
+              height: Math.round(rect.height),
+              ...crossOrigin ? { crossOrigin: true, localX: Math.round(lx), localY: Math.round(ly) } : {}
             }
           };
         }
         case "show": {
           const selector = params.selector;
           const els = Array.from(document.querySelectorAll(selector));
-          if (els.length === 0) return { success: false, error: `Element not found: ${selector}` };
+          if (els.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           for (const el of els) {
             if (!showRegistry.has(el)) {
               showRegistry.set(el, {
@@ -201,7 +219,7 @@
           const selector = params.selector;
           const text = params.text;
           const el = findElement(selector);
-          if (!el) return { success: false, error: `Element not found: ${selector}` };
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
             el.value = text;
             el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -234,7 +252,7 @@
           const filename = params.filename || "upload.png";
           const mime = params.mime || "image/png";
           const el = findElement(selector);
-          if (!el) return { success: false, error: `Element not found: ${selector}` };
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           if (!(el instanceof HTMLInputElement) || el.type !== "file") {
             return { success: false, error: `Element is not a file input: ${selector}` };
           }
@@ -253,7 +271,7 @@
           const selector = params.selector;
           const html = params.html;
           const el = findElement(selector);
-          if (!el) return { success: false, error: `Element not found: ${selector}` };
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           if (!el.isContentEditable) {
             return { success: false, error: `Element is not contenteditable: ${selector} (tag=${el.tagName})` };
           }
@@ -273,7 +291,7 @@
         case "get_text": {
           const selector = params.selector;
           const el = selector ? findElement(selector) : document.body;
-          if (!el) return { success: false, error: `Element not found: ${selector}` };
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           return { success: true, data: el.textContent?.trim() };
         }
         case "get_css": {
@@ -282,7 +300,7 @@
           const isCss = selector.startsWith("css:");
           const query = isCss ? selector.slice(4) : selector;
           const nodes = isCss ? document.querySelectorAll(query) : [findElement(selector)].filter(Boolean);
-          if (nodes.length === 0) return { success: false, error: `Element not found: ${selector}` };
+          if (nodes.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           const results = Array.from(nodes).map((el, i) => {
             const computed = window.getComputedStyle(el);
             const css = {};
@@ -293,6 +311,16 @@
             return { index: i, css };
           });
           return { success: true, data: { selector, count: nodes.length, results } };
+        }
+        case "frame_info": {
+          return {
+            success: true,
+            data: {
+              url: window.location.href,
+              title: document.title,
+              html: document.documentElement.outerHTML
+            }
+          };
         }
         case "get_page_info": {
           const [pageInfo, iframes] = await Promise.all([
@@ -420,4 +448,6 @@
     }
     return document.querySelector(selector);
   }
+  chrome.runtime.sendMessage({ type: "cs_injected" }).catch(() => {
+  });
 })();

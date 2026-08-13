@@ -120,7 +120,13 @@ wsClient.onMessage("command", (msg: Message) => {
 });
 
 chrome.runtime.onMessage.addListener(
-  (msg: { type: string }, _sender: chrome.runtime.MessageSender, sendResponse: (res: { status: ConnectionStatus }) => void) => {
+  (msg: { type: string }, _sender: chrome.runtime.MessageSender, sendResponse: (res: Record<string, unknown>) => void) => {
+    // 内容脚本就绪信号（动态注入后，或 manifest all_frames 注入时都会发）。
+    // 立即响应并关闭消息通道，不进入下面 return true 的异步保活。
+    if (msg.type === "cs_injected") {
+      sendResponse({ ok: true });
+      return;
+    }
     if (msg.type === "connect") {
       const { serverUrl, nodeName } = msg as unknown as { serverUrl: string; nodeName: string };
       if (serverUrl && nodeName) {
@@ -183,204 +189,399 @@ function dequeueNext(tabId: number): void {
   });
 }
 
-function sendToTab(
+async function sendToTab(
   tabId: number,
   cmd: CommandMessage,
   params: Record<string, unknown>,
   onDone?: () => void,
-): void {
-  const isClick = cmd.payload.command === "click";
+): Promise<void> {
+  const command = cmd.payload.command;
+  const isClick = command === "click";
   const fieldFilter = ((cmd.payload.params as Record<string, string[]> | undefined)?._field) || [];
   const needCurrent = fieldFilter.length === 0 || fieldFilter.some(f => f === "currentTab" || f.startsWith("currentTab."));
   const needIframe = fieldFilter.length === 0 || fieldFilter.some(f => f === "iframeChanges" || f.startsWith("iframeChanges."));
+  const needNewTabs = fieldFilter.length === 0 || fieldFilter.some(f => f === "newTabs" || f.startsWith("newTabs."));
   const needBeforeInfo = isClick && needIframe;
 
-  const tabPromise = chrome.tabs.get(tabId);
-  const beforeTabsPromise = tabPromise.then((tab) =>
-    chrome.tabs.query({ windowId: tab.windowId! }),
-  );
-  const beforeFullInfoPromise = needBeforeInfo
-    ? getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined)
-    : Promise.resolve(null);
+  const sendResult = (payload: { commandId: string; success: boolean; data?: unknown; error?: string }): void => {
+    wsClient.send({ type: "command_result", payload: { ...payload, data: payload.data } });
+  };
 
-  const retrying = { value: false };
-
-  function doSend(targetTabId: number): void {
-    function sendResult(payload: { commandId: string; success: boolean; data?: unknown; error?: string | undefined }): void {
-      wsClient.send({ type: "command_result", payload: { ...payload, data: payload.data } });
+  // before 信息（新标签检测需要 beforeTabs；click+iframeChanges 需要 beforeFullInfo）
+  let beforeTabs: chrome.tabs.Tab[] = [];
+  let beforeFullInfo: FullPageInfo | null = null;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (needBeforeInfo || needNewTabs) {
+      beforeTabs = await chrome.tabs.query({ windowId: tab.windowId! });
     }
-
-    chrome.tabs.sendMessage(targetTabId, {
-      type: "execute_command",
-      id: cmd.id,
-      payload: { command: cmd.payload.command, params },
-    }, async (response) => {
-      if (chrome.runtime.lastError) {
-        const msg = chrome.runtime.lastError.message || "";
-
-        // 点击导致页面导航：内容脚本在返回前被销毁，消息通道关闭
-        // 不重试（避免在新页面上重复执行 click），直接获取新页面信息
-        const NAV_ERROR = "The page keeping the extension port is moved into back/forward cache";
-        if (isClick && msg.includes(NAV_ERROR)) {
-          try {
-            const currentInfo = needCurrent
-              ? await getFullPageInfo(targetTabId, cmd.payload.params as Record<string, string[]> | undefined)
-              : null;
-            sendResult({
-              commandId: cmd.id!,
-              success: true,
-              data: {
-                navigated: true,
-                ...(needCurrent ? { currentTab: currentInfo } : { currentTab: null }),
-              },
-            });
-          } catch {
-            sendResult({
-              commandId: cmd.id!,
-              success: true,
-              data: { navigated: true, currentTab: null },
-            });
-          }
-          onDone?.();
-          return;
-        }
-
-        if (!retrying.value && msg.includes("Receiving end does not exist")) {
-          retrying.value = true;
-          try {
-            await injectContentScript(targetTabId);
-          } catch {
-            // injection failed, fall through to error
-          }
-          doSend(targetTabId);
-          return;
-        }
-        sendResult({
-          commandId: cmd.id!,
-          success: false,
-          error: msg.includes("Receiving end does not exist")
-            ? `Tab ${targetTabId}: no content script loaded (is it a chrome:// page or not fully loaded?)`
-            : msg,
-        });
-        onDone?.();
-        return;
-      }
-
-      const navigated = (response?.data as Record<string, unknown> | undefined)?.navigated as boolean | undefined;
-      const needNewTabs = fieldFilter.length === 0 || fieldFilter.some(f => f === "newTabs" || f.startsWith("newTabs."));
-
-      if (navigated) {
-        try {
-          const [beforeTabs, currentTab] = await Promise.all([
-            beforeTabsPromise,
-            chrome.tabs.get(targetTabId),
-          ]);
-          const beforeIds = new Set(beforeTabs.map((t) => t.id));
-
-          const currentInfo = needCurrent
-            ? await getFullPageInfo(targetTabId, cmd.payload.params as Record<string, string[]> | undefined)
-            : null;
-          const afterTabs = await chrome.tabs.query({ windowId: currentTab.windowId! });
-          const newTabIds = needNewTabs
-            ? afterTabs.filter((t) => !beforeIds.has(t.id)).map((t) => t.id)
-            : [];
-
-          const newTabInfos: { tabId: number; url: string; title: string; iframes: FullPageInfo["iframes"] }[] = [];
-          for (const ntid of newTabIds) {
-            try {
-              await waitForTabLoad(ntid);
-            } catch {
-              continue;
-            }
-            const info = await getFullPageInfo(ntid, cmd.payload.params as Record<string, string[]> | undefined);
-            if (info) newTabInfos.push({ tabId: ntid, ...info });
-          }
-
-        const navResult: Record<string, unknown> = {
-          navigated: true,
-        };
-        if (needCurrent) {
-          navResult.currentTab = currentInfo;
-        }
-        if (needNewTabs && newTabInfos.length > 0) navResult.newTabs = newTabInfos;
-        sendResult({
-          commandId: cmd.id!,
-          success: true,
-          data: navResult,
-        });
-        } catch {
-          sendResult({
-            commandId: cmd.id!,
-            success: true,
-            data: { navigated: true, current: null },
-          });
-        }
-      } else if (isClick) {
-        const beforeInfo = needBeforeInfo ? await beforeFullInfoPromise : null;
-        const afterInfo = needCurrent
-          ? await getFullPageInfo(targetTabId, cmd.payload.params as Record<string, string[]> | undefined)
-          : null;
-
-        let newTabInfos: { tabId: number; url: string; title: string; iframes: FullPageInfo["iframes"] }[] = [];
-        const navigated = (response?.data as Record<string, unknown> | undefined)?.navigated as boolean | undefined;
-        if (!navigated && response?.success && needNewTabs) {
-          try {
-            const currentTab = await chrome.tabs.get(targetTabId);
-            const afterTabs = await chrome.tabs.query({ windowId: currentTab.windowId! });
-            const beforeTabIds = beforeTabsPromise.then(bt => new Set(bt.map(t => t.id)));
-            const beforeIds = await beforeTabIds;
-            const newTabIds = afterTabs.filter(t => !beforeIds.has(t.id)).map(t => t.id);
-            for (const ntid of newTabIds) {
-              try { await waitForTabLoad(ntid); } catch { continue; }
-              const info = await getFullPageInfo(ntid, cmd.payload.params as Record<string, string[]> | undefined);
-              if (info) newTabInfos.push({ tabId: ntid, ...info });
-            }
-          } catch {
-            // ignore tab detection errors
-          }
-        }
-
-        const result: Record<string, unknown> = {
-          navigated: navigated ?? false,
-          ...(typeof response?.data === "object" && response?.data !== null ? response.data : {}),
-        };
-        if (needCurrent) {
-          result.currentTab = afterInfo;
-        }
-        if (needIframe) {
-          const iframeChanges = beforeInfo && afterInfo
-            ? diffIframes(beforeInfo.iframes, afterInfo.iframes)
-            : [];
-          if (iframeChanges.length > 0) result.iframeChanges = iframeChanges;
-        }
-        if (needNewTabs && newTabInfos.length > 0) result.newTabs = newTabInfos;
-
-        sendResult({
-          commandId: cmd.id!,
-          success: response?.success ?? false,
-          data: result,
-          error: response?.error,
-        });
-      } else {
-        sendResult({
-          commandId: cmd.id!,
-          success: response?.success ?? false,
-          data: response?.data,
-          error: response?.error,
-        });
-      }
-      onDone?.();
-    });
+    if (needBeforeInfo) {
+      beforeFullInfo = await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined);
+    }
+  } catch {
+    // 预读失败不阻断命令
   }
 
-  doSend(tabId);
+  const msg = { type: "execute_command", id: cmd.id, payload: { command, params } };
+
+  // 特殊命令：jsErrors 广播聚合；clear_js_errors 广播；hide 各 frame 各自还原；
+  // get_page_info 走 SW 侧（含跨域 iframe 元数据补全）
+  if (command === "get_js_errors") {
+    const data = await broadcastJsErrors(tabId);
+    sendResult({ commandId: cmd.id!, success: true, data });
+    onDone?.();
+    return;
+  }
+  if (command === "clear_js_errors") {
+    await broadcastClearJsErrors(tabId);
+    sendResult({ commandId: cmd.id!, success: true, data: {} });
+    onDone?.();
+    return;
+  }
+  if (command === "hide") {
+    const frames = await getFrameTree(tabId);
+    let count = 0;
+    for (const f of frames) {
+      const { response } = await sendToFrame(tabId, f.frameId, msg);
+      count += (response?.data as { count?: number } | undefined)?.count ?? 0;
+    }
+    sendResult({ commandId: cmd.id!, success: true, data: { count } });
+    onDone?.();
+    return;
+  }
+  if (command === "get_page_info") {
+    const info = await getFullPageInfo(tabId, params as Record<string, string[]> | undefined);
+    sendResult({ commandId: cmd.id!, success: info != null, data: info ?? undefined, error: info ? undefined : "get_page_info failed" });
+    onDone?.();
+    return;
+  }
+
+  // 坐标 click 只在顶层（elementFromPoint 语义）；其余元素命令按 frame 搜索
+  const isCoordinateClick = isClick && params.x !== undefined && params.y !== undefined;
+  const searchable = ELEMENT_SEARCH_COMMANDS.has(command) && !isCoordinateClick;
+
+  let response: { success: boolean; data?: unknown; error?: string; notFound?: boolean; navigated?: boolean } | undefined;
+  let matchedFrame: SearchFrame | undefined;
+  let navigatedFallback = false;
+
+  async function doSearch(): Promise<void> {
+    if (!searchable) {
+      const r = await sendToFrame(tabId, 0, msg);
+      response = r.response;
+      return;
+    }
+    const frames = await resolveSearchFrames(tabId, params.frame);
+    for (const f of frames) {
+      const r = await sendToFrame(tabId, f.frameId, msg);
+      if (r.missing) {
+        // 点击导致该 frame 导航：端口关闭、无响应 → 按「已点击 + 导航」处理
+        if (isClick) { navigatedFallback = true; matchedFrame = f; break; }
+        continue;
+      }
+      if (r.response?.notFound) continue;
+      response = r.response;
+      matchedFrame = f;
+      break;
+    }
+  }
+
+  // 若没有任何 frame 有 content script（动态 frame / 页面加载前）：注入一次后重试
+  let injected = false;
+  while (true) {
+    await doSearch();
+    if (response || navigatedFallback) break;
+    if (injected) break;
+    try {
+      await injectContentScript(tabId);
+      injected = true;
+    } catch {
+      break;
+    }
+  }
+
+  const frameAttribution = matchedFrame
+    ? { frame: { frameId: matchedFrame.frameId, url: matchedFrame.url } }
+    : {};
+
+  try {
+    const wasNavigated = navigatedFallback || (response?.data as { navigated?: boolean } | undefined)?.navigated === true;
+    if (wasNavigated) {
+      // 页面/iframe 跳转：取新页面信息
+      const currentInfo = needCurrent
+        ? await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined)
+        : null;
+      const navResult: Record<string, unknown> = { navigated: true };
+      if (needCurrent) navResult.currentTab = currentInfo;
+      if (needNewTabs) {
+        const newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params as Record<string, string[]> | undefined);
+        if (newTabInfos.length > 0) navResult.newTabs = newTabInfos;
+      }
+      sendResult({ commandId: cmd.id!, success: true, data: navResult });
+      onDone?.();
+      return;
+    }
+
+    if (isClick) {
+      const afterInfo = needCurrent
+        ? await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined)
+        : null;
+      let newTabInfos: NewTabInfo[] = [];
+      if (needNewTabs) {
+        try { newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params as Record<string, string[]> | undefined); } catch { /* ignore */ }
+      }
+      const result: Record<string, unknown> = {
+        navigated: false,
+        ...(typeof response?.data === "object" && response?.data !== null ? response.data : {}),
+        ...frameAttribution,
+      };
+      if (needCurrent) result.currentTab = afterInfo;
+      if (needIframe) {
+        const iframeChanges = beforeFullInfo && afterInfo
+          ? diffIframes(beforeFullInfo.iframes, afterInfo.iframes)
+          : [];
+        if (iframeChanges.length > 0) result.iframeChanges = iframeChanges;
+      }
+      if (needNewTabs && newTabInfos.length > 0) result.newTabs = newTabInfos;
+      sendResult({ commandId: cmd.id!, success: response?.success ?? false, data: result, error: response?.error });
+      onDone?.();
+      return;
+    }
+
+    // 常规命令：透传数据 + 命中 frame 归属
+    const data = (typeof response?.data === "object" && response?.data !== null && !Array.isArray(response.data))
+      ? { ...(response.data as Record<string, unknown>), ...frameAttribution }
+      : response?.data;
+    sendResult({ commandId: cmd.id!, success: response?.success ?? false, data, error: response?.error });
+    onDone?.();
+  } catch (err) {
+    sendResult({ commandId: cmd.id!, success: false, error: String(err) });
+    onDone?.();
+  }
+}
+
+type NewTabInfo = { tabId: number; url: string; title: string; iframes: FullPageInfo["iframes"] };
+
+async function collectNewTabs(tabId: number, beforeTabs: chrome.tabs.Tab[], cmdParams?: Record<string, unknown>): Promise<NewTabInfo[]> {
+  const beforeIds = new Set(beforeTabs.map((t) => t.id));
+  try {
+    const currentTab = await chrome.tabs.get(tabId);
+    const afterTabs = await chrome.tabs.query({ windowId: currentTab.windowId! });
+    const newTabIds: number[] = afterTabs.filter((t) => t.id != null && !beforeIds.has(t.id)).map((t) => t.id as number);
+    const out: NewTabInfo[] = [];
+    for (const ntid of newTabIds) {
+      try { await waitForTabLoad(ntid); } catch { continue; }
+      const info = await getFullPageInfo(ntid, cmdParams);
+      if (info) out.push({ tabId: ntid, ...info });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+
+interface IframeMeta {
+  index: number;
+  src: string;
+  sameOrigin: boolean;
+  url?: string;
+  html?: string;
 }
 
 interface FullPageInfo {
   url: string;
   title: string;
-  iframes: { index: number; src: string; sameOrigin: boolean; url?: string }[];
+  iframes: IframeMeta[];
+  html?: string;
   jsErrors?: { message: string; source: string; lineno?: number }[];
+}
+
+// 需要在每个 frame 中查找元素的命令（首个命中即返回；坐标 click / scroll 只在顶层）
+const ELEMENT_SEARCH_COMMANDS = new Set(["click", "type", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect"]);
+
+interface SearchFrame {
+  frameId: number;
+  parentFrameId: number;
+  url: string;
+  depth: number;
+  order: number;
+}
+
+// 短 TTL 的 frame 树缓存（按 tabId）：同一命令内多次枚举不重复调 webNavigation；
+// tab 导航后（onUpdated status=complete）失效。
+const frameTreeCache = new Map<number, { at: number; frames: SearchFrame[] }>();
+
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status === "complete") frameTreeCache.delete(tabId);
+});
+
+async function getFrameTree(tabId: number): Promise<SearchFrame[]> {
+  const cached = frameTreeCache.get(tabId);
+  if (cached && Date.now() - cached.at < 500) return cached.frames;
+  let frames: SearchFrame[] = [];
+  try {
+    const all = await chrome.webNavigation.getAllFrames({ tabId });
+    if (all && all.length > 0) {
+      const byId = new Map(all.map((f) => [f.frameId, f]));
+      const depthOf = new Map<number, number>();
+      const depth = (frameId: number): number => {
+        const cachedD = depthOf.get(frameId);
+        if (cachedD != null) return cachedD;
+        const f = byId.get(frameId);
+        const d = f && f.parentFrameId != null && f.parentFrameId !== -1
+          ? depth(f.parentFrameId) + 1
+          : 0;
+        depthOf.set(frameId, d);
+        return d;
+      };
+      // 顶层优先（depth 小）、同层保持 getAllFrames 数组序（近似 DOM 顺序）
+      frames = all
+        .map((f, i) => ({
+          frameId: f.frameId,
+          parentFrameId: f.parentFrameId ?? -1,
+          url: f.url || "",
+          depth: depth(f.frameId),
+          order: i,
+        }))
+        .sort((a, b) => a.depth - b.depth || a.order - b.order);
+    }
+  } catch {
+    // getAllFrames 失败（如浏览器内建页）：退化为只顶层
+  }
+  if (frames.length === 0) {
+    frames = [{ frameId: 0, parentFrameId: -1, url: "", depth: 0, order: 0 }];
+  }
+  frameTreeCache.set(tabId, { at: Date.now(), frames });
+  return frames;
+}
+
+// 向指定 frame 发消息的 Promise 封装：无 listener / 端口关闭（如 frame 刚导航走）视为 missing
+function sendToFrame(
+  tabId: number,
+  frameId: number,
+  msg: Record<string, unknown>,
+  timeoutMs = 1200,
+): Promise<{
+  response?: { success: boolean; data?: unknown; error?: string; notFound?: boolean; navigated?: boolean };
+  missing?: boolean;
+}> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve({ missing: true }), timeoutMs);
+    try {
+      chrome.tabs.sendMessage(tabId, msg, { frameId }, (r) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) {
+          resolve({ missing: true });
+          return;
+        }
+        resolve({
+          response: r as { success: boolean; data?: unknown; error?: string; notFound?: boolean; navigated?: boolean },
+        });
+      });
+    } catch {
+      clearTimeout(timer);
+      resolve({ missing: true });
+    }
+  });
+}
+
+// 顶层 frame 的 iframes 元数据（index↔src，跨域条目也带 src）
+async function getTopIframes(tabId: number): Promise<IframeMeta[]> {
+  const { response } = await sendToFrame(tabId, 0, {
+    type: "execute_command",
+    payload: { command: "get_page_info", params: { _field: ["iframes"] } },
+  });
+  return (response?.data as { iframes?: IframeMeta[] } | undefined)?.iframes ?? [];
+}
+
+// frame 参数 → 搜索范围：
+//   "top"           仅顶层
+//   数字 n          顶层 iframe 序号（用 iframes 的 index↔src 关联到 frameId）
+//   {url:"子串"}    按 URL 子串匹配首个 frame（跨域最稳，推荐）
+//   缺省 / "auto"   全 frame（顶层优先深度优先）
+async function resolveSearchFrames(tabId: number, frameParam: unknown): Promise<SearchFrame[]> {
+  const frames = await getFrameTree(tabId);
+  if (frameParam === "top") return frames.filter((f) => f.frameId === 0);
+  if (typeof frameParam === "number") {
+    const iframes = await getTopIframes(tabId);
+    const target = iframes[frameParam];
+    const src = target?.url || target?.src;
+    if (!src) return [];
+    const hit = frames.find((f) => f.parentFrameId === 0 && f.url && (f.url === src || f.url.startsWith(src)));
+    return hit ? [hit] : [];
+  }
+  if (frameParam && typeof frameParam === "object" && !Array.isArray(frameParam)) {
+    const urlSub = (frameParam as { url?: string }).url;
+    if (urlSub) {
+      const hit = frames.find((f) => f.url && f.url.includes(urlSub));
+      return hit ? [hit] : [];
+    }
+  }
+  return frames;
+}
+
+// 顶层 collectIframes 只含同源 url/html；跨域条目用「src ↔ getAllFrames.url」关联到
+// 子 frameId，再调 frame_info 补全 url/html
+async function enrichCrossOriginIframes(tabId: number, iframes: IframeMeta[], needHtml: boolean): Promise<IframeMeta[]> {
+  if (!iframes.some((f) => !f.sameOrigin)) return iframes;
+  const frames = await getFrameTree(tabId);
+  const childFrames = frames.filter((f) => f.parentFrameId === 0);
+  const used = new Set<number>();
+  const out: IframeMeta[] = [];
+  for (const ifr of iframes) {
+    if (ifr.sameOrigin) {
+      out.push(ifr);
+      continue;
+    }
+    // 优先按 src 关联；失败则按顺序取下一个未匹配的子 frame
+    let match = childFrames.find((cf) => !used.has(cf.frameId) && ifr.src && cf.url && (cf.url === ifr.src || cf.url.startsWith(ifr.src)));
+    if (!match) match = childFrames.find((cf) => !used.has(cf.frameId));
+    if (match) {
+      used.add(match.frameId);
+      const { response } = await sendToFrame(tabId, match.frameId, {
+        type: "execute_command",
+        payload: { command: "frame_info", params: {} },
+      });
+      const d = response?.data as { url?: string; title?: string; html?: string } | undefined;
+      out.push({
+        index: ifr.index,
+        src: ifr.src,
+        sameOrigin: false,
+        ...(d?.url ? { url: d.url } : {}),
+        ...(needHtml && d?.html ? { html: d.html } : {}),
+      });
+    } else {
+      out.push(ifr);
+    }
+  }
+  return out;
+}
+
+// get_js_errors / clear_js_errors：广播到所有 frame，聚合时给错误标注来源 frame url
+async function broadcastJsErrors(tabId: number): Promise<{ errors: { message: string; source: string; lineno?: number; frame?: string }[]; count: number }> {
+  const frames = await getFrameTree(tabId);
+  const errors: { message: string; source: string; lineno?: number; frame?: string }[] = [];
+  for (const f of frames) {
+    const { response } = await sendToFrame(tabId, f.frameId, {
+      type: "execute_command",
+      payload: { command: "get_js_errors", params: {} },
+    });
+    const errs = (response?.data as { errors?: { message: string; source: string; lineno?: number }[] })?.errors;
+    if (Array.isArray(errs)) {
+      for (const e of errs) errors.push({ ...e, ...(f.frameId !== 0 ? { frame: f.url } : {}) });
+    }
+  }
+  return { errors, count: errors.length };
+}
+
+async function broadcastClearJsErrors(tabId: number): Promise<void> {
+  const frames = await getFrameTree(tabId);
+  for (const f of frames) {
+    await sendToFrame(tabId, f.frameId, {
+      type: "execute_command",
+      payload: { command: "clear_js_errors", params: {} },
+    });
+  }
 }
 
 async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown>): Promise<FullPageInfo | null> {
@@ -400,26 +601,26 @@ async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown
     const fields = (cmdParams as Record<string, string[]> | undefined)?._field || [];
     const mappedFields = fields.map(f => f.replace(/^currentTab\./, ""));
     const needContentScript = mappedFields.some(f => f === "iframes" || f === "html" || f === "jsErrors");
+    const needIframes = fields.length === 0 || fields.some(f => f === "iframes" || f === `currentTab.iframes`);
 
     if (needContentScript) {
       await waitForTabLoad(tabId);
+      let iframes: IframeMeta[] | null = null;
       for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) await new Promise(r => setTimeout(r, 100));
-        const resp = await new Promise<{ data?: FullPageInfo }>((resolve) => {
-          const timer = setTimeout(() => resolve({}), 800);
-          chrome.tabs.sendMessage(tabId, {
-            type: "execute_command",
-            payload: { command: "get_page_info", params: { _field: mappedFields } },
-          }, (r) => {
-            clearTimeout(timer);
-            if (chrome.runtime.lastError) return resolve({});
-            resolve(r as { data?: FullPageInfo });
-          });
+        const { response } = await sendToFrame(tabId, 0, {
+          type: "execute_command",
+          payload: { command: "get_page_info", params: { _field: mappedFields } },
         });
-        if (resp.data?.iframes && resp.data.iframes.length > 0) {
-          result.iframes = resp.data.iframes;
+        const data = response?.data as { iframes?: IframeMeta[] } | undefined;
+        if (data?.iframes && data.iframes.length > 0) {
+          iframes = data.iframes;
           break;
         }
+      }
+      if (iframes) {
+        // 跨域 iframe 顶层读不到内容，用子 frame 自报补全 url/html
+        result.iframes = await enrichCrossOriginIframes(tabId, iframes, needIframes);
       }
     }
 
@@ -431,7 +632,7 @@ async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown
       if (hasField("title")) filtered.title = result.title;
       if (hasField("iframes")) filtered.iframes = result.iframes;
       if (hasField("html")) filtered.html = result.html;
-      return filtered as FullPageInfo;
+      return filtered as unknown as FullPageInfo;
     }
 
     return result;
@@ -496,8 +697,10 @@ function waitForTabLoad(tabId: number, timeoutMs = 30000): Promise<void> {
 
 /**
  * Inject the content script into a tab that doesn't have one loaded.
- * Uses chrome.scripting.executeScript to dynamically inject the handler.
- * Waits for the injected code to signal readiness before resolving.
+ * Uses chrome.scripting.executeScript to dynamically inject the packaged
+ * content-script.js into every frame (all_frames: true), so iframe content
+ * is available even for frames inserted after the page's initial load.
+ * Waits for the injected code to signal readiness (cs_injected) before resolving.
  */
 async function injectContentScript(tabId: number): Promise<void> {
   const INJECT_TIMEOUT = 5000;
@@ -518,338 +721,10 @@ async function injectContentScript(tabId: number): Promise<void> {
     chrome.runtime.onMessage.addListener(listener);
   });
 
+  // 动态注入打包好的 content-script.js（单一事实来源，与 manifest all_frames 注入同一份文件）
   await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      // Self-contained content script injected into the page
-      (() => {
-        chrome.runtime.onMessage.addListener(
-          (
-            msg: { type: string; id?: string; payload: { command: string; params?: Record<string, unknown> } },
-            _sender: chrome.runtime.MessageSender,
-            sendResponse: (res: { success: boolean; data?: unknown; error?: string }) => void,
-          ) => {
-            if (msg.type !== "execute_command") return;
-            const { command } = msg.payload;
-            const exec = () => handleCommand(msg.payload);
-            exec().then(sendResponse);
-            return true;
-          },
-        );
-
-        // Persistent JS error collection (starts on page load)
-        const jsErrors: { message: string; source: string; lineno?: number }[] = [];
-        window.addEventListener("error", (ev: ErrorEvent) => {
-          jsErrors.push({ message: ev.message, source: ev.filename, lineno: ev.lineno });
-        });
-        window.addEventListener("unhandledrejection", (ev: PromiseRejectionEvent) => {
-          const reason = ev.reason;
-          const msg = typeof reason === "string" ? reason : reason?.message ?? String(reason);
-          jsErrors.push({ message: `Unhandled rejection: ${msg}`, source: "unhandledrejection" });
-        });
-
-        // Signal readiness to the service worker
-        chrome.runtime.sendMessage({ type: "cs_injected" }).catch(() => {});
-
-        async function handleCommand(
-          payload: { command: string; params?: Record<string, unknown> },
-        ): Promise<{ success: boolean; data?: unknown; error?: string }> {
-          const { command, params = {} } = payload;
-          try {
-            switch (command) {
-              case "click": {
-                let el: Element;
-                let clickDesc: Record<string, unknown> = {};
-                const dispatchFullClick = (target: Element, x?: number, y?: number) => {
-                  const rect = (target as HTMLElement).getBoundingClientRect();
-                  const cx = x ?? rect.left + rect.width / 2;
-                  const cy = y ?? rect.top + rect.height / 2;
-                  const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
-                  target.dispatchEvent(new MouseEvent("mousedown", opts));
-                  target.dispatchEvent(new MouseEvent("mouseup", opts));
-                  target.dispatchEvent(new MouseEvent("click", opts));
-                };
-                if (params.text) {
-                  const text = params.text as string;
-                  const found = findByText(text);
-                  if (!found) return { success: false, error: `No element found with text: ${text}` };
-                  el = found;
-                  clickDesc = { text, tag: (el as HTMLElement).tagName.toLowerCase() };
-                  dispatchFullClick(el);
-                } else if (params.x !== undefined && params.y !== undefined) {
-                  const x = params.x as number;
-                  const y = params.y as number;
-                  const found = document.elementFromPoint(x, y);
-                  if (!found) return { success: false, error: `No element at (${x}, ${y})` };
-                  el = found;
-                  clickDesc = { x, y, tag: (el as HTMLElement).tagName.toLowerCase() };
-                  dispatchFullClick(el, x, y);
-                } else {
-                  const selector = params.selector as string;
-                  if (!selector) return { success: false, error: "Need text, selector, or {x,y}" };
-                  const found = findElement(selector);
-                  if (!found) return { success: false, error: `Element not found: ${selector}` };
-                  el = found;
-                  clickDesc = { selector, tag: (el as HTMLElement).tagName.toLowerCase() };
-                  dispatchFullClick(el);
-                }
-                let navigated = false;
-                const onBeforeUnload = () => { navigated = true; };
-                window.addEventListener("beforeunload", onBeforeUnload, { once: true });
-                await new Promise((r) => setTimeout(r, 200));
-                window.removeEventListener("beforeunload", onBeforeUnload);
-                return { success: true, navigated, data: clickDesc };
-              }
-              case "type": {
-                const selector = params.selector as string;
-                const text = params.text as string;
-                const el = findElement(selector) as HTMLElement | null;
-                if (!el) return { success: false, error: `Element not found: ${selector}` };
-                if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-                  el.value = text;
-                  el.dispatchEvent(new Event("input", { bubbles: true }));
-                  el.dispatchEvent(new Event("change", { bubbles: true }));
-                  return { success: true };
-                }
-                if (el.isContentEditable) {
-                  el.focus();
-                  const sel = window.getSelection();
-                  if (sel) {
-                    const range = document.createRange();
-                    range.selectNodeContents(el);
-                    sel.removeAllRanges();
-                    sel.addRange(range);
-                    document.execCommand("delete", false);
-                  }
-                  const paragraphs = text.split(/\n+/).filter((s) => s.length > 0);
-                  paragraphs.forEach((para, i) => {
-                    document.execCommand("insertText", false, para);
-                    if (i < paragraphs.length - 1) document.execCommand("insertParagraph", false);
-                  });
-                  el.dispatchEvent(new Event("input", { bubbles: true }));
-                  return { success: true };
-                }
-                return { success: false, error: `Element not typeable: ${selector} (tag=${el.tagName}, contentEditable=${el.contentEditable})` };
-              }
-              case "upload_file": {
-                const selector = params.selector as string;
-                const base64 = params.base64 as string;
-                const filename = (params.filename as string) || "upload.png";
-                const mime = (params.mime as string) || "image/png";
-                const el = findElement(selector) as HTMLInputElement | null;
-                if (!el) return { success: false, error: `Element not found: ${selector}` };
-                if (!(el instanceof HTMLInputElement) || el.type !== "file") {
-                  return { success: false, error: `Element is not a file input: ${selector}` };
-                }
-                const clean = base64.replace(/^data:[^;]+;base64,/, "");
-                const bin = atob(clean);
-                const bytes = new Uint8Array(bin.length);
-                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                const file = new File([bytes], filename, { type: mime });
-                const dt = new DataTransfer();
-                dt.items.add(file);
-                el.files = dt.files;
-                el.dispatchEvent(new Event("change", { bubbles: true }));
-                return { success: true, data: { filename, size: bytes.length, mime } };
-              }
-              case "paste_rich": {
-                const selector = params.selector as string;
-                const html = params.html as string;
-                const el = findElement(selector) as HTMLElement | null;
-                if (!el) return { success: false, error: `Element not found: ${selector}` };
-                if (!el.isContentEditable) {
-                  return { success: false, error: `Element is not contenteditable: ${selector} (tag=${el.tagName})` };
-                }
-                el.focus();
-                const sel = window.getSelection();
-                if (sel) {
-                  const range = document.createRange();
-                  range.selectNodeContents(el);
-                  sel.removeAllRanges();
-                  sel.addRange(range);
-                  document.execCommand("delete", false);
-                }
-                document.execCommand("insertHTML", false, html);
-                el.dispatchEvent(new Event("input", { bubbles: true }));
-                return { success: true, data: { inserted: true } };
-              }
-              case "get_text": {
-                const selector = params.selector as string;
-                const el = selector ? findElement(selector) : document.body;
-                if (!el) return { success: false, error: `Element not found: ${selector}` };
-                return { success: true, data: el.textContent?.trim() };
-              }
-              case "get_css": {
-                const selector = params.selector as string;
-                if (!selector) return { success: false, error: "selector is required" };
-                const isCss = selector.startsWith("css:");
-                const query = isCss ? selector.slice(4) : selector;
-                const nodes = isCss ? document.querySelectorAll(query) : [findElement(selector)].filter(Boolean) as Element[];
-                if (nodes.length === 0) return { success: false, error: `Element not found: ${selector}` };
-                const results = Array.from(nodes).map((el, i) => {
-                  const computed = window.getComputedStyle(el);
-                  const css: Record<string, string> = {};
-                  for (let j = 0; j < computed.length; j++) {
-                    const prop = computed[j];
-                    css[prop] = computed.getPropertyValue(prop);
-                  }
-                  return { index: i, css };
-                });
-                return { success: true, data: { selector, count: nodes.length, results } };
-              }
-              case "get_page_info": {
-                const fields = ((params as Record<string, string[]> | undefined)._field) || [];
-                const data: Record<string, unknown> = {};
-                if (fields.length === 0 || fields.includes("url")) data.url = window.location.href;
-                if (fields.length === 0 || fields.includes("title")) data.title = document.title;
-                if (fields.length === 0 || fields.includes("html")) data.html = document.documentElement.outerHTML;
-                if (fields.length === 0 || fields.includes("iframes")) {
-                  const iframes: { index: number; src: string; sameOrigin: boolean; url?: string; html?: string }[] = [];
-                  document.querySelectorAll("iframe").forEach((f, i) => {
-                    const iframe = f as HTMLIFrameElement;
-                    let sameOrigin = false;
-                    let url: string | undefined;
-                    let html: string | undefined;
-                    try {
-                      const doc = iframe.contentDocument;
-                      if (doc) {
-                        sameOrigin = true;
-                        url = doc.location.href;
-                        html = doc.documentElement.outerHTML;
-                      }
-                    } catch {
-                      sameOrigin = false;
-                    }
-                    iframes.push({ index: i, src: iframe.src, sameOrigin, ...(sameOrigin ? { url, html } : {}) });
-                  });
-                  data.iframes = iframes;
-                }
-                return { success: true, data };
-              }
-              case "get_js_errors": {
-                return { success: true, data: { errors: [...jsErrors], count: jsErrors.length } };
-              }
-              case "clear_js_errors": {
-                jsErrors.length = 0;
-                return { success: true };
-              }
-              case "wait_for_page": {
-                const timeout = (params.timeout as number) ?? 10000;
-                const start = Date.now();
-                return new Promise<{ success: boolean; data: { readyState: string; elapsed: number } }>((resolve) => {
-                  let settled = false;
-                  const cleanup = () => {
-                    document.removeEventListener("readystatechange", onChange);
-                    clearTimeout(timer);
-                  };
-                  const onChange = () => {
-                    if (document.readyState === "complete") {
-                      settled = true;
-                      cleanup();
-                      waitForDomStable(3000).then(() => {
-                        resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
-                      });
-                    }
-                  };
-                  document.addEventListener("readystatechange", onChange);
-                  if (document.readyState === "complete") {
-                    settled = true;
-                    cleanup();
-                    waitForDomStable(3000).then(() => {
-                      resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
-                    });
-                  } else {
-                    const timer = setTimeout(() => {
-                      if (settled) return;
-                      cleanup();
-                      resolve({ success: true, data: { readyState: document.readyState, elapsed: Date.now() - start } });
-                    }, timeout);
-                  }
-                });
-              }
-              case "scroll": {
-                const y = (params.y as number) ?? 0;
-                const x = (params.x as number) ?? 0;
-                window.scrollTo({ top: y, left: x, behavior: "smooth" });
-                await waitForDomStable(3000);
-                return { success: true, data: { scrollX: window.scrollX, scrollY: window.scrollY } };
-              }
-              default:
-                return { success: false, error: `Unknown command: ${command}` };
-            }
-          } catch (err) {
-            return { success: false, error: String(err) };
-          }
-        }
-
-        function waitForDomStable(maxWaitMs: number): Promise<void> {
-          return new Promise((resolve) => {
-            let quietTimer: number;
-            const observer = new MutationObserver(() => {
-              clearTimeout(quietTimer);
-              quietTimer = window.setTimeout(() => {
-                observer.disconnect();
-                resolve();
-              }, 250);
-            });
-            observer.observe(document.body, { childList: true, subtree: true });
-            quietTimer = window.setTimeout(() => {
-              observer.disconnect();
-              resolve();
-            }, 250);
-            setTimeout(() => {
-              observer.disconnect();
-              clearTimeout(quietTimer);
-              resolve();
-            }, maxWaitMs);
-          });
-        }
-
-        function findByText(text: string): Element | null {
-          const q = xpathStr(text);
-          const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
-          const xpath = [
-            `//body//button[contains(normalize-space(.), ${q})]`,
-            `//body//a[contains(normalize-space(.), ${q})]`,
-            `//body//input[contains(@value, ${q})]`,
-            `//body//*[not(${hidden})][contains(normalize-space(.), ${q}) and not(./*[not(${hidden})][contains(normalize-space(.), ${q})])]`,
-          ].join(" | ");
-          const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
-          let el = result.iterateNext();
-          while (el) {
-            const htmlEl = el as HTMLElement;
-            if (isVisible(htmlEl)) return htmlEl;
-            el = result.iterateNext();
-          }
-          return null;
-        }
-
-        function isVisible(el: HTMLElement): boolean {
-          const style = getComputedStyle(el);
-          if (style.display === "none" || style.visibility === "hidden") return false;
-          const rect = el.getBoundingClientRect();
-          return rect.width > 0 && rect.height > 0;
-        }
-
-        function xpathStr(s: string): string {
-          if (!s.includes("'")) return `'${s}'`;
-          if (!s.includes('"')) return `"${s}"`;
-          return "concat('" + s.replace(/'/g, "',\"'\",'") + "')";
-        }
-
-        function findElement(selector: string): Element | null {
-          if (selector.startsWith("css:")) {
-            return document.querySelector(selector.slice(4));
-          }
-          if (selector.startsWith("xpath:")) {
-            const xpath = selector.slice(6);
-            const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-            return result.singleNodeValue as Element | null;
-          }
-          return document.querySelector(selector);
-        }
-      })();
-    },
+    target: { tabId, allFrames: true },
+    files: ["content/content-script.js"],
   });
 
   // Wait for the injected code to register its listener and confirm readiness
@@ -1009,8 +884,9 @@ async function autoConnect(): Promise<void> {
 /**
  * real_click: 通过 chrome.debugger 发送完整真实鼠标事件（isTrusted=true），
  * 解决微信后台等对合成 click 免疫的 Vue/React 组件点击问题。
- * 事件链：mouseMoved（触发 mouseover/mouseenter/hover）-> mousePressed(mousedown) -> mouseReleased(mouseup+click) -> mouseMoved(移开)
- * 流程：content script 获取元素中心坐标 -> debugger 附加页面 -> Input.dispatchMouseEvent 发送完整序列。
+ * 事件链：mouseMoved（触发 mouseover/mouseenter/hover）-> mousePressed(mousedown) -> mouseReleased(mouseup+click)。
+ * 流程：content script 获取元素中心坐标（iframe 内同源自动换算为顶层坐标；跨域走 CDP 定位）
+ *      -> debugger 附加页面 -> Input.dispatchMouseEvent 发送完整序列。
  */
 async function handleRealClick(cmd: CommandMessage): Promise<void> {
   const params = cmd.payload.params || {};
@@ -1035,7 +911,7 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       try {
         const result = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", {
           format: "png",
-        });
+        }) as { data?: string };
         sendResult({ success: true, data: result?.data ?? null });
       } finally {
         await chrome.debugger.detach({ tabId }).catch(() => {});
@@ -1043,33 +919,49 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       return;
     }
 
-    // 1. 确定点击目标坐标：优先直接 x/y，否则 content script 取元素中心坐标
+    // 1. 确定点击目标坐标：优先直接 x/y；否则按 frame 搜索定位元素。
+    //    同源 iframe：get_rect 已换算顶层视口坐标；跨域 iframe：get_rect 标记 crossOrigin，
+    //    记下 frameId，附加 debugger 后用 CDP getContentQuads 精确定位。
     let x = params.x as number | undefined;
     let y = params.y as number | undefined;
+    let cdpFrameId: number | undefined;
     if (x == null || y == null) {
-      const rectResp = await new Promise<{ data?: { x?: number; y?: number } }>((resolve) => {
-        const timer = setTimeout(() => resolve({}), 8000);
-        chrome.tabs.sendMessage(tabId, {
+      const frames = await resolveSearchFrames(tabId, params.frame);
+      for (const f of frames) {
+        const r = await sendToFrame(tabId, f.frameId, {
           type: "execute_command",
           payload: { command: "get_rect", params: { selector } },
-        }, (r) => {
-          clearTimeout(timer);
-          if (chrome.runtime.lastError) return resolve({});
-          resolve(r as { data?: { x?: number; y?: number } });
-        });
-      });
-      x = rectResp.data?.x;
-      y = rectResp.data?.y;
+        }, 8000);
+        if (r.missing || r.response?.notFound) continue;
+        const d = r.response?.data as { x?: number; y?: number; crossOrigin?: boolean } | undefined;
+        if (d?.crossOrigin) {
+          cdpFrameId = f.frameId;
+          break;
+        }
+        x = d?.x;
+        y = d?.y;
+        break;
+      }
     }
     if (x == null || y == null) {
-      sendResult({ success: false, error: `Could not locate element: ${selector || `(${x},${y})`}` });
+      sendResult({ success: false, error: `Could not locate element: ${selector || "unknown"}` });
       return;
     }
 
     // 2. 附加 debugger
     await chrome.debugger.attach({ tabId }, "1.3");
     try {
-      // 2.1 激活窗口和标签页（CDP 鼠标事件需要窗口在前台才触发页面交互）
+      // 2.1 跨域 iframe：CDP 在目标 frame 上下文里定位元素中心（顶层视口坐标）
+      if (cdpFrameId != null) {
+        const point = await getElementCenterViaCdp(tabId, cdpFrameId, params);
+        if (!point) {
+          sendResult({ success: false, error: `Could not locate element in iframe via CDP: ${selector}` });
+          return;
+        }
+        x = point.x;
+        y = point.y;
+      }
+      // 2.2 激活窗口和标签页（CDP 鼠标事件需要窗口在前台才触发页面交互）
       try {
         const tab = await chrome.tabs.get(tabId);
         if (tab.windowId != null) {
@@ -1113,6 +1005,87 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
     sendResult({ success: false, error: String(err) });
   }
 }
+
+/**
+ * 跨域 iframe 内元素定位：顶层 content script 无法读其坐标（getBoundingClientRect 越权），
+ * 用 CDP 在目标 frame 的 JS 上下文里定位元素，再 DOM.getContentQuads 取顶层视口中心坐标。
+ * 必须在 debugger 已 attach 时调用。
+ */
+async function getElementCenterViaCdp(
+  tabId: number,
+  frameId: number,
+  params: Record<string, unknown>,
+): Promise<{ x: number; y: number } | null> {
+  await chrome.debugger.sendCommand({ tabId }, "DOM.enable");
+  await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
+  await chrome.debugger.sendCommand({ tabId }, "Page.enable");
+
+  // 收集 execution contexts（Runtime.enable 会重放已存在的 context 创建事件），
+  // 选目标 frame 的默认主世界 context
+  const contexts: { id: number; frameId?: string; isDefault?: boolean }[] = [];
+  const onEvent = (_src: chrome.debugger.Debuggee, method: string, eventParams?: object) => {
+    if (method === "Runtime.executionContextCreated") {
+      const ctx = (eventParams as { context?: { id?: number; auxData?: { frameId?: string; isDefault?: boolean } } } | undefined)?.context;
+      if (ctx?.id != null) {
+        contexts.push({
+          id: ctx.id,
+          frameId: ctx.auxData?.frameId,
+          isDefault: ctx.auxData?.isDefault,
+        });
+      }
+    }
+  };
+  chrome.debugger.onEvent.addListener(onEvent);
+  await new Promise((r) => setTimeout(r, 300));
+  chrome.debugger.onEvent.removeListener(onEvent);
+
+  const ctx = contexts.find((c) => c.isDefault && c.frameId === String(frameId));
+  if (!ctx) return null;
+
+  // 构建查找表达式：与 content script 的 findElement / findByText 语义一致
+  const selector = params.selector as string | undefined;
+  const text = params.text as string | undefined;
+  let expression: string;
+  if (text) {
+    const q = JSON.stringify(text);
+    const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
+    expression = `(()=>{const xpath=[`//body//button[contains(normalize-space(.),${q})]`,`//body//a[contains(normalize-space(.),${q})]`,`//body//input[contains(@value,${q})]`,`//body//*[not(${hidden})][contains(normalize-space(.),${q}) and not(./*[not(${hidden})][contains(normalize-space(.),${q})])]`].join(" | ");const res=document.evaluate(xpath,document,null,XPathResult.ORDERED_NODE_ITERATOR_TYPE,null);let el=res.iterateNext();while(el){const s=getComputedStyle(el);if(s.display!=="none"&&s.visibility!=="hidden"&&el.getBoundingClientRect().width>0&&el.getBoundingClientRect().height>0)return el;el=res.iterateNext()}return null})()`;
+  } else if ((selector || "").startsWith("xpath:")) {
+    const xpath = (selector || "").slice(6);
+    expression = `(()=>{const r=document.evaluate(${JSON.stringify(xpath)},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null);return r.singleNodeValue||null})()`;
+  } else {
+    const css = (selector || "").replace(/^css:/, "");
+    expression = `document.querySelector(${JSON.stringify(css)})`;
+  }
+
+  const evalRes = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+    contextId: ctx.id,
+    expression,
+    userGesture: true,
+  }) as { result?: { objectId?: string } };
+  const objectId = evalRes?.result?.objectId;
+  if (!objectId) return null;
+
+  const nodeRes = await chrome.debugger.sendCommand({ tabId }, "DOM.requestNode", { objectId }) as { nodeId?: number };
+  const nodeId = nodeRes?.nodeId;
+  if (nodeId == null) return null;
+
+  // quads 为顶层视口坐标（含 iframe 偏移与父滚动），取包围盒中心
+  const quadsRes = await chrome.debugger.sendCommand({ tabId }, "DOM.getContentQuads", { nodeId }) as { quads?: number[][] };
+  const quads = quadsRes?.quads;
+  if (!quads || quads.length === 0) return null;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const quad of quads) {
+    for (let i = 0; i < quad.length; i += 2) {
+      minX = Math.min(minX, quad[i]); minY = Math.min(minY, quad[i + 1]);
+      maxX = Math.max(maxX, quad[i]); maxY = Math.max(maxY, quad[i + 1]);
+    }
+  }
+  if (minX > maxX || minY > maxY) return null;
+  return { x: Math.round((minX + maxX) / 2), y: Math.round((minY + maxY) / 2) };
+}
+
 
 chrome.storage.onChanged.addListener(
   (changes: { [key: string]: chrome.storage.StorageChange }, area: string) => {

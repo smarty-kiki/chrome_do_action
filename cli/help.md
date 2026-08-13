@@ -32,10 +32,13 @@ cda list
   "url": "http://example.com",
   "title": "页面标题",
   "iframes": [
-    { "index": 0, "src": "...", "sameOrigin": true, "url": "..." }
+    { "index": 0, "src": "/embedded", "sameOrigin": true, "url": "/embedded", "html": "..." },
+    { "index": 1, "src": "https://ads.example.com", "sameOrigin": false, "url": "https://ads.example.com", "html": "..." }
   ]
 }
 ```
+
+`iframes` 中**同源与跨域 iframe 都补全 `url` 与 `html`**：跨域 iframe 通过 URL 子串关联到其 frame 后读取内部 document。`src` 为 iframe 标签的原始属性，`url` 为 frame 当前文档地址（跨域也可获取）。
 
 ### click 返回
 
@@ -106,6 +109,24 @@ cda --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"打开"}
 # 只看 iframe 变化
 cda --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges"
 ```
+
+## iframe 定位
+
+元素命令（`click`/`real_click`/`type`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+
+如需指定 frame，加 `frame` 参数：
+
+```json
+{"selector": ".ProseMirror"}                     // 缺省 = 顶层优先全 frame 自动搜索
+{"selector": "#submit", "frame": "top"}          // 仅顶层 frame
+{"selector": "#submit", "frame": 0}              // 第 0 个顶层 iframe（按序号）
+{"selector": "#submit", "frame": {"url": "mp.weixin.qq.com"}}  // URL 含子串的首个 frame（跨域最稳）
+```
+
+- `frame` 支持 `click`/`real_click`/`type`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`（`get_rect` 定位）
+- **跨域 iframe 同样可读可操作**：`get_rect` 会沿 `window.parent` 链换算坐标，跨域边界自动切换 CDP `DOM.getContentQuads` 兜底
+- `real_click` 在 iframe 内同样可用：同源直接复用换算坐标，跨域走 CDP 精确定位后发送真实鼠标事件链
+- `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；要读 iframe 文本用 `{"selector":"...","frame":{...}}`
 
 ## 常用场景
 
@@ -211,7 +232,7 @@ cda send OfficePC open https://example.com
 cda send OfficePC get_js_errors current
 ```
 
-返回 `{ errors: [...], count: N }`，每条错误包含 `message`、`source`（文件名）、`lineno`（行号）。
+返回 `{ errors: [...], count: N }`，每条错误包含 `message`、`source`（文件名）、`lineno`（行号）。错误**跨所有 frame 聚合**，iframe 里的报错也会收集到。
 
 查看错误后清空，方便下一次操作重新计数：
 
@@ -312,6 +333,8 @@ cda send OfficePC get_text current '{"selector":"table"}'
 {"selector": "xpath://btn"}          // XPath 前缀
 ```
 
+选择器/text 定位**自动搜索所有 iframe**（顶层优先）；若目标在 iframe 内，可加 `frame` 参数精确指定（见「iframe 定位」）。坐标点击（`x,y`）只在顶层视口语义下命中。
+
 ### real_click
 
 - 与 `click` 参数基本相同（selector 或 x/y），但通过 chrome.debugger（CDP）发送**完整真实鼠标事件链**（isTrusted=true）
@@ -323,10 +346,11 @@ cda send OfficePC get_text current '{"selector":"table"}'
   {"x": 500, "y": 343, "approach": [[360, 360], [420, 330], [470, 325]]}
   ```
 - 原理：content script 获取元素中心坐标（或直接给 x/y）→ 激活窗口 → CDP `Input.dispatchMouseEvent` 发送完整序列
+- **iframe 支持**：自动搜索所有 iframe（同源 `get_rect` 已换算顶层坐标；跨域切换 CDP 定位），也可用 `frame` 参数指定目标
 - 适用：对合成事件免疫的站点（如微信公众平台后台 Vue 组件）、hover 才显示的工具条元素
 - 注意：**坐标必须是元素真实位置**（用截图确认），DOM 快照里可能有顶部隐藏模板导致 get_rect 返回错误坐标（如把 y=824 误报成 y=224）
 - 副作用：attach 瞬间 Chrome 顶部会出现"正在调试此浏览器"横幅，随即消失
-- 使用：`send <id> real_click <tab> '{"selector":"#submit"}'` 或 `'{"x":100,"y":200}'`
+- 使用：`send <id> real_click <tab> '{"selector":"#submit"}'` 或 `'{"x":100,"y":200}'`，iframe 内加 `frame` 参数
 
 ### type 参数
 
@@ -405,10 +429,11 @@ send <id> hide <tabId>       // 无参数：还原全部被 show 的元素
 
 ## 注意事项
 
-- `text` 定位会跳过 `<script>`、`<style>`、`<noscript>` 等不可见元素，优先匹配 `<button>`、`<a>`、`<input>`
+- `text` 定位会跳过 `<script>`、`<style>`、`<noscript>` 等不可见元素，优先匹配 `<button>`、`<a>`、`<input>`；自动搜索 iframe，返回带命中 frame 的 `url`
 - `--field` 只对 `click`、`get_page_info`、`open` 有效，在浏览器端按需采集，减少不必要的 DOM 操作
-- `--field html` 会被 Content Script 采集但被服务端剥离，不会出现在返回中；如需页面 HTML 内容，用 `get_text` 配合 selector 获取
+- `--field html`（如 `--field "currentTab.html"`）返回该 frame 的**完整 HTML 内容**（服务端与 CLI 原样转发，不会剥离），需抓页面源码时直接用它
 - 同一标签页的命令串行执行，前一条完成后下一条才执行，不需要手动等待
 - 点击后如果页面跳转，会自动等待新页面加载完成再返回结果
 - `get_text` 对 textarea 返回空（textContent 不含 value），验证 textarea 输入用 `get_page_info --field "currentTab.html"` 抓 HTML 检查
+- `get_js_errors` / `clear_js_errors` 聚合所有 frame（含 iframe）的错误，每条带 `source` 定位到具体 frame
 - 扩展更新代码后需在 `chrome://extensions` 刷新扩展，且已打开页面需刷新才会重新注入新脚本

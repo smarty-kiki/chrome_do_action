@@ -1,7 +1,7 @@
 ---
 name: cda-chrome-control
 description: 通过 cda CLI 控制本机 Chrome 浏览器执行页面操作：打开网页、点击、输入文本、富文本排版、上传图片、截图、显示隐藏菜单、提取内容、监听 JS 错误、管理标签页。当用户要求"用 Chrome 打开某网页"、"控制浏览器做 XX"、"自动化公众号文章"、"抓取网页内容"、"填表单"等场景时使用。前置条件：Node.js 18+、本机 Chrome，按"安装"章节完成一次配置。
-version: 1.1.0
+version: 1.2.0
 display_name: cda Chrome 控制
 display_name_en: cda Chrome Control
 description_zh: 用命令行控制本机 Chrome 浏览器（打开/点击/输入/排版/上传/截图/公众号自动化）
@@ -77,15 +77,16 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 
 | 命令 | 用法 | 说明 |
 |------|------|------|
-| `click` | `send <id> click <tab> '{"selector":"#id"}'` 或 `'{"text":"登录"}'` 或 `'{"x":100,"y":200}'` | 点击元素（selector/CSS/XPath/text/坐标） |
+| `click` | `send <id> click <tab> '{"selector":"#id"}'` 或 `'{"text":"登录"}'` 或 `'{"x":100,"y":200}'` | 点击元素（selector/CSS/XPath/text/坐标）；**自动搜索 iframe**（顶层优先，含跨域），可加 `frame` 指定 |
+| `real_click` | `send <id> real_click <tab> '{"selector":"#submit"}'` | CDP 真实点击（isTrusted=true），对合成事件免疫的站点（如微信后台）有效；同源 iframe 自动换算坐标，跨域走 CDP 定位 |
 | `type` | `send <id> type <tab> '{"selector":"#title","text":"标题"}'` | 输入文本：input/textarea 直接赋值；contenteditable 富文本按 `\n` 分段 |
 | `paste_rich` | `send <id> paste_rich <tab> '{"selector":".ProseMirror","html":"<section>..."}'` | 向富文本编辑器注入带样式 HTML（先清空再插入），等价粘贴排好版的文档 |
 | `upload_file` | `send <id> upload_file <tab> '{"selector":"input[type=file]","base64":"...","filename":"a.jpg","mime":"image/jpeg"}'` | base64 图片注入 file input，触发 change 上传 |
 | `show` | `send <id> show <tab> '.js_imagedialog'` | 强制显示隐藏元素（仅改 CSS：visibility/opacity/display），让 hover 菜单常驻可见后可点击 |
 | `hide` | `send <id> hide <tab>` | 还原所有被 show 的元素（清 inline style 回 CSS 控制） |
-| `get_text` | `send <id> get_text <tab> [selector]` | 获取文本（无 selector 取整页） |
+| `get_text` | `send <id> get_text <tab> [selector]` | 获取文本（无 selector 取整页；带 selector 自动搜索 iframe） |
 | `get_css` | `send <id> get_css <tab> <selector>` | 获取元素 computed style |
-| `get_page_info` | `send <id> get_page_info <tab>` | 页面信息（url/title/iframes），支持 --field |
+| `get_page_info` | `send <id> get_page_info <tab>` | 页面信息（url/title/iframes），支持 --field；iframes 对**跨域也补全 url/html** |
 | `screenshot` | `send <id> screenshot <tab> '{"path":"/tmp/shot.png"}'` | CDP 截图（只读），操作前确认页面真实状态 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取页面 JS 报错 |
 | `scroll` | `send <id> scroll <tab> '{"y":500}'` | 滚动页面 |
@@ -94,9 +95,10 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 
 1. **坐标必须截图确认**：DOM 快照可能有顶部隐藏模板，get_rect 会返回错误坐标（曾把 y=824 误报成 224）。先 `screenshot` 看真实页面再定位。
 2. **hover 菜单用 show 解决**：触发不了 hover 时别硬怼事件模拟，`show` 强制显示元素后普通 `click` 即可命中。操作完 `hide` 还原。
-3. **paste_rich 传参**：HTML 含英文引号时 shell 单引号会截断参数，用 Node `spawnSync`（参数数组，不经 shell）传参。
-4. **富文本输入**：公众号正文是 ProseMirror（contenteditable），用 `type` 支持富文本；标题 `#title`（textarea）。
-5. **登录态**：直接复用本机已登录浏览器，无需处理 cookie。
+3. **iframe 自动搜索**：元素命令默认顶层优先搜遍所有 iframe（含跨域），返回带命中 `frame.url`。目标在 iframe 内且自动搜索未命中时，加 `frame` 参数固定：`{"selector":"...","frame":{"url":"子串"}}`（跨域最稳）或 `{"frame":0}`（第 N 个顶层 iframe）。
+4. **paste_rich 传参**：HTML 含英文引号时 shell 单引号会截断参数，用 Node `spawnSync`（参数数组，不经 shell）传参。
+5. **富文本输入**：公众号正文是 ProseMirror（contenteditable），用 `type` 支持富文本；标题 `#title`（textarea）。
+6. **登录态**：直接复用本机已登录浏览器，无需处理 cookie。
 
 ## 实战：公众号文章全自动化
 

@@ -23,11 +23,15 @@ Browser commands (no tab):
 Page commands (tab required):
   click <tab> [params]        Click by selector, text, or {x,y}
                               selector prefixes: "css:" for CSS, "xpath:" for XPath
+                              Searches top frame then all iframes automatically;
+                              use {frame} to target a specific frame
   real_click <tab> <params>   Trusted click chain via CDP (isTrusted=true) for sites
                               that ignore synthetic events (e.g. WeChat MP).
                               Params: {selector} or {x,y}; optional {approach} =
                               [[x,y],...] path to move through progressively,
-                              triggering hover chains before clicking
+                              triggering hover chains before clicking.
+                              Works in iframes: same-origin via coordinate
+                              translation, cross-origin via CDP
   type <tab> <params>         Type text ({selector,text}); supports input/textarea
                               and contenteditable (rich text, splits by newline)
   upload_file <tab> <params>  Inject base64 image into file input
@@ -40,12 +44,21 @@ Page commands (tab required):
                               (clears inline style back to CSS control)
   get_text <tab> [params]     Get text of element ({selector}) or entire page
   get_css <tab> <selector>    Get computed CSS of element ({selector})
-  get_page_info <tab>         Get page info (url, title, iframes), supports --field
-  get_js_errors <tab>         Get accumulated JS errors
+  get_page_info <tab>         Get page info (url, title, iframes), supports --field.
+                              iframes include url/html for same-origin AND
+                              cross-origin frames
+  get_js_errors <tab>         Get accumulated JS errors (aggregated across frames)
   clear_js_errors <tab>       Clear accumulated JS errors
   screenshot <tab> <params>   Capture page screenshot via CDP
                               ({path: "/tmp/shot.png"} saves PNG locally)
   scroll <tab> <params>       Scroll page ({y} or {x,y})
+
+frame param (optional, for element commands that search iframes):
+  {frame: "auto"}             (default) top frame first, then all iframes
+  {frame: "top"}              top frame only
+  {frame: 0}                  first top-level iframe (0-based index)
+  {frame: {url: "substring"}} first frame whose url contains the substring
+                              (most reliable for cross-origin iframes)
 
 Examples:
   cda list

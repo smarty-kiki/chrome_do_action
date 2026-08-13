@@ -55,6 +55,7 @@
 | 🐛 JS 错误收集 | 页面加载即持续监听 `error` 与 `unhandledrejection`，随时查询/清空 |
 | ⚡ 按需采集 `--field` | 指定返回字段，跳过不必要的 DOM 操作，命令更快、结果更精简 |
 | 🔎 状态感知 | 自动检测页面跳转、新开标签页、iframe 变化，命令返回「操作后的世界」而非裸事件 |
+| 🧩 iframe 支持 | 所有元素命令自动搜索 iframe（含跨域）并可直接读写操作，`iframes` 元数据对跨域也补全 `url`/`html` |
 | 🔁 高可用 | 断线自动重连、同一标签页命令串行排队、Content Script 丢失自动恢复注入 |
 | 🌐 多浏览器 | 一个服务端连接多个浏览器客户端，用节点名精确定位目标 |
 
@@ -248,11 +249,12 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 ### click / real_click 定位方式
 
 ```json
-{"selector": "#submit"}              // CSS 选择器
+{"selector": "#submit"}              // CSS 选择器（自动搜索 iframe，顶层优先）
 {"text": "登录"}                      // 按可见文字查找（优先按钮/链接）
 {"x": 100, "y": 200}                 // 坐标点击
 {"selector": "css:button"}           // 显式 CSS 前缀
 {"selector": "xpath://btn"}          // XPath 前缀
+{"selector": "#submit", "frame": {"url": "mp.weixin.qq.com"}}  // 指定 iframe（URL 子串匹配）
 ```
 
 ### 其他命令参数
@@ -288,6 +290,7 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 - 鼠标移动采用**渐进步进**（每步 10px）而非瞬移，能真实触发途经元素的 hover 链
 - 点击后鼠标**停留在目标上**，保留 hover 状态供连续操作
 - `approach` 参数模拟「先移到触发点、再移到目标」的多级 hover 场景（如封面 hover 工具条）
+- **iframe 支持**：自动搜索 iframe（含跨域），同源换算坐标、跨域走 CDP 定位，`frame` 参数可指定目标
 - 副作用：attach 瞬间 Chrome 顶部会出现「正在调试此浏览器」横幅，随即消失
 
 ### 2. 富文本与文件上传：绕开最难的两个交互
@@ -326,7 +329,31 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 
 ### 6. JS 错误收集
 
-页面加载即开始持久收集 `window.onerror` 与 `unhandledrejection`，不阻塞任何命令。错误持续累积，`get_js_errors` 查看、`clear_js_errors` 清空，也可在任意支持 `--field` 的命令中指定 `jsErrors` 附带返回。
+页面加载即开始持久收集 `window.onerror` 与 `unhandledrejection`，不阻塞任何命令。错误持续累积，`get_js_errors` 查看、`clear_js_errors` 清空，也可在任意支持 `--field` 的命令中指定 `jsErrors` 附带返回。错误**跨所有 frame 聚合**，iframe 内的报错也会被收集。
+
+### 7. iframe 读写操作
+
+所有元素命令（`click`/`real_click`/`type`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）都**自动搜索 iframe**：顶层优先、深度优先遍历每个 frame（含跨域），首个命中即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+
+```bash
+# 读取 iframe 内元素文本（自动搜索到跨域 iframe）
+cda send OfficePC get_text current '{"selector":".rich-text-content"}'
+
+# 点击 iframe 内按钮（跨域同样可命中）
+cda send OfficePC click current '{"selector":"#save"}'
+
+# 固定到某个 frame：按 URL 子串（跨域最稳）
+cda send OfficePC click current '{"selector":"#submit","frame":{"url":"mp.weixin.qq.com"}}'
+
+# 只搜顶层，或按序号指定顶层 iframe
+cda send OfficePC get_text current '{"selector":"#nav","frame":"top"}'
+cda send OfficePC get_text current '{"selector":"#editor","frame":0}'
+```
+
+- **跨域定位原理**：同源 iframe 用 `get_rect` 沿 `window.parent` 链把坐标换算到顶层视口；跨域边界访问父文档抛 SecurityError，自动切换 CDP `DOM.getContentQuads` 取元素在顶层视口的真实中心坐标
+- **`real_click` 在 iframe 内同样有效**：同源复用换算坐标，跨域走 CDP 精确定位后发送 `isTrusted=true` 的真实鼠标事件链
+- **`frame` 参数**：`"auto"`（缺省，顶层优先全 frame）、`"top"`（仅顶层）、数字（顶层 iframe 序号）、`{url:"子串"}`（URL 匹配首个 frame）
+- `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；`get_page_info --field iframes` 直接看所有 frame 的元数据与内容快照
 
 ---
 
@@ -339,13 +366,13 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
   "url": "https://example.com",
   "title": "Example Domain",
   "iframes": [
-    { "index": 0, "src": "https://ads.example.com", "sameOrigin": false },
-    { "index": 1, "src": "/embedded", "sameOrigin": true, "url": "/embedded" }
+    { "index": 0, "src": "https://ads.example.com", "sameOrigin": false, "url": "https://ads.example.com", "html": "..." },
+    { "index": 1, "src": "/embedded", "sameOrigin": true, "url": "/embedded", "html": "..." }
   ]
 }
 ```
 
-跨域 iframe 只返回 `src` 与 `sameOrigin: false`，不暴露内部内容；同源 iframe 额外返回内部 URL。
+所有 iframe 均补全 `url`（当前文档地址）与 `html`（内部内容快照），**跨域 iframe 同样可见**。`src` 为 iframe 标签原始属性，`url` 为 frame 当前地址，二者跨域重定向时可能不同。
 
 ### `click`（未跳转）
 

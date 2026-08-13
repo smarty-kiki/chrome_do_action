@@ -276,6 +276,10 @@
   });
   chrome.runtime.onMessage.addListener(
     (msg, _sender, sendResponse) => {
+      if (msg.type === "cs_injected") {
+        sendResponse({ ok: true });
+        return;
+      }
       if (msg.type === "connect") {
         const { serverUrl, nodeName } = msg;
         if (serverUrl && nodeName) {
@@ -327,163 +331,308 @@
       }
     });
   }
-  function sendToTab(tabId, cmd, params, onDone) {
-    const isClick = cmd.payload.command === "click";
+  async function sendToTab(tabId, cmd, params, onDone) {
+    const command = cmd.payload.command;
+    const isClick = command === "click";
     const fieldFilter = cmd.payload.params?._field || [];
     const needCurrent = fieldFilter.length === 0 || fieldFilter.some((f) => f === "currentTab" || f.startsWith("currentTab."));
     const needIframe = fieldFilter.length === 0 || fieldFilter.some((f) => f === "iframeChanges" || f.startsWith("iframeChanges."));
+    const needNewTabs = fieldFilter.length === 0 || fieldFilter.some((f) => f === "newTabs" || f.startsWith("newTabs."));
     const needBeforeInfo = isClick && needIframe;
-    const tabPromise = chrome.tabs.get(tabId);
-    const beforeTabsPromise = tabPromise.then(
-      (tab) => chrome.tabs.query({ windowId: tab.windowId })
-    );
-    const beforeFullInfoPromise = needBeforeInfo ? getFullPageInfo(tabId, cmd.payload.params) : Promise.resolve(null);
-    const retrying = { value: false };
-    function doSend(targetTabId) {
-      function sendResult(payload) {
-        wsClient.send({ type: "command_result", payload: { ...payload, data: payload.data } });
+    const sendResult = (payload) => {
+      wsClient.send({ type: "command_result", payload: { ...payload, data: payload.data } });
+    };
+    let beforeTabs = [];
+    let beforeFullInfo = null;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (needBeforeInfo || needNewTabs) {
+        beforeTabs = await chrome.tabs.query({ windowId: tab.windowId });
       }
-      chrome.tabs.sendMessage(targetTabId, {
-        type: "execute_command",
-        id: cmd.id,
-        payload: { command: cmd.payload.command, params }
-      }, async (response) => {
-        if (chrome.runtime.lastError) {
-          const msg = chrome.runtime.lastError.message || "";
-          const NAV_ERROR = "The page keeping the extension port is moved into back/forward cache";
-          if (isClick && msg.includes(NAV_ERROR)) {
-            try {
-              const currentInfo = needCurrent ? await getFullPageInfo(targetTabId, cmd.payload.params) : null;
-              sendResult({
-                commandId: cmd.id,
-                success: true,
-                data: {
-                  navigated: true,
-                  ...needCurrent ? { currentTab: currentInfo } : { currentTab: null }
-                }
-              });
-            } catch {
-              sendResult({
-                commandId: cmd.id,
-                success: true,
-                data: { navigated: true, currentTab: null }
-              });
-            }
-            onDone?.();
-            return;
+      if (needBeforeInfo) {
+        beforeFullInfo = await getFullPageInfo(tabId, cmd.payload.params);
+      }
+    } catch {
+    }
+    const msg = { type: "execute_command", id: cmd.id, payload: { command, params } };
+    if (command === "get_js_errors") {
+      const data = await broadcastJsErrors(tabId);
+      sendResult({ commandId: cmd.id, success: true, data });
+      onDone?.();
+      return;
+    }
+    if (command === "clear_js_errors") {
+      await broadcastClearJsErrors(tabId);
+      sendResult({ commandId: cmd.id, success: true, data: {} });
+      onDone?.();
+      return;
+    }
+    if (command === "hide") {
+      const frames = await getFrameTree(tabId);
+      let count = 0;
+      for (const f of frames) {
+        const { response: response2 } = await sendToFrame(tabId, f.frameId, msg);
+        count += response2?.data?.count ?? 0;
+      }
+      sendResult({ commandId: cmd.id, success: true, data: { count } });
+      onDone?.();
+      return;
+    }
+    if (command === "get_page_info") {
+      const info = await getFullPageInfo(tabId, params);
+      sendResult({ commandId: cmd.id, success: info != null, data: info ?? void 0, error: info ? void 0 : "get_page_info failed" });
+      onDone?.();
+      return;
+    }
+    const isCoordinateClick = isClick && params.x !== void 0 && params.y !== void 0;
+    const searchable = ELEMENT_SEARCH_COMMANDS.has(command) && !isCoordinateClick;
+    let response;
+    let matchedFrame;
+    let navigatedFallback = false;
+    async function doSearch() {
+      if (!searchable) {
+        const r = await sendToFrame(tabId, 0, msg);
+        response = r.response;
+        return;
+      }
+      const frames = await resolveSearchFrames(tabId, params.frame);
+      for (const f of frames) {
+        const r = await sendToFrame(tabId, f.frameId, msg);
+        if (r.missing) {
+          if (isClick) {
+            navigatedFallback = true;
+            matchedFrame = f;
+            break;
           }
-          if (!retrying.value && msg.includes("Receiving end does not exist")) {
-            retrying.value = true;
-            try {
-              await injectContentScript(targetTabId);
-            } catch {
-            }
-            doSend(targetTabId);
-            return;
-          }
-          sendResult({
-            commandId: cmd.id,
-            success: false,
-            error: msg.includes("Receiving end does not exist") ? `Tab ${targetTabId}: no content script loaded (is it a chrome:// page or not fully loaded?)` : msg
-          });
-          onDone?.();
-          return;
+          continue;
         }
-        const navigated = response?.data?.navigated;
-        const needNewTabs = fieldFilter.length === 0 || fieldFilter.some((f) => f === "newTabs" || f.startsWith("newTabs."));
-        if (navigated) {
-          try {
-            const [beforeTabs, currentTab] = await Promise.all([
-              beforeTabsPromise,
-              chrome.tabs.get(targetTabId)
-            ]);
-            const beforeIds = new Set(beforeTabs.map((t) => t.id));
-            const currentInfo = needCurrent ? await getFullPageInfo(targetTabId, cmd.payload.params) : null;
-            const afterTabs = await chrome.tabs.query({ windowId: currentTab.windowId });
-            const newTabIds = needNewTabs ? afterTabs.filter((t) => !beforeIds.has(t.id)).map((t) => t.id) : [];
-            const newTabInfos = [];
-            for (const ntid of newTabIds) {
-              try {
-                await waitForTabLoad(ntid);
-              } catch {
-                continue;
-              }
-              const info = await getFullPageInfo(ntid, cmd.payload.params);
-              if (info) newTabInfos.push({ tabId: ntid, ...info });
-            }
-            const navResult = {
-              navigated: true
-            };
-            if (needCurrent) {
-              navResult.currentTab = currentInfo;
-            }
-            if (needNewTabs && newTabInfos.length > 0) navResult.newTabs = newTabInfos;
-            sendResult({
-              commandId: cmd.id,
-              success: true,
-              data: navResult
-            });
-          } catch {
-            sendResult({
-              commandId: cmd.id,
-              success: true,
-              data: { navigated: true, current: null }
-            });
-          }
-        } else if (isClick) {
-          const beforeInfo = needBeforeInfo ? await beforeFullInfoPromise : null;
-          const afterInfo = needCurrent ? await getFullPageInfo(targetTabId, cmd.payload.params) : null;
-          let newTabInfos = [];
-          const navigated2 = response?.data?.navigated;
-          if (!navigated2 && response?.success && needNewTabs) {
-            try {
-              const currentTab = await chrome.tabs.get(targetTabId);
-              const afterTabs = await chrome.tabs.query({ windowId: currentTab.windowId });
-              const beforeTabIds = beforeTabsPromise.then((bt) => new Set(bt.map((t) => t.id)));
-              const beforeIds = await beforeTabIds;
-              const newTabIds = afterTabs.filter((t) => !beforeIds.has(t.id)).map((t) => t.id);
-              for (const ntid of newTabIds) {
-                try {
-                  await waitForTabLoad(ntid);
-                } catch {
-                  continue;
-                }
-                const info = await getFullPageInfo(ntid, cmd.payload.params);
-                if (info) newTabInfos.push({ tabId: ntid, ...info });
-              }
-            } catch {
-            }
-          }
-          const result = {
-            navigated: navigated2 ?? false,
-            ...typeof response?.data === "object" && response?.data !== null ? response.data : {}
-          };
-          if (needCurrent) {
-            result.currentTab = afterInfo;
-          }
-          if (needIframe) {
-            const iframeChanges = beforeInfo && afterInfo ? diffIframes(beforeInfo.iframes, afterInfo.iframes) : [];
-            if (iframeChanges.length > 0) result.iframeChanges = iframeChanges;
-          }
-          if (needNewTabs && newTabInfos.length > 0) result.newTabs = newTabInfos;
-          sendResult({
-            commandId: cmd.id,
-            success: response?.success ?? false,
-            data: result,
-            error: response?.error
-          });
-        } else {
-          sendResult({
-            commandId: cmd.id,
-            success: response?.success ?? false,
-            data: response?.data,
-            error: response?.error
-          });
+        if (r.response?.notFound) continue;
+        response = r.response;
+        matchedFrame = f;
+        break;
+      }
+    }
+    let injected = false;
+    while (true) {
+      await doSearch();
+      if (response || navigatedFallback) break;
+      if (injected) break;
+      try {
+        await injectContentScript(tabId);
+        injected = true;
+      } catch {
+        break;
+      }
+    }
+    const frameAttribution = matchedFrame ? { frame: { frameId: matchedFrame.frameId, url: matchedFrame.url } } : {};
+    try {
+      const wasNavigated = navigatedFallback || response?.data?.navigated === true;
+      if (wasNavigated) {
+        const currentInfo = needCurrent ? await getFullPageInfo(tabId, cmd.payload.params) : null;
+        const navResult = { navigated: true };
+        if (needCurrent) navResult.currentTab = currentInfo;
+        if (needNewTabs) {
+          const newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params);
+          if (newTabInfos.length > 0) navResult.newTabs = newTabInfos;
         }
+        sendResult({ commandId: cmd.id, success: true, data: navResult });
         onDone?.();
+        return;
+      }
+      if (isClick) {
+        const afterInfo = needCurrent ? await getFullPageInfo(tabId, cmd.payload.params) : null;
+        let newTabInfos = [];
+        if (needNewTabs) {
+          try {
+            newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params);
+          } catch {
+          }
+        }
+        const result = {
+          navigated: false,
+          ...typeof response?.data === "object" && response?.data !== null ? response.data : {},
+          ...frameAttribution
+        };
+        if (needCurrent) result.currentTab = afterInfo;
+        if (needIframe) {
+          const iframeChanges = beforeFullInfo && afterInfo ? diffIframes(beforeFullInfo.iframes, afterInfo.iframes) : [];
+          if (iframeChanges.length > 0) result.iframeChanges = iframeChanges;
+        }
+        if (needNewTabs && newTabInfos.length > 0) result.newTabs = newTabInfos;
+        sendResult({ commandId: cmd.id, success: response?.success ?? false, data: result, error: response?.error });
+        onDone?.();
+        return;
+      }
+      const data = typeof response?.data === "object" && response?.data !== null && !Array.isArray(response.data) ? { ...response.data, ...frameAttribution } : response?.data;
+      sendResult({ commandId: cmd.id, success: response?.success ?? false, data, error: response?.error });
+      onDone?.();
+    } catch (err) {
+      sendResult({ commandId: cmd.id, success: false, error: String(err) });
+      onDone?.();
+    }
+  }
+  async function collectNewTabs(tabId, beforeTabs, cmdParams) {
+    const beforeIds = new Set(beforeTabs.map((t) => t.id));
+    try {
+      const currentTab = await chrome.tabs.get(tabId);
+      const afterTabs = await chrome.tabs.query({ windowId: currentTab.windowId });
+      const newTabIds = afterTabs.filter((t) => t.id != null && !beforeIds.has(t.id)).map((t) => t.id);
+      const out = [];
+      for (const ntid of newTabIds) {
+        try {
+          await waitForTabLoad(ntid);
+        } catch {
+          continue;
+        }
+        const info = await getFullPageInfo(ntid, cmdParams);
+        if (info) out.push({ tabId: ntid, ...info });
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+  var ELEMENT_SEARCH_COMMANDS = /* @__PURE__ */ new Set(["click", "type", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect"]);
+  var frameTreeCache = /* @__PURE__ */ new Map();
+  chrome.tabs.onUpdated.addListener((tabId, info) => {
+    if (info.status === "complete") frameTreeCache.delete(tabId);
+  });
+  async function getFrameTree(tabId) {
+    const cached = frameTreeCache.get(tabId);
+    if (cached && Date.now() - cached.at < 500) return cached.frames;
+    let frames = [];
+    try {
+      const all = await chrome.webNavigation.getAllFrames({ tabId });
+      if (all && all.length > 0) {
+        const byId = new Map(all.map((f) => [f.frameId, f]));
+        const depthOf = /* @__PURE__ */ new Map();
+        const depth = (frameId) => {
+          const cachedD = depthOf.get(frameId);
+          if (cachedD != null) return cachedD;
+          const f = byId.get(frameId);
+          const d = f && f.parentFrameId != null && f.parentFrameId !== -1 ? depth(f.parentFrameId) + 1 : 0;
+          depthOf.set(frameId, d);
+          return d;
+        };
+        frames = all.map((f, i) => ({
+          frameId: f.frameId,
+          parentFrameId: f.parentFrameId ?? -1,
+          url: f.url || "",
+          depth: depth(f.frameId),
+          order: i
+        })).sort((a, b) => a.depth - b.depth || a.order - b.order);
+      }
+    } catch {
+    }
+    if (frames.length === 0) {
+      frames = [{ frameId: 0, parentFrameId: -1, url: "", depth: 0, order: 0 }];
+    }
+    frameTreeCache.set(tabId, { at: Date.now(), frames });
+    return frames;
+  }
+  function sendToFrame(tabId, frameId, msg, timeoutMs = 1200) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve({ missing: true }), timeoutMs);
+      try {
+        chrome.tabs.sendMessage(tabId, msg, { frameId }, (r) => {
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) {
+            resolve({ missing: true });
+            return;
+          }
+          resolve({
+            response: r
+          });
+        });
+      } catch {
+        clearTimeout(timer);
+        resolve({ missing: true });
+      }
+    });
+  }
+  async function getTopIframes(tabId) {
+    const { response } = await sendToFrame(tabId, 0, {
+      type: "execute_command",
+      payload: { command: "get_page_info", params: { _field: ["iframes"] } }
+    });
+    return response?.data?.iframes ?? [];
+  }
+  async function resolveSearchFrames(tabId, frameParam) {
+    const frames = await getFrameTree(tabId);
+    if (frameParam === "top") return frames.filter((f) => f.frameId === 0);
+    if (typeof frameParam === "number") {
+      const iframes = await getTopIframes(tabId);
+      const target = iframes[frameParam];
+      const src = target?.url || target?.src;
+      if (!src) return [];
+      const hit = frames.find((f) => f.parentFrameId === 0 && f.url && (f.url === src || f.url.startsWith(src)));
+      return hit ? [hit] : [];
+    }
+    if (frameParam && typeof frameParam === "object" && !Array.isArray(frameParam)) {
+      const urlSub = frameParam.url;
+      if (urlSub) {
+        const hit = frames.find((f) => f.url && f.url.includes(urlSub));
+        return hit ? [hit] : [];
+      }
+    }
+    return frames;
+  }
+  async function enrichCrossOriginIframes(tabId, iframes, needHtml) {
+    if (!iframes.some((f) => !f.sameOrigin)) return iframes;
+    const frames = await getFrameTree(tabId);
+    const childFrames = frames.filter((f) => f.parentFrameId === 0);
+    const used = /* @__PURE__ */ new Set();
+    const out = [];
+    for (const ifr of iframes) {
+      if (ifr.sameOrigin) {
+        out.push(ifr);
+        continue;
+      }
+      let match = childFrames.find((cf) => !used.has(cf.frameId) && ifr.src && cf.url && (cf.url === ifr.src || cf.url.startsWith(ifr.src)));
+      if (!match) match = childFrames.find((cf) => !used.has(cf.frameId));
+      if (match) {
+        used.add(match.frameId);
+        const { response } = await sendToFrame(tabId, match.frameId, {
+          type: "execute_command",
+          payload: { command: "frame_info", params: {} }
+        });
+        const d = response?.data;
+        out.push({
+          index: ifr.index,
+          src: ifr.src,
+          sameOrigin: false,
+          ...d?.url ? { url: d.url } : {},
+          ...needHtml && d?.html ? { html: d.html } : {}
+        });
+      } else {
+        out.push(ifr);
+      }
+    }
+    return out;
+  }
+  async function broadcastJsErrors(tabId) {
+    const frames = await getFrameTree(tabId);
+    const errors = [];
+    for (const f of frames) {
+      const { response } = await sendToFrame(tabId, f.frameId, {
+        type: "execute_command",
+        payload: { command: "get_js_errors", params: {} }
+      });
+      const errs = response?.data?.errors;
+      if (Array.isArray(errs)) {
+        for (const e of errs) errors.push({ ...e, ...f.frameId !== 0 ? { frame: f.url } : {} });
+      }
+    }
+    return { errors, count: errors.length };
+  }
+  async function broadcastClearJsErrors(tabId) {
+    const frames = await getFrameTree(tabId);
+    for (const f of frames) {
+      await sendToFrame(tabId, f.frameId, {
+        type: "execute_command",
+        payload: { command: "clear_js_errors", params: {} }
       });
     }
-    doSend(tabId);
   }
   async function getFullPageInfo(tabId, cmdParams) {
     try {
@@ -500,25 +649,24 @@
       const fields = cmdParams?._field || [];
       const mappedFields = fields.map((f) => f.replace(/^currentTab\./, ""));
       const needContentScript = mappedFields.some((f) => f === "iframes" || f === "html" || f === "jsErrors");
+      const needIframes = fields.length === 0 || fields.some((f) => f === "iframes" || f === `currentTab.iframes`);
       if (needContentScript) {
         await waitForTabLoad(tabId);
+        let iframes = null;
         for (let attempt = 0; attempt < 3; attempt++) {
           if (attempt > 0) await new Promise((r) => setTimeout(r, 100));
-          const resp = await new Promise((resolve) => {
-            const timer2 = setTimeout(() => resolve({}), 800);
-            chrome.tabs.sendMessage(tabId, {
-              type: "execute_command",
-              payload: { command: "get_page_info", params: { _field: mappedFields } }
-            }, (r) => {
-              clearTimeout(timer2);
-              if (chrome.runtime.lastError) return resolve({});
-              resolve(r);
-            });
+          const { response } = await sendToFrame(tabId, 0, {
+            type: "execute_command",
+            payload: { command: "get_page_info", params: { _field: mappedFields } }
           });
-          if (resp.data?.iframes && resp.data.iframes.length > 0) {
-            result.iframes = resp.data.iframes;
+          const data = response?.data;
+          if (data?.iframes && data.iframes.length > 0) {
+            iframes = data.iframes;
             break;
           }
+        }
+        if (iframes) {
+          result.iframes = await enrichCrossOriginIframes(tabId, iframes, needIframes);
         }
       }
       if (fields.length > 0) {
@@ -563,7 +711,7 @@
           resolve();
           return;
         }
-        const timer2 = setTimeout(() => {
+        const timer = setTimeout(() => {
           chrome.tabs.onUpdated.removeListener(listener);
           reject(new Error(`Tab ${tabId} load timeout after ${timeoutMs}ms`));
         }, timeoutMs);
@@ -571,7 +719,7 @@
           if (tid === tabId && info.status === "complete") {
             chrome.tabs.get(tabId, (t) => {
               if (t.url) {
-                clearTimeout(timer2);
+                clearTimeout(timer);
                 chrome.tabs.onUpdated.removeListener(listener);
                 resolve();
               }
@@ -585,13 +733,13 @@
   async function injectContentScript(tabId) {
     const INJECT_TIMEOUT = 5e3;
     const ready = new Promise((resolve, reject) => {
-      const timer2 = setTimeout(() => {
+      const timer = setTimeout(() => {
         chrome.runtime.onMessage.removeListener(listener);
         reject(new Error(`Content script injection timed out after ${INJECT_TIMEOUT}ms`));
       }, INJECT_TIMEOUT);
       const listener = (_msg) => {
         if (_msg.type === "cs_injected") {
-          clearTimeout(timer2);
+          clearTimeout(timer);
           chrome.runtime.onMessage.removeListener(listener);
           resolve();
         }
@@ -599,323 +747,8 @@
       chrome.runtime.onMessage.addListener(listener);
     });
     await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        (() => {
-          chrome.runtime.onMessage.addListener(
-            (msg, _sender, sendResponse) => {
-              if (msg.type !== "execute_command") return;
-              const { command } = msg.payload;
-              const exec = () => handleCommand(msg.payload);
-              exec().then(sendResponse);
-              return true;
-            }
-          );
-          const jsErrors = [];
-          window.addEventListener("error", (ev) => {
-            jsErrors.push({ message: ev.message, source: ev.filename, lineno: ev.lineno });
-          });
-          window.addEventListener("unhandledrejection", (ev) => {
-            const reason = ev.reason;
-            const msg = typeof reason === "string" ? reason : reason?.message ?? String(reason);
-            jsErrors.push({ message: `Unhandled rejection: ${msg}`, source: "unhandledrejection" });
-          });
-          chrome.runtime.sendMessage({ type: "cs_injected" }).catch(() => {
-          });
-          async function handleCommand(payload) {
-            const { command, params = {} } = payload;
-            try {
-              switch (command) {
-                case "click": {
-                  let el;
-                  let clickDesc = {};
-                  const dispatchFullClick = (target, x, y) => {
-                    const rect = target.getBoundingClientRect();
-                    const cx = x ?? rect.left + rect.width / 2;
-                    const cy = y ?? rect.top + rect.height / 2;
-                    const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
-                    target.dispatchEvent(new MouseEvent("mousedown", opts));
-                    target.dispatchEvent(new MouseEvent("mouseup", opts));
-                    target.dispatchEvent(new MouseEvent("click", opts));
-                  };
-                  if (params.text) {
-                    const text = params.text;
-                    const found = findByText(text);
-                    if (!found) return { success: false, error: `No element found with text: ${text}` };
-                    el = found;
-                    clickDesc = { text, tag: el.tagName.toLowerCase() };
-                    dispatchFullClick(el);
-                  } else if (params.x !== void 0 && params.y !== void 0) {
-                    const x = params.x;
-                    const y = params.y;
-                    const found = document.elementFromPoint(x, y);
-                    if (!found) return { success: false, error: `No element at (${x}, ${y})` };
-                    el = found;
-                    clickDesc = { x, y, tag: el.tagName.toLowerCase() };
-                    dispatchFullClick(el, x, y);
-                  } else {
-                    const selector = params.selector;
-                    if (!selector) return { success: false, error: "Need text, selector, or {x,y}" };
-                    const found = findElement(selector);
-                    if (!found) return { success: false, error: `Element not found: ${selector}` };
-                    el = found;
-                    clickDesc = { selector, tag: el.tagName.toLowerCase() };
-                    dispatchFullClick(el);
-                  }
-                  let navigated = false;
-                  const onBeforeUnload = () => {
-                    navigated = true;
-                  };
-                  window.addEventListener("beforeunload", onBeforeUnload, { once: true });
-                  await new Promise((r) => setTimeout(r, 200));
-                  window.removeEventListener("beforeunload", onBeforeUnload);
-                  return { success: true, navigated, data: clickDesc };
-                }
-                case "type": {
-                  const selector = params.selector;
-                  const text = params.text;
-                  const el = findElement(selector);
-                  if (!el) return { success: false, error: `Element not found: ${selector}` };
-                  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-                    el.value = text;
-                    el.dispatchEvent(new Event("input", { bubbles: true }));
-                    el.dispatchEvent(new Event("change", { bubbles: true }));
-                    return { success: true };
-                  }
-                  if (el.isContentEditable) {
-                    el.focus();
-                    const sel = window.getSelection();
-                    if (sel) {
-                      const range = document.createRange();
-                      range.selectNodeContents(el);
-                      sel.removeAllRanges();
-                      sel.addRange(range);
-                      document.execCommand("delete", false);
-                    }
-                    const paragraphs = text.split(/\n+/).filter((s) => s.length > 0);
-                    paragraphs.forEach((para, i) => {
-                      document.execCommand("insertText", false, para);
-                      if (i < paragraphs.length - 1) document.execCommand("insertParagraph", false);
-                    });
-                    el.dispatchEvent(new Event("input", { bubbles: true }));
-                    return { success: true };
-                  }
-                  return { success: false, error: `Element not typeable: ${selector} (tag=${el.tagName}, contentEditable=${el.contentEditable})` };
-                }
-                case "upload_file": {
-                  const selector = params.selector;
-                  const base64 = params.base64;
-                  const filename = params.filename || "upload.png";
-                  const mime = params.mime || "image/png";
-                  const el = findElement(selector);
-                  if (!el) return { success: false, error: `Element not found: ${selector}` };
-                  if (!(el instanceof HTMLInputElement) || el.type !== "file") {
-                    return { success: false, error: `Element is not a file input: ${selector}` };
-                  }
-                  const clean = base64.replace(/^data:[^;]+;base64,/, "");
-                  const bin = atob(clean);
-                  const bytes = new Uint8Array(bin.length);
-                  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                  const file = new File([bytes], filename, { type: mime });
-                  const dt = new DataTransfer();
-                  dt.items.add(file);
-                  el.files = dt.files;
-                  el.dispatchEvent(new Event("change", { bubbles: true }));
-                  return { success: true, data: { filename, size: bytes.length, mime } };
-                }
-                case "paste_rich": {
-                  const selector = params.selector;
-                  const html = params.html;
-                  const el = findElement(selector);
-                  if (!el) return { success: false, error: `Element not found: ${selector}` };
-                  if (!el.isContentEditable) {
-                    return { success: false, error: `Element is not contenteditable: ${selector} (tag=${el.tagName})` };
-                  }
-                  el.focus();
-                  const sel = window.getSelection();
-                  if (sel) {
-                    const range = document.createRange();
-                    range.selectNodeContents(el);
-                    sel.removeAllRanges();
-                    sel.addRange(range);
-                    document.execCommand("delete", false);
-                  }
-                  document.execCommand("insertHTML", false, html);
-                  el.dispatchEvent(new Event("input", { bubbles: true }));
-                  return { success: true, data: { inserted: true } };
-                }
-                case "get_text": {
-                  const selector = params.selector;
-                  const el = selector ? findElement(selector) : document.body;
-                  if (!el) return { success: false, error: `Element not found: ${selector}` };
-                  return { success: true, data: el.textContent?.trim() };
-                }
-                case "get_css": {
-                  const selector = params.selector;
-                  if (!selector) return { success: false, error: "selector is required" };
-                  const isCss = selector.startsWith("css:");
-                  const query = isCss ? selector.slice(4) : selector;
-                  const nodes = isCss ? document.querySelectorAll(query) : [findElement(selector)].filter(Boolean);
-                  if (nodes.length === 0) return { success: false, error: `Element not found: ${selector}` };
-                  const results = Array.from(nodes).map((el, i) => {
-                    const computed = window.getComputedStyle(el);
-                    const css = {};
-                    for (let j = 0; j < computed.length; j++) {
-                      const prop = computed[j];
-                      css[prop] = computed.getPropertyValue(prop);
-                    }
-                    return { index: i, css };
-                  });
-                  return { success: true, data: { selector, count: nodes.length, results } };
-                }
-                case "get_page_info": {
-                  const fields = params._field || [];
-                  const data = {};
-                  if (fields.length === 0 || fields.includes("url")) data.url = window.location.href;
-                  if (fields.length === 0 || fields.includes("title")) data.title = document.title;
-                  if (fields.length === 0 || fields.includes("html")) data.html = document.documentElement.outerHTML;
-                  if (fields.length === 0 || fields.includes("iframes")) {
-                    const iframes = [];
-                    document.querySelectorAll("iframe").forEach((f, i) => {
-                      const iframe = f;
-                      let sameOrigin = false;
-                      let url;
-                      let html;
-                      try {
-                        const doc = iframe.contentDocument;
-                        if (doc) {
-                          sameOrigin = true;
-                          url = doc.location.href;
-                          html = doc.documentElement.outerHTML;
-                        }
-                      } catch {
-                        sameOrigin = false;
-                      }
-                      iframes.push({ index: i, src: iframe.src, sameOrigin, ...sameOrigin ? { url, html } : {} });
-                    });
-                    data.iframes = iframes;
-                  }
-                  return { success: true, data };
-                }
-                case "get_js_errors": {
-                  return { success: true, data: { errors: [...jsErrors], count: jsErrors.length } };
-                }
-                case "clear_js_errors": {
-                  jsErrors.length = 0;
-                  return { success: true };
-                }
-                case "wait_for_page": {
-                  const timeout = params.timeout ?? 1e4;
-                  const start = Date.now();
-                  return new Promise((resolve) => {
-                    let settled = false;
-                    const cleanup = () => {
-                      document.removeEventListener("readystatechange", onChange);
-                      clearTimeout(timer);
-                    };
-                    const onChange = () => {
-                      if (document.readyState === "complete") {
-                        settled = true;
-                        cleanup();
-                        waitForDomStable(3e3).then(() => {
-                          resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
-                        });
-                      }
-                    };
-                    document.addEventListener("readystatechange", onChange);
-                    if (document.readyState === "complete") {
-                      settled = true;
-                      cleanup();
-                      waitForDomStable(3e3).then(() => {
-                        resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
-                      });
-                    } else {
-                      const timer2 = setTimeout(() => {
-                        if (settled) return;
-                        cleanup();
-                        resolve({ success: true, data: { readyState: document.readyState, elapsed: Date.now() - start } });
-                      }, timeout);
-                    }
-                  });
-                }
-                case "scroll": {
-                  const y = params.y ?? 0;
-                  const x = params.x ?? 0;
-                  window.scrollTo({ top: y, left: x, behavior: "smooth" });
-                  await waitForDomStable(3e3);
-                  return { success: true, data: { scrollX: window.scrollX, scrollY: window.scrollY } };
-                }
-                default:
-                  return { success: false, error: `Unknown command: ${command}` };
-              }
-            } catch (err) {
-              return { success: false, error: String(err) };
-            }
-          }
-          function waitForDomStable(maxWaitMs) {
-            return new Promise((resolve) => {
-              let quietTimer;
-              const observer = new MutationObserver(() => {
-                clearTimeout(quietTimer);
-                quietTimer = window.setTimeout(() => {
-                  observer.disconnect();
-                  resolve();
-                }, 250);
-              });
-              observer.observe(document.body, { childList: true, subtree: true });
-              quietTimer = window.setTimeout(() => {
-                observer.disconnect();
-                resolve();
-              }, 250);
-              setTimeout(() => {
-                observer.disconnect();
-                clearTimeout(quietTimer);
-                resolve();
-              }, maxWaitMs);
-            });
-          }
-          function findByText(text) {
-            const q = xpathStr(text);
-            const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
-            const xpath = [
-              `//body//button[contains(normalize-space(.), ${q})]`,
-              `//body//a[contains(normalize-space(.), ${q})]`,
-              `//body//input[contains(@value, ${q})]`,
-              `//body//*[not(${hidden})][contains(normalize-space(.), ${q}) and not(./*[not(${hidden})][contains(normalize-space(.), ${q})])]`
-            ].join(" | ");
-            const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
-            let el = result.iterateNext();
-            while (el) {
-              const htmlEl = el;
-              if (isVisible(htmlEl)) return htmlEl;
-              el = result.iterateNext();
-            }
-            return null;
-          }
-          function isVisible(el) {
-            const style = getComputedStyle(el);
-            if (style.display === "none" || style.visibility === "hidden") return false;
-            const rect = el.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0;
-          }
-          function xpathStr(s) {
-            if (!s.includes("'")) return `'${s}'`;
-            if (!s.includes('"')) return `"${s}"`;
-            return "concat('" + s.replace(/'/g, `',"'",'`) + "')";
-          }
-          function findElement(selector) {
-            if (selector.startsWith("css:")) {
-              return document.querySelector(selector.slice(4));
-            }
-            if (selector.startsWith("xpath:")) {
-              const xpath = selector.slice(6);
-              const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-              return result.singleNodeValue;
-            }
-            return document.querySelector(selector);
-          }
-        })();
-      }
+      target: { tabId, allFrames: true },
+      files: ["content/content-script.js"]
     });
     await ready;
   }
@@ -1083,27 +916,40 @@
       }
       let x = params.x;
       let y = params.y;
+      let cdpFrameId;
       if (x == null || y == null) {
-        const rectResp = await new Promise((resolve) => {
-          const timer2 = setTimeout(() => resolve({}), 8e3);
-          chrome.tabs.sendMessage(tabId, {
+        const frames = await resolveSearchFrames(tabId, params.frame);
+        for (const f of frames) {
+          const r = await sendToFrame(tabId, f.frameId, {
             type: "execute_command",
             payload: { command: "get_rect", params: { selector } }
-          }, (r) => {
-            clearTimeout(timer2);
-            if (chrome.runtime.lastError) return resolve({});
-            resolve(r);
-          });
-        });
-        x = rectResp.data?.x;
-        y = rectResp.data?.y;
+          }, 8e3);
+          if (r.missing || r.response?.notFound) continue;
+          const d = r.response?.data;
+          if (d?.crossOrigin) {
+            cdpFrameId = f.frameId;
+            break;
+          }
+          x = d?.x;
+          y = d?.y;
+          break;
+        }
       }
       if (x == null || y == null) {
-        sendResult({ success: false, error: `Could not locate element: ${selector || `(${x},${y})`}` });
+        sendResult({ success: false, error: `Could not locate element: ${selector || "unknown"}` });
         return;
       }
       await chrome.debugger.attach({ tabId }, "1.3");
       try {
+        if (cdpFrameId != null) {
+          const point = await getElementCenterViaCdp(tabId, cdpFrameId, params);
+          if (!point) {
+            sendResult({ success: false, error: `Could not locate element in iframe via CDP: ${selector}` });
+            return;
+          }
+          x = point.x;
+          y = point.y;
+        }
         try {
           const tab = await chrome.tabs.get(tabId);
           if (tab.windowId != null) {
@@ -1137,6 +983,67 @@
     } catch (err) {
       sendResult({ success: false, error: String(err) });
     }
+  }
+  async function getElementCenterViaCdp(tabId, frameId, params) {
+    await chrome.debugger.sendCommand({ tabId }, "DOM.enable");
+    await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
+    await chrome.debugger.sendCommand({ tabId }, "Page.enable");
+    const contexts = [];
+    const onEvent = (_src, method, eventParams) => {
+      if (method === "Runtime.executionContextCreated") {
+        const ctx2 = eventParams?.context;
+        if (ctx2?.id != null) {
+          contexts.push({
+            id: ctx2.id,
+            frameId: ctx2.auxData?.frameId,
+            isDefault: ctx2.auxData?.isDefault
+          });
+        }
+      }
+    };
+    chrome.debugger.onEvent.addListener(onEvent);
+    await new Promise((r) => setTimeout(r, 300));
+    chrome.debugger.onEvent.removeListener(onEvent);
+    const ctx = contexts.find((c) => c.isDefault && c.frameId === String(frameId));
+    if (!ctx) return null;
+    const selector = params.selector;
+    const text = params.text;
+    let expression;
+    if (text) {
+      const q = JSON.stringify(text);
+      const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
+      expression = `(()=>{const xpath=[`;
+    } else if ((selector || "").startsWith("xpath:")) {
+      const xpath = (selector || "").slice(6);
+      expression = `(()=>{const r=document.evaluate(${JSON.stringify(xpath)},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null);return r.singleNodeValue||null})()`;
+    } else {
+      const css = (selector || "").replace(/^css:/, "");
+      expression = `document.querySelector(${JSON.stringify(css)})`;
+    }
+    const evalRes = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+      contextId: ctx.id,
+      expression,
+      userGesture: true
+    });
+    const objectId = evalRes?.result?.objectId;
+    if (!objectId) return null;
+    const nodeRes = await chrome.debugger.sendCommand({ tabId }, "DOM.requestNode", { objectId });
+    const nodeId = nodeRes?.nodeId;
+    if (nodeId == null) return null;
+    const quadsRes = await chrome.debugger.sendCommand({ tabId }, "DOM.getContentQuads", { nodeId });
+    const quads = quadsRes?.quads;
+    if (!quads || quads.length === 0) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const quad of quads) {
+      for (let i = 0; i < quad.length; i += 2) {
+        minX = Math.min(minX, quad[i]);
+        minY = Math.min(minY, quad[i + 1]);
+        maxX = Math.max(maxX, quad[i]);
+        maxY = Math.max(maxY, quad[i + 1]);
+      }
+    }
+    if (minX > maxX || minY > maxY) return null;
+    return { x: Math.round((minX + maxX) / 2), y: Math.round((minY + maxY) / 2) };
   }
   chrome.storage.onChanged.addListener(
     (changes, area) => {

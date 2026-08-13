@@ -118,7 +118,7 @@ async function collectIframes(fields: string[]): Promise<{ index: number; src: s
 
 async function handleCommand(
   payload: { command: string; params?: Record<string, unknown> },
-): Promise<{ success: boolean; data?: unknown; error?: string }> {
+): Promise<{ success: boolean; data?: unknown; error?: string; notFound?: boolean }> {
   const { command, params = {} } = payload;
   const fields = getFieldFilter(params);
 
@@ -142,7 +142,7 @@ async function handleCommand(
         if (params.text) {
           const text = params.text as string;
           const found = findByText(text);
-          if (!found) return { success: false, error: `No element found with text: ${text}` };
+          if (!found) return { success: false, notFound: true, error: `No element found with text: ${text}` };
           el = found;
           clickDesc = { text, tag: (el as HTMLElement).tagName.toLowerCase() };
           dispatchFullClick(el);
@@ -150,7 +150,7 @@ async function handleCommand(
           const x = params.x as number;
           const y = params.y as number;
           const found = document.elementFromPoint(x, y);
-          if (!found) return { success: false, error: `No element at (${x}, ${y})` };
+          if (!found) return { success: false, notFound: true, error: `No element at (${x}, ${y})` };
           el = found;
           clickDesc = { x, y, tag: (el as HTMLElement).tagName.toLowerCase() };
           dispatchFullClick(el, x, y);
@@ -158,7 +158,7 @@ async function handleCommand(
           const selector = params.selector as string;
           if (!selector) return { success: false, error: "Need text, selector, or {x,y}" };
           const found = findElement(selector);
-          if (!found) return { success: false, error: `Element not found: ${selector}` };
+          if (!found) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           el = found;
           clickDesc = { selector, tag: (el as HTMLElement).tagName.toLowerCase() };
           dispatchFullClick(el);
@@ -188,19 +188,41 @@ async function handleCommand(
       }
 
       case "get_rect": {
-        // 获取元素在视口中的坐标（供 real_click 真实点击使用）
+        // 获取元素在视口中的坐标（供 real_click 真实点击使用）。
+        // iframe 内元素的 getBoundingClientRect 相对 iframe 自身视口，
+        // 沿 window.parent 链累加每层 frameElement 的偏移换算为顶层视口坐标；
+        // 跨域边界无法读父 frame（getBoundingClientRect 抛 SecurityError）→ 标记 crossOrigin，
+        // 返回 iframe 本地坐标，由 service worker 走 CDP getContentQuads 精确定位。
         const selector = params.selector as string;
         const el = findElement(selector) as HTMLElement | null;
-        if (!el) return { success: false, error: `Element not found: ${selector}` };
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         const rect = el.getBoundingClientRect();
+        const lx = rect.left + rect.width / 2;
+        const ly = rect.top + rect.height / 2;
+        let x = lx;
+        let y = ly;
+        let crossOrigin = false;
+        let win: Window = window;
+        while (win.frameElement) {
+          try {
+            const fr = (win.frameElement as HTMLElement).getBoundingClientRect();
+            x += fr.left;
+            y += fr.top;
+          } catch {
+            crossOrigin = true;
+            break;
+          }
+          win = win.parent;
+        }
         return {
           success: true,
           data: {
             selector,
-            x: Math.round(rect.left + rect.width / 2),
-            y: Math.round(rect.top + rect.height / 2),
+            x: Math.round(x),
+            y: Math.round(y),
             width: Math.round(rect.width),
             height: Math.round(rect.height),
+            ...(crossOrigin ? { crossOrigin: true, localX: Math.round(lx), localY: Math.round(ly) } : {}),
           },
         };
       }
@@ -212,7 +234,7 @@ async function handleCommand(
         // 记录原样式值，hide 可精确还原。
         const selector = params.selector as string;
         const els = Array.from(document.querySelectorAll(selector)) as HTMLElement[];
-        if (els.length === 0) return { success: false, error: `Element not found: ${selector}` };
+        if (els.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         for (const el of els) {
           if (!showRegistry.has(el)) {
             showRegistry.set(el, {
@@ -247,7 +269,7 @@ async function handleCommand(
         const selector = params.selector as string;
         const text = params.text as string;
         const el = findElement(selector) as HTMLElement | null;
-        if (!el) return { success: false, error: `Element not found: ${selector}` };
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         // input/textarea: 直接设置 value
         if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
           el.value = text;
@@ -284,7 +306,7 @@ async function handleCommand(
         const filename = (params.filename as string) || "upload.png";
         const mime = (params.mime as string) || "image/png";
         const el = findElement(selector) as HTMLInputElement | null;
-        if (!el) return { success: false, error: `Element not found: ${selector}` };
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         if (!(el instanceof HTMLInputElement) || el.type !== "file") {
           return { success: false, error: `Element is not a file input: ${selector}` };
         }
@@ -306,7 +328,7 @@ async function handleCommand(
         const selector = params.selector as string;
         const html = params.html as string;
         const el = findElement(selector) as HTMLElement | null;
-        if (!el) return { success: false, error: `Element not found: ${selector}` };
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         if (!el.isContentEditable) {
           return { success: false, error: `Element is not contenteditable: ${selector} (tag=${el.tagName})` };
         }
@@ -328,7 +350,7 @@ async function handleCommand(
       case "get_text": {
         const selector = params.selector as string;
         const el = selector ? findElement(selector) : document.body;
-        if (!el) return { success: false, error: `Element not found: ${selector}` };
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         return { success: true, data: el.textContent?.trim() };
       }
 
@@ -338,7 +360,7 @@ async function handleCommand(
         const isCss = selector.startsWith("css:");
         const query = isCss ? selector.slice(4) : selector;
         const nodes = isCss ? document.querySelectorAll(query) : [findElement(selector)].filter(Boolean) as Element[];
-        if (nodes.length === 0) return { success: false, error: `Element not found: ${selector}` };
+        if (nodes.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         const results = Array.from(nodes).map((el, i) => {
           const computed = window.getComputedStyle(el);
           const css: Record<string, string> = {};
@@ -349,6 +371,18 @@ async function handleCommand(
           return { index: i, css };
         });
         return { success: true, data: { selector, count: nodes.length, results } };
+      }
+
+      case "frame_info": {
+        // 返回自身 frame 的文档信息（供 service worker 补全跨域 iframe 元数据）
+        return {
+          success: true,
+          data: {
+            url: window.location.href,
+            title: document.title,
+            html: document.documentElement.outerHTML,
+          },
+        };
       }
 
       case "get_page_info": {
@@ -488,3 +522,7 @@ function findElement(selector: string): Element | null {
   }
   return document.querySelector(selector);
 }
+
+// 就绪信号：动态注入（chrome.scripting.executeScript）时告知 service worker 已注册完成；
+// manifest 正常注入（all_frames）时由 service worker 常驻 listener 静默响应，无副作用。
+chrome.runtime.sendMessage({ type: "cs_injected" }).catch(() => {});
