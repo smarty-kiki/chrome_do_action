@@ -293,6 +293,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | `type` | `send <id> type <tab> <params>` | 输入文本（{selector,text}），支持 input/textarea 与 contenteditable 富文本，富文本按换行分段 |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入本地图片（{selector,base64,filename,mime}），触发 change 事件完成上传 |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | 向 contenteditable 富文本编辑器粘贴带样式的 HTML（{selector,html}），等价于粘贴排好版的文档 |
+| `show` | `send <id> show <tab> <params>` | 强制显示隐藏元素（{selector}），仅改 CSS 样式不执行代码；让 hover 才显示的菜单/工具条常驻可见，随后可被 click 命中 |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本内容 |
 | `get_css` | `send <id> get_css <tab> <selector>` | 获取所有匹配元素的 computed style，返回 `{selector, count, results}` |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息 |
@@ -321,7 +322,6 @@ cda send OfficePC get_text current '{"selector":"table"}'
   // 先渐进经过封面按钮（触发 hover 菜单），最后点击"从图片库选择"菜单项
   {"x": 500, "y": 343, "approach": [[360, 360], [420, 330], [470, 325]]}
   ```
-- **noMove 参数**：`{"x":500, "y":343, "noMove": true}`——跳过鼠标移动，直接在目标坐标 press/release。用于**菜单已显示**的场景：不移动内部鼠标位置，避免触发触发器 mouseleave 导致 popover 关闭（菜单显示后用 noMove 点菜单项，成功率高）
 - 原理：content script 获取元素中心坐标（或直接给 x/y）→ 激活窗口 → CDP `Input.dispatchMouseEvent` 发送完整序列
 - 适用：对合成事件免疫的站点（如微信公众平台后台 Vue 组件）、hover 才显示的工具条元素
 - 注意：**坐标必须是元素真实位置**（用截图确认），DOM 快照里可能有顶部隐藏模板导致 get_rect 返回错误坐标（如把 y=824 误报成 y=224）
@@ -358,6 +358,28 @@ cda send OfficePC get_text current '{"selector":"table"}'
 - 会先清空目标编辑器现有内容再插入（等价于"全选删除后粘贴"）
 - 与 `type`（纯文本）互补：type 写字，paste_rich 粘贴排版
 - 不修改页面源代码，仅向编辑器内容区插入富文本
+
+### show
+
+```
+send <id> show <tabId> '.js_imagedialog'      // selector 直接位置参数
+```
+
+- **只改 CSS 样式，不执行代码**：将所有匹配元素的 `visibility` 置为 `visible`、`opacity` 置为 `1`、`display` 若为 `none` 则置为 `block`
+- **默认作用于所有匹配元素**（无需 all 参数）
+- inline style 优先级最高，不会被 hover CSS 覆盖 → 元素**常驻可见**
+- 用途：hover 才显示的工具条/菜单（如微信后台封面菜单"从图片库选择"等），强制显示后可被 `click` 或 `real_click` 命中
+- 组合用法：`show` 显示菜单项 → `click`（或 `real_click`）点击 → 后续流程 → `hide` 还原
+
+### hide
+
+```
+send <id> hide <tabId>       // 无参数：还原全部被 show 的元素
+```
+
+- 与 `show` 成对：操作完调用 hide 还原，清掉 inline style 回到 CSS 控制，避免菜单常驻影响后续点击
+- show 会记录被改元素的原始 inline 样式，hide 精确恢复
+- 页面刷新后样式本身恢复原状（inline style 不持久），hide 用于不刷新页面的场景
 
 ### scroll 参数
 

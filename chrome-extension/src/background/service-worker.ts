@@ -1085,18 +1085,14 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       const clickPoint = { x, y, button: "left" as const, clickCount: 1 };
 
       // 3.0 渐进移动到 approach 路径各点（模拟真实鼠标轨迹，逐级触发 hover）
-      // noMove 模式：跳过鼠标移动，直接 press/release 在目标坐标——
-      // 用于菜单已显示的场景：不移动内部鼠标位置，避免触发触发器 mouseleave 关闭菜单
-      if (!params.noMove) {
-        if (approach && approach.length) {
-          for (const [ax, ay] of approach) {
-            await moveMouseInSteps(tabId, ax, ay);
-            await new Promise((r) => setTimeout(r, 150));
-          }
+      if (approach && approach.length) {
+        for (const [ax, ay] of approach) {
+          await moveMouseInSteps(tabId, ax, ay);
+          await new Promise((r) => setTimeout(r, 150));
         }
-        // 3.1 鼠标渐进移动到元素中心（触发 mouseover/mouseenter/mousemove，激活 hover 状态）
-        await moveMouseInSteps(tabId, x, y);
       }
+      // 3.1 鼠标渐进移动到元素中心（触发 mouseover/mouseenter/mousemove，激活 hover 状态）
+      await moveMouseInSteps(tabId, x, y);
       // 3.2 短暂停留，让 hover/样式生效（有 approach 时等 popover 展开）
       await new Promise((r) => setTimeout(r, approach && approach.length ? 400 : 120));
       // 3.3 按下（触发 mousedown + focus）

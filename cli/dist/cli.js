@@ -30,15 +30,17 @@ Page commands (tab required):
                               that ignore synthetic events (e.g. WeChat MP).
                               Params: {selector} or {x,y}; optional {approach} =
                               [[x,y],...] path to move through progressively,
-                              triggering hover chains before clicking;
-                              {noMove:true} skips mouse movement (press/release
-                              at target only, keeps popover open)
+                              triggering hover chains before clicking
   type <tab> <params>         Type text ({selector,text}); supports input/textarea
                               and contenteditable (rich text, splits by newline)
   upload_file <tab> <params>  Inject base64 image into file input
                               ({selector,base64,filename,mime}), triggers change
   paste_rich <tab> <params>   Paste styled HTML into contenteditable
                               ({selector,html}); clears existing content first
+  show <tab> <selector>       Force-show all matching hidden elements
+                              (inline style; makes hover-only menus clickable)
+  hide <tab>                  Restore all elements shown by show
+                              (clears inline style back to CSS control)
   get_text <tab> [params]     Get text of element ({selector}) or entire page
   get_css <tab> <selector>    Get computed CSS of element ({selector})
   get_page_info <tab>         Get page info (url, title, iframes), supports --field
@@ -103,7 +105,7 @@ function buildMessage(action, args) {
             console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
-            console.error("Page commands (tab required): click | real_click | type | upload_file | paste_rich | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | screenshot | scroll");
+            console.error("Page commands (tab required): click | real_click | type | upload_file | paste_rich | show | hide | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | screenshot | scroll");
             console.error("");
             console.error("Example: cda send abc123 get_page_info current");
             process.exit(1);
@@ -142,11 +144,11 @@ function buildMessage(action, args) {
             process.exit(1);
         }
         let params = {};
-        if (command === "get_css") {
+        if (command === "get_css" || command === "show") {
             const selector = args[3];
             if (!selector) {
-                console.error(`Error: "get_css" requires a selector argument.`);
-                console.error(`Usage: cda --server <url> send ${nodeId} get_css <tabId> <selector>`);
+                console.error(`Error: "${command}" requires a selector argument.`);
+                console.error(`Usage: cda --server <url> send ${nodeId} ${command} <tabId> <selector>`);
                 process.exit(1);
             }
             params = { selector };

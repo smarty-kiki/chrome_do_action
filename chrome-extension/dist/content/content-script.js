@@ -12,6 +12,22 @@
   }
   window.addEventListener("error", onPageError);
   window.addEventListener("unhandledrejection", onUnhandledRejection);
+  var showRegistry = /* @__PURE__ */ new Map();
+  function restoreShownElement(el) {
+    const orig = showRegistry.get(el);
+    if (!orig) return;
+    const restoreProp = (prop, origVal) => {
+      if (origVal) {
+        el.style[prop] = origVal;
+      } else {
+        el.style.removeProperty(prop);
+      }
+    };
+    restoreProp("visibility", orig.visibility);
+    restoreProp("opacity", orig.opacity);
+    restoreProp("display", orig.display);
+    showRegistry.delete(el);
+  }
   chrome.runtime.onMessage.addListener(
     (msg, _sender, sendResponse) => {
       if (msg.type !== "execute_command") return;
@@ -149,6 +165,37 @@
               height: Math.round(rect.height)
             }
           };
+        }
+        case "show": {
+          const selector = params.selector;
+          const els = Array.from(document.querySelectorAll(selector));
+          if (els.length === 0) return { success: false, error: `Element not found: ${selector}` };
+          for (const el of els) {
+            if (!showRegistry.has(el)) {
+              showRegistry.set(el, {
+                visibility: el.style.visibility || void 0,
+                opacity: el.style.opacity || void 0,
+                display: el.style.display || void 0
+              });
+            }
+            el.style.visibility = "visible";
+            el.style.opacity = "1";
+            if (el.style.display === "none" || getComputedStyle(el).display === "none") {
+              el.style.display = "block";
+            }
+          }
+          return { success: true, data: { selector, count: els.length } };
+        }
+        case "hide": {
+          const els = Array.from(showRegistry.keys());
+          let count = 0;
+          for (const el of els) {
+            if (el.isConnected) {
+              restoreShownElement(el);
+              count++;
+            }
+          }
+          return { success: true, data: { count } };
         }
         case "type": {
           const selector = params.selector;

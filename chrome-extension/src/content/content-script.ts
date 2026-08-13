@@ -17,6 +17,26 @@ function onUnhandledRejection(ev: PromiseRejectionEvent) {
 window.addEventListener("error", onPageError);
 window.addEventListener("unhandledrejection", onUnhandledRejection);
 
+// --- show/hide 还原注册表 ---
+// show 记录被改元素的原始 inline 样式，hide 或 ttl 到期时精确还原（清掉 inline style 回到 CSS 控制）
+const showRegistry = new Map<HTMLElement, { visibility?: string; opacity?: string; display?: string }>();
+
+function restoreShownElement(el: HTMLElement): void {
+  const orig = showRegistry.get(el);
+  if (!orig) return;
+  const restoreProp = (prop: "visibility" | "opacity" | "display", origVal?: string) => {
+    if (origVal) {
+      (el.style as Record<string, string>)[prop] = origVal;
+    } else {
+      el.style.removeProperty(prop);
+    }
+  };
+  restoreProp("visibility", orig.visibility);
+  restoreProp("opacity", orig.opacity);
+  restoreProp("display", orig.display);
+  showRegistry.delete(el);
+}
+
 // --- Command handler ---
 
 chrome.runtime.onMessage.addListener(
@@ -183,6 +203,44 @@ async function handleCommand(
             height: Math.round(rect.height),
           },
         };
+      }
+
+      case "show": {
+        // 强制显示隐藏元素（仅改 CSS 样式，不执行代码）。
+        // 作用于所有匹配元素：把 hover 才显示的工具条/菜单常驻可见，
+        // inline style 优先级最高，不会被 hover CSS 覆盖，随后可被 click 命中。
+        // 记录原样式值，hide 可精确还原。
+        const selector = params.selector as string;
+        const els = Array.from(document.querySelectorAll(selector)) as HTMLElement[];
+        if (els.length === 0) return { success: false, error: `Element not found: ${selector}` };
+        for (const el of els) {
+          if (!showRegistry.has(el)) {
+            showRegistry.set(el, {
+              visibility: el.style.visibility || undefined,
+              opacity: el.style.opacity || undefined,
+              display: el.style.display || undefined,
+            });
+          }
+          el.style.visibility = "visible";
+          el.style.opacity = "1";
+          if (el.style.display === "none" || getComputedStyle(el).display === "none") {
+            el.style.display = "block";
+          }
+        }
+        return { success: true, data: { selector, count: els.length } };
+      }
+
+      case "hide": {
+        // 还原所有被 show 的元素：清掉 inline style，回到 CSS 控制
+        const els = Array.from(showRegistry.keys());
+        let count = 0;
+        for (const el of els) {
+          if (el.isConnected) {
+            restoreShownElement(el);
+            count++;
+          }
+        }
+        return { success: true, data: { count } };
       }
 
       case "type": {
