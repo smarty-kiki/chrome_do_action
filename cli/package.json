@@ -2,6 +2,7 @@
   "name": "chrome-do-action-cli",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "bin": {
     "cda": "dist/cli.js"
   },
