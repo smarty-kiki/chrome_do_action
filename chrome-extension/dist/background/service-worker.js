@@ -648,26 +648,29 @@
       };
       const fields = cmdParams?._field || [];
       const mappedFields = fields.map((f) => f.replace(/^currentTab\./, ""));
-      const needContentScript = mappedFields.some((f) => f === "iframes" || f === "html" || f === "jsErrors");
+      const needContentScript = fields.length === 0 || mappedFields.some((f) => f === "iframes" || f === "html" || f === "jsErrors");
       const needIframes = fields.length === 0 || fields.some((f) => f === "iframes" || f === `currentTab.iframes`);
+      const needHtml = fields.some((f) => f === "html" || f === `currentTab.html`);
+      const csFields = fields.length === 0 ? ["iframes"] : mappedFields;
       if (needContentScript) {
         await waitForTabLoad(tabId);
         let iframes = null;
+        let html;
         for (let attempt = 0; attempt < 3; attempt++) {
           if (attempt > 0) await new Promise((r) => setTimeout(r, 100));
           const { response } = await sendToFrame(tabId, 0, {
             type: "execute_command",
-            payload: { command: "get_page_info", params: { _field: mappedFields } }
+            payload: { command: "get_page_info", params: { _field: csFields } }
           });
           const data = response?.data;
-          if (data?.iframes && data.iframes.length > 0) {
-            iframes = data.iframes;
-            break;
-          }
+          if (typeof data?.html === "string") html = data.html;
+          if (data?.iframes && data.iframes.length > 0) iframes = data.iframes;
+          if ((!needIframes || iframes) && (!needHtml || html !== void 0)) break;
         }
         if (iframes) {
           result.iframes = await enrichCrossOriginIframes(tabId, iframes, needIframes);
         }
+        if (needHtml && html !== void 0) result.html = html;
       }
       if (fields.length > 0) {
         const filtered = {};

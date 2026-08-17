@@ -600,28 +600,36 @@ async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown
     // 将 currentTab.xxx 映射为 xxx 传给 content script
     const fields = (cmdParams as Record<string, string[]> | undefined)?._field || [];
     const mappedFields = fields.map(f => f.replace(/^currentTab\./, ""));
-    const needContentScript = mappedFields.some(f => f === "iframes" || f === "html" || f === "jsErrors");
+    // 无 _field 时默认也要取 iframes（页面结构的一部分）；有 _field 时按需采集
+    const needContentScript = fields.length === 0 || mappedFields.some(f => f === "iframes" || f === "html" || f === "jsErrors");
     const needIframes = fields.length === 0 || fields.some(f => f === "iframes" || f === `currentTab.iframes`);
+    const needHtml = fields.some(f => f === "html" || f === `currentTab.html`);
+    // 默认只向内容脚本要 iframes（url/title 直接用 tabs API；html 仅在显式请求时采集）
+    const csFields = fields.length === 0 ? ["iframes"] : mappedFields;
 
     if (needContentScript) {
       await waitForTabLoad(tabId);
       let iframes: IframeMeta[] | null = null;
+      let html: string | undefined;
       for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) await new Promise(r => setTimeout(r, 100));
         const { response } = await sendToFrame(tabId, 0, {
           type: "execute_command",
-          payload: { command: "get_page_info", params: { _field: mappedFields } },
+          payload: { command: "get_page_info", params: { _field: csFields } },
         });
-        const data = response?.data as { iframes?: IframeMeta[] } | undefined;
-        if (data?.iframes && data.iframes.length > 0) {
-          iframes = data.iframes;
-          break;
-        }
+        // 内容脚本返回 data.{url,title,html,iframes}，按请求字段取回
+        const data = response?.data as { iframes?: IframeMeta[]; html?: string } | undefined;
+        if (typeof data?.html === "string") html = data.html;
+        if (data?.iframes && data.iframes.length > 0) iframes = data.iframes;
+        // 本请求所需数据齐了就退出（无 iframe 的页面也能尽快返回）
+        if ((!needIframes || iframes) && (!needHtml || html !== undefined)) break;
       }
       if (iframes) {
         // 跨域 iframe 顶层读不到内容，用子 frame 自报补全 url/html
         result.iframes = await enrichCrossOriginIframes(tabId, iframes, needIframes);
       }
+      // html 只在显式 --field html 时返回；默认输出保持 url/title/iframes
+      if (needHtml && html !== undefined) result.html = html;
     }
 
     // 根据 _field 过滤返回字段
