@@ -236,6 +236,7 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 | `click` | `send <id> click <tab> <params>` | 点击元素（selector / 文字 / 坐标） |
 | `real_click` | `send <id> real_click <tab> <params>` | CDP 真实点击（`isTrusted=true`），支持 `approach` 渐进 hover 路径 |
 | `type` | `send <id> type <tab> <params>` | 输入文本；支持 input/textarea 与 contenteditable 富文本 |
+| `keyboard` | `send <id> keyboard <tab> <params>` | 向元素发送按键（`{selector,key}`，selector 省略用当前聚焦元素），可加 `ctrl`/`shift`/`alt`/`meta` 组合键 |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入 base64 图片并触发上传 |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | 向富文本编辑器粘贴带样式的 HTML |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取元素/整页文本 |
@@ -333,7 +334,7 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 
 ### 7. iframe 读写操作
 
-所有元素命令（`click`/`real_click`/`type`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）都**自动搜索 iframe**：顶层优先、深度优先遍历每个 frame（含跨域），首个命中即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+所有元素命令（`click`/`real_click`/`type`/`keyboard`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）都**自动搜索 iframe**：顶层优先、深度优先遍历每个 frame（含跨域），首个命中即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
 
 ```bash
 # 读取 iframe 内元素文本（自动搜索到跨域 iframe）

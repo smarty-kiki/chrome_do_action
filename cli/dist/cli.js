@@ -37,6 +37,9 @@ Page commands (tab required):
                               translation, cross-origin via CDP
   type <tab> <params>         Type text ({selector,text}); supports input/textarea
                               and contenteditable (rich text, splits by newline)
+  keyboard <tab> <params>     Send key press to element ({selector,key[,ctrl|shift|alt|meta]});
+                              selector optional (defaults to focused element); key e.g.
+                              Enter, Escape, Tab, ArrowDown, or a single char
   upload_file <tab> <params>  Inject base64 image into file input
                               ({selector,base64,filename,mime}), triggers change
   paste_rich <tab> <params>   Paste styled HTML into contenteditable
@@ -118,7 +121,7 @@ function buildMessage(action, args) {
             console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
-            console.error("Page commands (tab required): click | real_click | type | upload_file | paste_rich | show | hide | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | screenshot | scroll");
+            console.error("Page commands (tab required): click | real_click | type | keyboard | upload_file | paste_rich | show | hide | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | screenshot | scroll");
             console.error("");
             console.error("Example: cda send abc123 get_page_info current");
             process.exit(1);

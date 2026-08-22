@@ -237,6 +237,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | `click` | `send <id> click <tab> <params>` | Click an element (selector / text / coordinates) |
 | `real_click` | `send <id> real_click <tab> <params>` | CDP real click (`isTrusted=true`); supports an `approach` hover path |
 | `type` | `send <id> type <tab> <params>` | Type text; supports input/textarea and `contenteditable` rich text |
+| `keyboard` | `send <id> keyboard <tab> <params>` | Send a key press to an element (`{selector,key}`; selector optional, defaults to the focused element); optional `ctrl`/`shift`/`alt`/`meta` modifiers |
 | `upload_file` | `send <id> upload_file <tab> <params>` | Inject a base64 image into a file input and trigger upload |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | Paste styled HTML into a rich-text editor |
 | `get_text` | `send <id> get_text <tab> [selector]` | Get an element's / the page's text |

@@ -59,10 +59,11 @@ function updateRetryInfo(data: { status: string; retry?: { retryCount: number; m
   }
 }
 
-function startCountdown(retry: { retryCount: number; maxRetries: number; nextRetryAt: number; retryIntervalMs: number }) {
+function startCountdown(retry: { retryCount: number; maxRetries: number; nextRetryAt: number | null; retryIntervalMs: number }) {
+  if (retry.nextRetryAt == null) return; // 调用处已保证非空，防御性兜底
   const tick = () => {
     const now = Date.now();
-    const remaining = Math.max(0, Math.ceil((retry.nextRetryAt - now) / 1000));
+    const remaining = Math.max(0, Math.ceil((retry.nextRetryAt! - now) / 1000));
     retryInfo.textContent = `${remaining}秒后重连 (本轮第${retry.retryCount}次失败)`;
     if (remaining <= 0) {
       clearInterval(countdownTimer!);

@@ -397,7 +397,7 @@ interface FullPageInfo {
 }
 
 // 需要在每个 frame 中查找元素的命令（首个命中即返回；坐标 click / scroll 只在顶层）
-const ELEMENT_SEARCH_COMMANDS = new Set(["click", "type", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect"]);
+const ELEMENT_SEARCH_COMMANDS = new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect"]);
 
 interface SearchFrame {
   frameId: number;
@@ -687,7 +687,7 @@ function waitForTabLoad(tabId: number, timeoutMs = 30000): Promise<void> {
         chrome.tabs.onUpdated.removeListener(listener);
         reject(new Error(`Tab ${tabId} load timeout after ${timeoutMs}ms`));
       }, timeoutMs);
-      const listener = (tid: number, info: chrome.tabs.TabChangeInfo) => {
+      const listener = (tid: number, info: chrome.tabs.OnUpdatedInfo) => {
         if (tid === tabId && info.status === "complete") {
           chrome.tabs.get(tabId, (t) => {
             if (t.url) {
@@ -765,15 +765,17 @@ async function cleanupGroupIfEmpty(): Promise<void> {
   try {
     const tabs = await chrome.tabs.query({ groupId });
     if (tabs.length === 0) {
-      await chrome.tabGroups.remove(groupId);
+      // 空标签组会被 Chrome 自动销毁并触发 onRemoved，这里只需清掉本地缓存
+      groupId = null;
+      groupWindowId = null;
     }
   } catch {
     // group already removed
   }
 }
 
-chrome.tabGroups.onRemoved.addListener(async (gid: number) => {
-  if (gid === groupId) {
+chrome.tabGroups.onRemoved.addListener((group: chrome.tabGroups.TabGroup) => {
+  if (group.id === groupId) {
     groupId = null;
     groupWindowId = null;
   }

@@ -26,7 +26,7 @@ function restoreShownElement(el: HTMLElement): void {
   if (!orig) return;
   const restoreProp = (prop: "visibility" | "opacity" | "display", origVal?: string) => {
     if (origVal) {
-      (el.style as Record<string, string>)[prop] = origVal;
+      el.style.setProperty(prop, origVal);
     } else {
       el.style.removeProperty(prop);
     }
@@ -300,6 +300,45 @@ async function handleCommand(
         return { success: false, error: `Element not typeable: ${selector} (tag=${el.tagName}, contentEditable=${el.contentEditable})` };
       }
 
+      case "keyboard": {
+        // 向元素发送按键（合成 KeyboardEvent，keydown/keypress/keyup 完整链）。
+        // selector 可省略：缺省用当前聚焦元素（document.activeElement）。
+        // 参考 chrome_agent 的 keypress 实现：合成事件能触发页面 JS 的 keydown/keyup 处理器，
+        // 但不会触发浏览器原生默认行为（如 input 内 Enter 换行/表单提交、Tab 切换焦点）。
+        const key = params.key as string | undefined;
+        if (!key) return { success: false, error: 'Need "key" parameter (e.g. Enter, Escape, Tab, ArrowDown, "a")' };
+        const selector = params.selector as string | undefined;
+        let el: Element | null = null;
+        if (selector) {
+          el = findElement(selector);
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+        } else {
+          el = (document.activeElement instanceof HTMLElement ? document.activeElement : document.body);
+        }
+        const target = el as HTMLElement;
+        try { target.focus({ preventScroll: true }); } catch { /* 非聚焦元素 focus 是 no-op */ }
+        const mods = {
+          ctrlKey: !!params.ctrl,
+          shiftKey: !!params.shift,
+          altKey: !!params.alt,
+          metaKey: !!params.meta,
+        };
+        const init = keyboardEventInit(key, mods);
+        target.dispatchEvent(new KeyboardEvent("keydown", init));
+        // keypress 只对非修饰键派发（真实浏览器里 Control/Shift/Alt/Meta 不产生 keypress）
+        if (!MODIFIER_KEYS.has(key)) target.dispatchEvent(new KeyboardEvent("keypress", init));
+        target.dispatchEvent(new KeyboardEvent("keyup", init));
+        return {
+          success: true,
+          data: {
+            key,
+            ...(selector ? { selector } : {}),
+            tag: target.tagName.toLowerCase(),
+            modifiers: mods,
+          },
+        };
+      }
+
       case "upload_file": {
         const selector = params.selector as string;
         const base64 = params.base64 as string;
@@ -409,9 +448,10 @@ async function handleCommand(
         const start = Date.now();
         return new Promise<{ success: boolean; data: { readyState: string; elapsed: number } }>((resolve) => {
           let settled = false;
+          let timer: ReturnType<typeof setTimeout> | undefined;
           const cleanup = () => {
             document.removeEventListener("readystatechange", onChange);
-            clearTimeout(timer);
+            if (timer != null) clearTimeout(timer);
           };
           const onChange = () => {
             if (document.readyState === "complete") {
@@ -430,7 +470,7 @@ async function handleCommand(
               resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
             });
           } else {
-            const timer = setTimeout(() => {
+            timer = setTimeout(() => {
               if (settled) return;
               cleanup();
               resolve({ success: true, data: { readyState: document.readyState, elapsed: Date.now() - start } });
@@ -509,6 +549,34 @@ function xpathStr(s: string): string {
   if (!s.includes("'")) return `'${s}'`;
   if (!s.includes('"')) return `"${s}"`;
   return "concat('" + s.replace(/'/g, "',\"'\",'") + "')";
+}
+
+// 常用按键的 keyCode（XPath / KeyboardEvent 兼容层用；单字符键取 ASCII 码）
+const KEY_CODE_MAP: Record<string, number> = {
+  Enter: 13, Escape: 27, Tab: 9, Backspace: 8, Delete: 46, Insert: 45,
+  Home: 36, End: 35, PageUp: 33, PageDown: 34,
+  ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+  " ": 32, Space: 32,
+  F1: 112, F2: 113, F3: 114, F4: 115, F5: 116, F6: 117,
+  F7: 118, F8: 119, F9: 120, F10: 121, F11: 122, F12: 123,
+};
+
+// 纯修饰键：浏览器不会为它们产生 keypress 事件，跳过 keypress 派发
+const MODIFIER_KEYS = new Set(["Control", "Shift", "Alt", "Meta", "CapsLock", "NumLock", "ScrollLock"]);
+
+// 由 key 值推导 KeyboardEventInit：补全 keyCode/which（兼容旧式处理器）与 code（物理按键）
+function keyboardEventInit(
+  key: string,
+  mods: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean; metaKey: boolean },
+): KeyboardEventInit {
+  const single = key.length === 1;
+  const keyCode = KEY_CODE_MAP[key] ?? (single ? key.toUpperCase().charCodeAt(0) : 0);
+  const code = key === " " || key === "Space"
+    ? "Space"
+    : single
+      ? (/[0-9]/.test(key) ? `Digit${key}` : `Key${key.toUpperCase()}`)
+      : key;
+  return { key, code, keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true, ...mods };
 }
 
 function findElement(selector: string): Element | null {

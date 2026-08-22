@@ -492,7 +492,7 @@
       return [];
     }
   }
-  var ELEMENT_SEARCH_COMMANDS = /* @__PURE__ */ new Set(["click", "type", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect"]);
+  var ELEMENT_SEARCH_COMMANDS = /* @__PURE__ */ new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect"]);
   var frameTreeCache = /* @__PURE__ */ new Map();
   chrome.tabs.onUpdated.addListener((tabId, info) => {
     if (info.status === "complete") frameTreeCache.delete(tabId);
@@ -778,13 +778,14 @@
     try {
       const tabs = await chrome.tabs.query({ groupId });
       if (tabs.length === 0) {
-        await chrome.tabGroups.remove(groupId);
+        groupId = null;
+        groupWindowId = null;
       }
     } catch {
     }
   }
-  chrome.tabGroups.onRemoved.addListener(async (gid) => {
-    if (gid === groupId) {
+  chrome.tabGroups.onRemoved.addListener((group) => {
+    if (group.id === groupId) {
       groupId = null;
       groupWindowId = null;
     }

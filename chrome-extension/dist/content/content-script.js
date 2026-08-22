@@ -18,7 +18,7 @@
     if (!orig) return;
     const restoreProp = (prop, origVal) => {
       if (origVal) {
-        el.style[prop] = origVal;
+        el.style.setProperty(prop, origVal);
       } else {
         el.style.removeProperty(prop);
       }
@@ -246,6 +246,42 @@
           }
           return { success: false, error: `Element not typeable: ${selector} (tag=${el.tagName}, contentEditable=${el.contentEditable})` };
         }
+        case "keyboard": {
+          const key = params.key;
+          if (!key) return { success: false, error: 'Need "key" parameter (e.g. Enter, Escape, Tab, ArrowDown, "a")' };
+          const selector = params.selector;
+          let el = null;
+          if (selector) {
+            el = findElement(selector);
+            if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+          } else {
+            el = document.activeElement instanceof HTMLElement ? document.activeElement : document.body;
+          }
+          const target = el;
+          try {
+            target.focus({ preventScroll: true });
+          } catch {
+          }
+          const mods = {
+            ctrlKey: !!params.ctrl,
+            shiftKey: !!params.shift,
+            altKey: !!params.alt,
+            metaKey: !!params.meta
+          };
+          const init = keyboardEventInit(key, mods);
+          target.dispatchEvent(new KeyboardEvent("keydown", init));
+          if (!MODIFIER_KEYS.has(key)) target.dispatchEvent(new KeyboardEvent("keypress", init));
+          target.dispatchEvent(new KeyboardEvent("keyup", init));
+          return {
+            success: true,
+            data: {
+              key,
+              ...selector ? { selector } : {},
+              tag: target.tagName.toLowerCase(),
+              modifiers: mods
+            }
+          };
+        }
         case "upload_file": {
           const selector = params.selector;
           const base64 = params.base64;
@@ -343,9 +379,10 @@
           const start = Date.now();
           return new Promise((resolve) => {
             let settled = false;
+            let timer;
             const cleanup = () => {
               document.removeEventListener("readystatechange", onChange);
-              clearTimeout(timer);
+              if (timer != null) clearTimeout(timer);
             };
             const onChange = () => {
               if (document.readyState === "complete") {
@@ -364,7 +401,7 @@
                 resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
               });
             } else {
-              const timer2 = setTimeout(() => {
+              timer = setTimeout(() => {
                 if (settled) return;
                 cleanup();
                 resolve({ success: true, data: { readyState: document.readyState, elapsed: Date.now() - start } });
@@ -436,6 +473,43 @@
     if (!s.includes("'")) return `'${s}'`;
     if (!s.includes('"')) return `"${s}"`;
     return "concat('" + s.replace(/'/g, `',"'",'`) + "')";
+  }
+  var KEY_CODE_MAP = {
+    Enter: 13,
+    Escape: 27,
+    Tab: 9,
+    Backspace: 8,
+    Delete: 46,
+    Insert: 45,
+    Home: 36,
+    End: 35,
+    PageUp: 33,
+    PageDown: 34,
+    ArrowUp: 38,
+    ArrowDown: 40,
+    ArrowLeft: 37,
+    ArrowRight: 39,
+    " ": 32,
+    Space: 32,
+    F1: 112,
+    F2: 113,
+    F3: 114,
+    F4: 115,
+    F5: 116,
+    F6: 117,
+    F7: 118,
+    F8: 119,
+    F9: 120,
+    F10: 121,
+    F11: 122,
+    F12: 123
+  };
+  var MODIFIER_KEYS = /* @__PURE__ */ new Set(["Control", "Shift", "Alt", "Meta", "CapsLock", "NumLock", "ScrollLock"]);
+  function keyboardEventInit(key, mods) {
+    const single = key.length === 1;
+    const keyCode = KEY_CODE_MAP[key] ?? (single ? key.toUpperCase().charCodeAt(0) : 0);
+    const code = key === " " || key === "Space" ? "Space" : single ? /[0-9]/.test(key) ? `Digit${key}` : `Key${key.toUpperCase()}` : key;
+    return { key, code, keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true, ...mods };
   }
   function findElement(selector) {
     if (selector.startsWith("css:")) {

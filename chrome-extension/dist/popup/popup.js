@@ -50,6 +50,7 @@
     }
   }
   function startCountdown(retry) {
+    if (retry.nextRetryAt == null) return;
     const tick = () => {
       const now = Date.now();
       const remaining = Math.max(0, Math.ceil((retry.nextRetryAt - now) / 1e3));

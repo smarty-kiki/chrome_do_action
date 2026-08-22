@@ -112,7 +112,7 @@ cda --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#ref
 
 ## iframe 定位
 
-元素命令（`click`/`real_click`/`type`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+元素命令（`click`/`real_click`/`type`/`keyboard`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
 
 如需指定 frame，加 `frame` 参数：
 
@@ -123,7 +123,7 @@ cda --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#ref
 {"selector": "#submit", "frame": {"url": "mp.weixin.qq.com"}}  // URL 含子串的首个 frame（跨域最稳）
 ```
 
-- `frame` 支持 `click`/`real_click`/`type`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`（`get_rect` 定位）
+- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`（`get_rect` 定位）
 - **跨域 iframe 同样可读可操作**：`get_rect` 会沿 `window.parent` 链换算坐标，跨域边界自动切换 CDP `DOM.getContentQuads` 兜底
 - `real_click` 在 iframe 内同样可用：同源直接复用换算坐标，跨域走 CDP 精确定位后发送真实鼠标事件链
 - `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；要读 iframe 文本用 `{"selector":"...","frame":{...}}`
@@ -312,6 +312,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | `click` | `send <id> click <tab> <params>` | 点击元素（合成事件） |
 | `real_click` | `send <id> real_click <tab> <params>` | 真实点击（CDP，isTrusted=true），参数 {selector} 或 {x,y}，可选 {approach} 渐进移动路径；用于合成事件无效的站点（如微信后台）及 hover 工具条 |
 | `type` | `send <id> type <tab> <params>` | 输入文本（{selector,text}），支持 input/textarea 与 contenteditable 富文本，富文本按换行分段 |
+| `keyboard` | `send <id> keyboard <tab> <params>` | 向元素发送按键（{selector,key}，selector 可省略用当前聚焦元素），触发页面 keydown/keypress/keyup 处理器；可加 {ctrl,shift,alt,meta} 组合键 |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入本地图片（{selector,base64,filename,mime}），触发 change 事件完成上传 |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | 向 contenteditable 富文本编辑器粘贴带样式的 HTML（{selector,html}），等价于粘贴排好版的文档 |
 | `show` | `send <id> show <tab> <params>` | 强制显示隐藏元素（{selector}），仅改 CSS 样式不执行代码；让 hover 才显示的菜单/工具条常驻可见，随后可被 click 命中 |
@@ -361,6 +362,22 @@ cda send OfficePC get_text current '{"selector":"table"}'
 
 - input/textarea：设置 `value` 并触发 `input` + `change` 事件
 - contenteditable（如 ProseMirror 富文本）：聚焦后按 `\n` 分段插入，保留段落结构；一次调用传入完整内容，不要多次追加（会覆盖）
+
+### keyboard 参数
+
+```json
+{"selector": "#title", "key": "Enter"}                       // 在标题输入框按回车
+{"selector": ".ProseMirror", "key": "ArrowDown"}             // 富文本里按方向键
+{"key": "Escape"}                                            // 省略 selector：向当前聚焦元素按键
+{"selector": "#input", "key": "Enter", "ctrl": true}         // Ctrl+Enter 组合键
+```
+
+- 先聚焦目标元素（`selector` 可省略，缺省用 `document.activeElement`），再派发 `keydown` → `keypress`（非修饰键）→ `keyup` 完整事件链
+- 支持修饰键：`ctrl`/`shift`/`alt`/`meta`（布尔）
+- `key` 取值同 `KeyboardEvent.key`：`Enter`、`Escape`、`Tab`、`Backspace`、`Delete`、`ArrowUp/Down/Left/Right`、`Home`/`End`、`F1`-`F12`，或单个字符（如 `"a"`、`"!"`）
+- 自动补全 `keyCode`/`which` 与 `code`，兼容只监听旧式键码的页面处理器
+- **合成事件**（`isTrusted=false`）：能触发页面 JS 的 keydown/keyup 处理器（Enter 提交、Escape 关闭、方向键导航等通常由 JS 实现），但**不会触发浏览器原生默认行为**（如 input 内 Enter 换行/表单默认提交、Tab 切换焦点）；对依赖原生默认行为的场景，先 `click` 聚焦后结合页面自身 JS 处理器使用
+- 自动搜索 iframe，返回 `{ key, selector, tag, modifiers }`
 
 ### upload_file 参数
 
