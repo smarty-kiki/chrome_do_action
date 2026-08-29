@@ -241,7 +241,11 @@ cda send OfficePC click current '{"selector":".ProseMirror"}'
 cda send OfficePC type current '{"selector":".ProseMirror","text":"第一段内容。\n\n第二段内容。"}'
 ```
 
-注意：一次传入完整内容，不要分多次 type 追加（会覆盖）。
+`mode` 可选（默认 `replace` 清空原内容后写入）：`append` 追加到末尾、`insert` 在光标处插入（有选中则替换选区），可用于分多次追加：
+
+```bash
+cda send OfficePC type current '{"selector":".ProseMirror","mode":"append","text":"追加的段落。"}'
+```
 
 ### 图片上传（file input）
 

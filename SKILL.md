@@ -79,7 +79,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 |------|------|------|
 | `click` | `send <id> click <tab> '{"selector":"#id"}'` 或 `'{"text":"登录"}'` 或 `'{"x":100,"y":200}'` | 点击元素（selector/CSS/XPath/text/坐标）；**自动搜索 iframe**（顶层优先，含跨域），可加 `frame` 指定 |
 | `real_click` | `send <id> real_click <tab> '{"selector":"#submit"}'` | CDP 真实点击（isTrusted=true），对合成事件免疫的站点（如微信后台）有效；同源 iframe 自动换算坐标，跨域走 CDP 定位 |
-| `type` | `send <id> type <tab> '{"selector":"#title","text":"标题"}'` | 输入文本：input/textarea 直接赋值；contenteditable 富文本按 `\n` 分段 |
+| `type` | `send <id> type <tab> '{"selector":"#title","text":"标题"}'` | 输入文本：input/textarea 直接赋值；contenteditable 富文本按 `\n` 分段。`mode` 可选：`replace`（默认，清空原内容）/`append`（追加到末尾）/`insert`（光标处插入，有选中则替换选区） |
 | `keyboard` | `send <id> keyboard <tab> '{"selector":"#title","key":"Enter"}'` | 向元素发送按键（keydown/keypress/keyup，合成事件）；selector 省略用当前聚焦元素；支持 `ctrl`/`shift`/`alt`/`meta` 组合键 |
 | `paste_rich` | `send <id> paste_rich <tab> '{"selector":".ProseMirror","html":"<section>..."}'` | 向富文本编辑器注入带样式 HTML（先清空再插入），等价粘贴排好版的文档 |
 | `upload_file` | `send <id> upload_file <tab> '{"selector":"input[type=file]","base64":"...","filename":"a.jpg","mime":"image/jpeg"}'` | base64 图片注入 file input，触发 change 上传 |

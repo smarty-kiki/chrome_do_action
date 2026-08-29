@@ -217,12 +217,31 @@
         case "type": {
           const selector = params.selector;
           const text = params.text;
+          const mode = params.mode || "replace";
           if (!selector) return { success: false, error: 'Need "selector" parameter' };
           if (text == null) return { success: false, error: 'Need "text" parameter' };
+          if (mode !== "replace" && mode !== "append" && mode !== "insert") {
+            return { success: false, error: `Invalid mode: ${mode} (expected replace|append|insert)` };
+          }
           const el = findElement(selector);
           if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-            el.value = text;
+            if (mode === "replace") {
+              el.value = text;
+            } else {
+              el.focus();
+              if (mode === "append") {
+                const end = el.value.length;
+                el.value = el.value.slice(0, end) + text;
+                el.setSelectionRange(end + text.length, end + text.length);
+              } else {
+                const start = el.selectionStart ?? 0;
+                const end = el.selectionEnd ?? start;
+                el.value = el.value.slice(0, start) + text + el.value.slice(end);
+                const pos = start + text.length;
+                el.setSelectionRange(pos, pos);
+              }
+            }
             el.dispatchEvent(new Event("input", { bubbles: true }));
             el.dispatchEvent(new Event("change", { bubbles: true }));
           } else if (!el.isContentEditable) {
@@ -233,10 +252,25 @@
             const sel = window.getSelection();
             if (sel) {
               const range = document.createRange();
-              range.selectNodeContents(el);
-              sel.removeAllRanges();
-              sel.addRange(range);
-              document.execCommand("delete", false);
+              if (mode === "replace") {
+                range.selectNodeContents(el);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                document.execCommand("delete", false);
+              } else if (mode === "append") {
+                range.selectNodeContents(el);
+                range.collapse(false);
+                sel.removeAllRanges();
+                sel.addRange(range);
+              } else {
+                const anchor = sel.anchorNode;
+                if (!(anchor instanceof Node) || !el.contains(anchor)) {
+                  range.selectNodeContents(el);
+                  range.collapse(false);
+                  sel.removeAllRanges();
+                  sel.addRange(range);
+                }
+              }
             }
             const paragraphs = text.split(/\n+/).filter((s) => s.length > 0);
             paragraphs.forEach((para, i) => {
@@ -247,7 +281,7 @@
           }
           const stable = await waitForSettled(3e3);
           const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
-          const typeData = { selector, tag: el.tagName.toLowerCase(), settledMs: stable.waited };
+          const typeData = { selector, mode, tag: el.tagName.toLowerCase(), settledMs: stable.waited };
           if (waitForResult) typeData.waitFor = waitForResult;
           return { success: true, data: typeData };
         }

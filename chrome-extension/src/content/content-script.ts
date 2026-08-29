@@ -279,13 +279,34 @@ async function handleCommand(
       case "type": {
         const selector = params.selector as string;
         const text = params.text as string;
+        const mode = (params.mode as string) || "replace";
         if (!selector) return { success: false, error: 'Need "selector" parameter' };
         if (text == null) return { success: false, error: 'Need "text" parameter' };
+        if (mode !== "replace" && mode !== "append" && mode !== "insert") {
+          return { success: false, error: `Invalid mode: ${mode} (expected replace|append|insert)` };
+        }
         const el = findElement(selector) as HTMLElement | null;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
-        // input/textarea: 直接设置 value
+        // input/textarea: 直接设置 value（mode 控制写入位置）
         if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-          el.value = text;
+          if (mode === "replace") {
+            el.value = text;
+          } else {
+            el.focus();
+            if (mode === "append") {
+              // 追加到末尾
+              const end = el.value.length;
+              el.value = el.value.slice(0, end) + text;
+              el.setSelectionRange(end + text.length, end + text.length);
+            } else {
+              // insert: 光标处插入，有选中则替换选区
+              const start = el.selectionStart ?? 0;
+              const end = el.selectionEnd ?? start;
+              el.value = el.value.slice(0, start) + text + el.value.slice(end);
+              const pos = start + text.length;
+              el.setSelectionRange(pos, pos);
+            }
+          }
           el.dispatchEvent(new Event("input", { bubbles: true }));
           el.dispatchEvent(new Event("change", { bubbles: true }));
         } else if (!el.isContentEditable) {
@@ -297,12 +318,30 @@ async function handleCommand(
           const sel = window.getSelection();
           if (sel) {
             const range = document.createRange();
-            range.selectNodeContents(el);
-            sel.removeAllRanges();
-            sel.addRange(range);
-            document.execCommand("delete", false);
+            if (mode === "replace") {
+              // 清空原内容，从头写入
+              range.selectNodeContents(el);
+              sel.removeAllRanges();
+              sel.addRange(range);
+              document.execCommand("delete", false);
+            } else if (mode === "append") {
+              // 光标移到末尾
+              range.selectNodeContents(el);
+              range.collapse(false);
+              sel.removeAllRanges();
+              sel.addRange(range);
+            } else {
+              // insert: 保留现有选区；光标不在元素内则回退到末尾
+              const anchor = sel.anchorNode;
+              if (!(anchor instanceof Node) || !el.contains(anchor)) {
+                range.selectNodeContents(el);
+                range.collapse(false);
+                sel.removeAllRanges();
+                sel.addRange(range);
+              }
+            }
           }
-          // 按换行分段输入，保留段落结构
+          // 按换行分段输入，保留段落结构（insertText 天然替换当前选区）
           const paragraphs = text.split(/\n+/).filter((s) => s.length > 0);
           paragraphs.forEach((para, i) => {
             document.execCommand("insertText", false, para);
@@ -315,7 +354,7 @@ async function handleCommand(
         const waitForResult = params.waitFor
           ? await waitForCondition(params.waitFor as { selector?: string; text?: string }, 3000)
           : null;
-        const typeData: Record<string, unknown> = { selector, tag: el.tagName.toLowerCase(), settledMs: stable.waited };
+        const typeData: Record<string, unknown> = { selector, mode, tag: el.tagName.toLowerCase(), settledMs: stable.waited };
         if (waitForResult) typeData.waitFor = waitForResult;
         return { success: true, data: typeData };
       }

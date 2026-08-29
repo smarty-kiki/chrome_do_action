@@ -40,9 +40,10 @@ Page commands (tab required):
                               Works in iframes: same-origin via coordinate
                               translation, cross-origin via CDP
                               Same settle + waitFor semantics as click
-  type <tab> <params>         Type text ({selector,text[,waitFor]}); supports
-                              input/textarea and contenteditable (rich text,
-                              splits by newline)
+  type <tab> <params>         Type text ({selector,text[,mode][,waitFor]}); mode:
+                              replace(default)/append(end)/insert(caret);
+                              supports input/textarea and contenteditable (rich
+                              text, splits by newline)
   keyboard <tab> <params>     Send key press to element ({selector,key[,ctrl|shift|alt|meta][,waitFor]});
                               selector optional (defaults to focused element); key e.g.
                               Enter, Escape, Tab, ArrowDown, or a single char
