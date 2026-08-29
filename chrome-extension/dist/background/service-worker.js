@@ -977,10 +977,6 @@
         sendResult({ success: false, error: "Missing tabId parameter" });
         return;
       }
-      if (params.x == null && params.y == null && !selector && !params.text) {
-        sendResult({ success: false, error: 'real_click needs "selector", "text", or {x, y}' });
-        return;
-      }
       if (cmd.payload.command === "screenshot") {
         await chrome.debugger.attach({ tabId }, "1.3");
         try {
@@ -992,6 +988,10 @@
           await chrome.debugger.detach({ tabId }).catch(() => {
           });
         }
+        return;
+      }
+      if (params.x == null && params.y == null && !selector && !params.text) {
+        sendResult({ success: false, error: 'real_click needs "selector", "text", or {x, y}' });
         return;
       }
       let x = params.x;

@@ -1016,13 +1016,10 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       sendResult({ success: false, error: "Missing tabId parameter" });
       return;
     }
-    // 定位参数校验：无任何定位方式时提前报具体错误（否则兜底文案是 "Could not locate element: unknown"）
-    if (params.x == null && params.y == null && !selector && !params.text) {
-      sendResult({ success: false, error: 'real_click needs "selector", "text", or {x, y}' });
-      return;
-    }
 
-    // screenshot: 通过 CDP Page.captureScreenshot 截取当前页面（只读，不注入代码）
+    // screenshot: 通过 CDP Page.captureScreenshot 截取当前页面（只读，不注入代码）。
+    // 必须放在 real_click 定位参数校验之前：screenshot 只传 tabId，不传 x/y/selector/text，
+    // 否则永远被下面的定位校验拦截报错。
     if (cmd.payload.command === "screenshot") {
       await chrome.debugger.attach({ tabId }, "1.3");
       try {
@@ -1033,6 +1030,12 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       } finally {
         await chrome.debugger.detach({ tabId }).catch(() => {});
       }
+      return;
+    }
+
+    // 定位参数校验：无任何定位方式时提前报具体错误（否则兜底文案是 "Could not locate element: unknown"）
+    if (params.x == null && params.y == null && !selector && !params.text) {
+      sendResult({ success: false, error: 'real_click needs "selector", "text", or {x, y}' });
       return;
     }
 
