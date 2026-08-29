@@ -998,7 +998,7 @@ async function autoConnect(): Promise<void> {
  */
 async function handleRealClick(cmd: CommandMessage): Promise<void> {
   const params = cmd.payload.params || {};
-  const tabId = params.tabId as number | undefined;
+  let tabId = params.tabId as number | undefined;
   const selector = params.selector as string;
   // approach: 渐进移动路径 [[x,y],...]，模拟真实鼠标轨迹逐级触发 hover
   const approach = params.approach as [number, number][] | undefined;
@@ -1012,9 +1012,15 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
   }
 
   try {
+    // tabId 为空时回退到当前激活 tab（server 对 "current" 不传 tabId），与页面级命令一致
     if (tabId == null) {
-      sendResult({ success: false, error: "Missing tabId parameter" });
-      return;
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tid = tabs[0]?.id;
+      if (tid == null) {
+        sendResult({ success: false, error: "No active tab" });
+        return;
+      }
+      tabId = tid;
     }
 
     // screenshot: 通过 CDP Page.captureScreenshot 截取当前页面（只读，不注入代码）。
