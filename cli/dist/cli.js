@@ -43,7 +43,7 @@ Page commands (tab required):
                               Works in iframes, including cross-origin.
                               Same settle + waitFor semantics as click
   type <tab> <params>         Type text ({selector,text[,mode][,waitFor]}); mode:
-                              replace(default)/append(end)/insert(caret);
+                              replace(default)/append/insert;
                               supports input/textarea and contenteditable (rich
                               text, splits by newline)
   keyboard <tab> <params>     Send key press to element ({selector,key[,ctrl|shift|alt|meta][,waitFor]});
