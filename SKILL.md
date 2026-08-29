@@ -35,7 +35,7 @@ node dist/cli.js --help   # 验证
 #    选择 chrome-extension/dist 目录
 
 # 4. 启动服务（后台常驻）
-cd ../cli
+cd ../server
 nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 ```
 
@@ -50,7 +50,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
    输出如 `d1ugtrds  kiki-macbook  ::ffff:192.168.65.1  online 891s`，第一列为节点 ID `<id>`。
    - 若返回空/连接失败：服务未运行，自动拉起
      ```bash
-     nohup node <项目>/cli/dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
+     nohup node <项目>/server/dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
      ```
      等 2 秒重试 `list`。仍无节点：Chrome 扩展未连接，提示在扩展弹窗填 `ws://127.0.0.1:12345` 并连接。
 

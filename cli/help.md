@@ -8,7 +8,7 @@
 
 ```bash
 # 1. 启动服务端
-node dist/server.js --port 12345 --log-dir /tmp/chrome/
+node server/dist/server.js --port 12345 --log-dir /tmp/chrome/
 
 # 2. Chrome 加载扩展（chrome-extension/dist/），在弹出窗填写服务端地址
 ```
