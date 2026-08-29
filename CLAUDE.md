@@ -34,3 +34,10 @@
 - 同一批工作又改了两次：0.1.1 → 0.1.2 → 0.1.3
 - commit 前：0.1.3 → 0.2.0
 - 用户说「升级大版本」：0.2.0 → 1.0.0
+
+## 构建流程（改完插件源码必须执行）
+
+1. 修改 `chrome-extension/src/` 下的源码（或 bump 版本号）后，**必须**在 `chrome-extension/` 下执行 `npm run build`
+   - 浏览器加载的是 `chrome-extension/dist/` 构建产物，不重新构建的话，即使 reload 扩展，跑的还是旧代码、旧版本号
+2. `dist/` 是 **git 跟踪**的构建产物（历史 commit 均包含），重新构建后改动要一并 commit
+3. 构建后测试：在 `chrome://extensions` 页面点击 Chrome Do Action 卡片上的 ⟳ 重新加载扩展（unpacked 扩展不会热更新）
