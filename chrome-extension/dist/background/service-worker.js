@@ -962,7 +962,7 @@
   }
   async function handleRealClick(cmd) {
     const params = cmd.payload.params || {};
-    const tabId = params.tabId;
+    let tabId = params.tabId;
     const selector = params.selector;
     const approach = params.approach;
     const fieldFilter = params._field || [];
@@ -974,8 +974,13 @@
     }
     try {
       if (tabId == null) {
-        sendResult({ success: false, error: "Missing tabId parameter" });
-        return;
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const tid = tabs[0]?.id;
+        if (tid == null) {
+          sendResult({ success: false, error: "No active tab" });
+          return;
+        }
+        tabId = tid;
       }
       if (cmd.payload.command === "screenshot") {
         await chrome.debugger.attach({ tabId }, "1.3");
