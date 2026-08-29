@@ -150,6 +150,7 @@
         }
         case "get_rect": {
           const selector = params.selector;
+          if (!selector && !params.text) return { success: false, error: 'Need "selector" or "text" parameter' };
           const el = params.text ? findByText(params.text) : findElement(selector);
           if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text || selector}` };
           const rect = el.getBoundingClientRect();
@@ -216,6 +217,8 @@
         case "type": {
           const selector = params.selector;
           const text = params.text;
+          if (!selector) return { success: false, error: 'Need "selector" parameter' };
+          if (text == null) return { success: false, error: 'Need "text" parameter' };
           const el = findElement(selector);
           if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
@@ -291,6 +294,8 @@
           const base64 = params.base64;
           const filename = params.filename || "upload.png";
           const mime = params.mime || "image/png";
+          if (!selector) return { success: false, error: 'Need "selector" parameter' };
+          if (!base64) return { success: false, error: 'Need "base64" parameter' };
           const el = findElement(selector);
           if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           if (!(el instanceof HTMLInputElement) || el.type !== "file") {
@@ -321,6 +326,8 @@
         case "paste_rich": {
           const selector = params.selector;
           const html = params.html;
+          if (!selector) return { success: false, error: 'Need "selector" parameter' };
+          if (html == null) return { success: false, error: 'Need "html" parameter' };
           const el = findElement(selector);
           if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           if (!el.isContentEditable) {
@@ -434,6 +441,11 @@
           });
         }
         case "scroll": {
+          const known = ["x", "y", "selector", "block", "frame"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown scroll parameter(s): ${unknown.join(", ")} (expected x, y, selector, block)` };
+          }
           const x = params.x ?? 0;
           const y = params.y ?? 0;
           const selector = params.selector;

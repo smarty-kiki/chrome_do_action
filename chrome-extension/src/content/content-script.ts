@@ -204,6 +204,7 @@ async function handleCommand(
         // 跨域边界无法读父 frame（getBoundingClientRect 抛 SecurityError）→ 标记 crossOrigin，
         // 返回 iframe 本地坐标，由 service worker 走 CDP getContentQuads 精确定位。
         const selector = params.selector as string;
+        if (!selector && !params.text) return { success: false, error: 'Need "selector" or "text" parameter' };
         const el = (params.text ? findByText(params.text) : findElement(selector)) as HTMLElement | null;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text || selector}` };
         const rect = el.getBoundingClientRect();
@@ -278,6 +279,8 @@ async function handleCommand(
       case "type": {
         const selector = params.selector as string;
         const text = params.text as string;
+        if (!selector) return { success: false, error: 'Need "selector" parameter' };
+        if (text == null) return { success: false, error: 'Need "text" parameter' };
         const el = findElement(selector) as HTMLElement | null;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         // input/textarea: 直接设置 value
@@ -366,6 +369,8 @@ async function handleCommand(
         const base64 = params.base64 as string;
         const filename = (params.filename as string) || "upload.png";
         const mime = (params.mime as string) || "image/png";
+        if (!selector) return { success: false, error: 'Need "selector" parameter' };
+        if (!base64) return { success: false, error: 'Need "base64" parameter' };
         const el = findElement(selector) as HTMLInputElement | null;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         if (!(el instanceof HTMLInputElement) || el.type !== "file") {
@@ -403,6 +408,8 @@ async function handleCommand(
         // 向富文本编辑器(contenteditable)粘贴带样式的 HTML 内容，等价于粘贴一份排好版的文档
         const selector = params.selector as string;
         const html = params.html as string;
+        if (!selector) return { success: false, error: 'Need "selector" parameter' };
+        if (html == null) return { success: false, error: 'Need "html" parameter' };
         const el = findElement(selector) as HTMLElement | null;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         if (!el.isContentEditable) {
@@ -534,6 +541,12 @@ async function handleCommand(
         // {x,y}              滚窗口/iframe；{selector} 滚动到元素：
         //   - 元素是可滚动容器（scrollHeight/clientHeight 溢出）→ 容器内滚动到 {x,y}
         //   - 普通元素 → scrollIntoView 进入可视区（shadow 内元素同样生效）
+        // 白名单校验：未知参数（如 direction）静默忽略会退化成滚回 (0,0) 并返回成功，误导调用方
+        const known = ["x", "y", "selector", "block", "frame"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown scroll parameter(s): ${unknown.join(", ")} (expected x, y, selector, block)` };
+        }
         const x = (params.x as number) ?? 0;
         const y = (params.y as number) ?? 0;
         const selector = params.selector as string | undefined;

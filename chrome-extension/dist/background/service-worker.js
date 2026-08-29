@@ -444,6 +444,11 @@
         return;
       }
       const { response: response2 } = await sendToFrame(tabId, f.frameId, msg, 1e4);
+      if (!response2) {
+        sendResult({ commandId: cmd.id, success: false, error: "Scroll timed out: no response from the target frame" });
+        onDone?.();
+        return;
+      }
       sendResult({ commandId: cmd.id, success: response2?.success ?? false, data: response2?.data, error: response2?.error });
       onDone?.();
       return;
@@ -970,6 +975,10 @@
     try {
       if (tabId == null) {
         sendResult({ success: false, error: "Missing tabId parameter" });
+        return;
+      }
+      if (params.x == null && params.y == null && !selector && !params.text) {
+        sendResult({ success: false, error: 'real_click needs "selector", "text", or {x, y}' });
         return;
       }
       if (cmd.payload.command === "screenshot") {

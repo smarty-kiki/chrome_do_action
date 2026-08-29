@@ -337,6 +337,12 @@ async function sendToTab(
     }
     // scroll 带 settle（前台 ~0.6s、后台 ~1.6s），超时放宽到 10s，避免 1200ms 误判 missing
     const { response } = await sendToFrame(tabId, f.frameId, msg, 10000);
+    // 超时/端口异常时给出具体原因，避免 success:false + error:undefined → CLI "unknown"
+    if (!response) {
+      sendResult({ commandId: cmd.id!, success: false, error: "Scroll timed out: no response from the target frame" });
+      onDone?.();
+      return;
+    }
     sendResult({ commandId: cmd.id!, success: response?.success ?? false, data: response?.data, error: response?.error });
     onDone?.();
     return;
@@ -1008,6 +1014,11 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
   try {
     if (tabId == null) {
       sendResult({ success: false, error: "Missing tabId parameter" });
+      return;
+    }
+    // 定位参数校验：无任何定位方式时提前报具体错误（否则兜底文案是 "Could not locate element: unknown"）
+    if (params.x == null && params.y == null && !selector && !params.text) {
+      sendResult({ success: false, error: 'real_click needs "selector", "text", or {x, y}' });
       return;
     }
 

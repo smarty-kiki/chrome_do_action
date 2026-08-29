@@ -283,7 +283,7 @@ wss.on("connection", (ws: WebSocket, req) => {
             if (!p) return;
             log(`[timeout] ${p.command} → ${p.target} (no response after ${PENDING_TIMEOUT}ms)`);
             if (p.cliWs && p.cliMsgId) {
-              sendWs(p.cliWs, { type: "cli_result", id: p.cliMsgId, payload: { success: false, error: "Command timed out" } });
+              sendWs(p.cliWs, { type: "cli_result", id: p.cliMsgId, payload: { success: false, error: `Command timed out after ${PENDING_TIMEOUT}ms: ${p.command} → ${p.target}` } });
             }
             pending.delete(cmdId);
           }, PENDING_TIMEOUT);

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chrome Do Action",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "description": "Remote control browser via WebSocket",
   "permissions": ["storage", "alarms", "tabs", "tabGroups", "scripting", "debugger", "webNavigation"],
   "action": {
