@@ -48,10 +48,10 @@
 | 能力 | 说明 |
 |---|---|
 | 🖱️ 页面操作 | 打开/刷新/关闭标签页、点击、输入、滚动、截图，覆盖浏览器绝大多数交互 |
-| 🔥 真实点击 `real_click` | 通过 CDP 发送 `isTrusted=true` 的完整鼠标事件链，突破对合成事件免疫的站点（如微信公众平台后台），支持多级 hover 路径 |
+| 🔥 真实点击 `real_click` | 发送完整真实鼠标事件链，突破对合成事件免疫的站点（如微信公众平台后台），支持多级 hover 路径 |
 | 📝 富文本编辑 | `type` 向 contenteditable 输入纯文本；`paste_rich` 直接粘贴带样式的 HTML，保留字号/颜色/加粗/排版 |
 | 🖼️ 图片上传 | `upload_file` 将 base64 图片注入文件输入框并触发上传，绕过系统文件对话框 |
-| 📸 CDP 截图 | 对页面「所见即所得」截图，本地自动保存 PNG，排查元素遮挡/浮层/滚动位置 |
+| 📸 页面截图 | 对页面「所见即所得」截图，本地自动保存 PNG，排查元素遮挡/浮层/滚动位置 |
 | 🐛 JS 错误收集 | 页面加载即持续监听 `error` 与 `unhandledrejection`，随时查询/清空 |
 | ⚡ 按需采集 `--field` | 所有返回对象的命令都支持点路径投影（`--field "clickDesc.selector,settledMs,currentTab.url"`），只采集/返回需要的字段，命令更快、结果更精简 |
 | ⏳ 等影响落地 | 操作命令返回前事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），`settledMs` 如实反映；影响晚到的场景用 `waitFor` 谓词（50ms 轮询、条件满足瞬间返回，后台 tab 亦可靠） |
@@ -192,7 +192,7 @@ cda send OfficePC upload_file current "{\"selector\":\"input[type=file]\",\"base
 ### 真实点击（对合成事件免疫的站点）
 
 ```bash
-# 微信后台：真实鼠标事件链（isTrusted=true）
+# 微信后台：真实点击
 cda send OfficePC real_click current '{"selector":"#submit"}'
 
 # 多级 hover：先渐进经过封面预览、换一张图标（触发 hover 链），最后点击菜单项
@@ -236,7 +236,7 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 | 命令 | 用法 | 说明 |
 |---|---|---|
 | `click` | `send <id> click <tab> <params>` | 点击元素（selector / 文字 / 坐标） |
-| `real_click` | `send <id> real_click <tab> <params>` | CDP 真实点击（`isTrusted=true`），支持 `approach` 渐进 hover 路径 |
+| `real_click` | `send <id> real_click <tab> <params>` | 真实点击，支持 `approach` 渐进 hover 路径 |
 | `type` | `send <id> type <tab> <params>` | 输入文本；支持 input/textarea 与 contenteditable 富文本 |
 | `keyboard` | `send <id> keyboard <tab> <params>` | 向元素发送按键（`{selector,key}`，selector 省略用当前聚焦元素），可加 `ctrl`/`shift`/`alt`/`meta` 组合键 |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入 base64 图片并触发上传 |
@@ -246,7 +246,7 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息（url / title / iframes） |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取累积的 JS 错误 |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空累积的 JS 错误 |
-| `screenshot` | `send <id> screenshot <tab> <params>` | CDP 截图，`{"path":"/tmp/s.png"}` 本地保存 |
+| `screenshot` | `send <id> screenshot <tab> <params>` | 截图，`{"path":"/tmp/s.png"}` 本地保存 |
 | `scroll` | `send <id> scroll <tab> <params>` | 滚动：窗口/iframe（`frame` 参数）或 `{"selector":...}` 滚到元素（可滚动容器内滚 / scrollIntoView，穿透 shadow）；smooth，等 DOM 稳定后返回 |
 
 ### click / real_click 定位方式
@@ -282,19 +282,13 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 
 ### 1. `real_click`：突破合成事件免疫的站点
 
-许多后台（如微信公众平台的 Vue 组件）会忽略 `dispatchEvent` 合成的 click。`real_click` 通过 `chrome.debugger`（CDP）发送**完整真实鼠标事件链**：
+许多后台（如微信公众平台的 Vue 组件）会忽略合成的 click。`real_click` 发送**完整真实鼠标事件链**：
 
-```
-渐进 mouseMoved（触发 mouseover/mouseenter/hover）
-→ mousePressed（mousedown + focus）
-→ mouseReleased（mouseup，浏览器自动合成 click）
-```
-
-- 鼠标移动采用**渐进步进**（每步 10px）而非瞬移，能真实触发途经元素的 hover 链
+- 鼠标渐进移动而非瞬移，能真实触发途经元素的 hover 链
 - 点击后鼠标**停留在目标上**，保留 hover 状态供连续操作
 - `approach` 参数模拟「先移到触发点、再移到目标」的多级 hover 场景（如封面 hover 工具条）
-- **iframe 支持**：自动搜索 iframe（含跨域），同源换算坐标、跨域走 CDP 定位，`frame` 参数可指定目标
-- 副作用：attach 瞬间 Chrome 顶部会出现「正在调试此浏览器」横幅，随即消失
+- **iframe 支持**：自动搜索 iframe（含跨域），`frame` 参数可指定目标
+- 副作用：执行时 Chrome 顶部短暂出现「正在调试此浏览器」横幅，随即消失
 
 ### 2. 富文本与文件上传：绕开最难的两个交互
 
@@ -313,14 +307,14 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-**所有返回对象的命令**都支持：`click`/`type`/`keyboard`/`upload_file`/`paste_rich`/`scroll`/`show`/`hide`/`get_rect`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`。字段路径逗号分隔、点号嵌套投影：`--field a.b` 返回 `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）；路径段遇数组逐项投影（`newTabs.url` → `{newTabs: [url, ...]}`）；不存在的路径忽略。`get_text` 返回纯文本，无字段可滤。
+**所有返回对象的命令**都支持：`click`/`type`/`keyboard`/`upload_file`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`。字段路径逗号分隔、点号嵌套投影：`--field a.b` 返回 `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）；路径段遇数组逐项投影（`newTabs.url` → `{newTabs: [url, ...]}`）；不存在的路径忽略。`get_text` 返回纯文本，无字段可滤。
 
 ### 4. 状态感知：操作之后自动「看结果」
 
-- **导航检测**：点击后监听 `beforeunload`（300ms 窗口）设置 `navigated` 标志，若发生跳转则**等待新页面加载完成**再返回完整信息
+- **导航检测**：点击后若发生跳转，**等待新页面加载完成**再返回完整信息（返回 `navigated` 标志）
 - **新标签页检测**：点击前后对比窗口内 tab 列表，主动发现 `target="_blank"` 打开的页并等待其加载
 - **iframe 变化检测**：点击前后采集所有 iframe 的 `src`，汇总 `iframeChanges`（`srcChanged` / `beforeSrc` / `afterSrc`）
-- **DOM 稳定等待**：滚动后用 MutationObserver 等 500ms 无变动再返回（最长 3s 超时）
+- **DOM 稳定等待**：滚动后等页面无变动再返回（最长 3s 超时）
 
 ### 5. 可靠性设计
 
@@ -354,8 +348,8 @@ cda send OfficePC get_text current '{"selector":"#nav","frame":"top"}'
 cda send OfficePC get_text current '{"selector":"#editor","frame":0}'
 ```
 
-- **跨域定位原理**：同源 iframe 用 `get_rect` 沿 `window.parent` 链把坐标换算到顶层视口；跨域边界访问父文档抛 SecurityError，自动切换 CDP `DOM.getContentQuads` 取元素在顶层视口的真实中心坐标
-- **`real_click` 在 iframe 内同样有效**：同源复用换算坐标，跨域走 CDP 精确定位后发送 `isTrusted=true` 的真实鼠标事件链
+- **跨域 iframe 同样可读可操作**：元素命令自动搜索所有 frame，跨域 iframe 也能定位命中
+- **`real_click` 在 iframe 内同样有效**（含跨域）
 - **`frame` 参数**：`"auto"`（缺省，顶层优先全 frame）、`"top"`（仅顶层）、数字（顶层 iframe 序号）、`{url:"子串"}`（URL 匹配首个 frame）
 - `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；`get_page_info --field iframes` 直接看所有 frame 的元数据与内容快照
 
@@ -378,10 +372,9 @@ cda send OfficePC click current '{"selector":"xpath://button[contains(.,'"'"'发
 cda send OfficePC click current '{"text":"发布"}'
 ```
 
-- **实现方式**：`#shadow-root` 与 `>>>` 是路径标记（浏览器原生不支持，cda 自行 tokenize 行走）；裸选择器 / `xpath:` / `text` 在 light DOM 未命中后，按文档序递归搜索所有 open shadow root
-- **`real_click` 同样支持 shadow 内元素**：CDP 定位表达式内嵌同一套穿透逻辑，取渲染层坐标后发送真实鼠标事件
-- **限制：closed shadow root 无法访问**（`.shadowRoot` 为 null），元素命令返回 notFound；此时用坐标点击兜底：`real_click {"x":..., "y":...}`（CDP 在渲染层派发真实鼠标事件，shadow 边界不存在）
-- **html 默认包含 shadow 内容**：`get_page_info --field html` 用 `Element.getHTML({shadowRoots:[...]})` 序列化，open shadow root 以内联 `<template shadowrootmode="open">` 出现在宿主元素里；无 shadow 的页面输出与之前完全一致
+- **`real_click` 同样支持 shadow 内元素**
+- **限制：closed shadow root 无法访问**，元素命令返回 notFound；此时用坐标点击兜底：`real_click {"x":..., "y":...}`
+- **html 默认包含 shadow 内容**：`get_page_info --field html` 中 open shadow root 以内联 `<template shadowrootmode="open">` 出现在宿主元素里；无 shadow 的页面输出与之前完全一致
 
 ---
 

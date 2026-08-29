@@ -78,7 +78,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | 命令 | 用法 | 说明 |
 |------|------|------|
 | `click` | `send <id> click <tab> '{"selector":"#id"}'` 或 `'{"text":"登录"}'` 或 `'{"x":100,"y":200}'` | 点击元素（selector/CSS/XPath/text/坐标）；**自动搜索 iframe**（顶层优先，含跨域），可加 `frame` 指定 |
-| `real_click` | `send <id> real_click <tab> '{"selector":"#submit"}'` | CDP 真实点击（isTrusted=true），对合成事件免疫的站点（如微信后台）有效；同源 iframe 自动换算坐标，跨域走 CDP 定位。可选 `approach`：渐进移动路径 `[[x,y],...]`，先移向触发点再点目标，模拟多级 hover（如微信封面工具条「从图片库选择」） |
+| `real_click` | `send <id> real_click <tab> '{"selector":"#submit"}'` | 真实点击，对合成事件免疫的站点（如微信后台）有效；iframe（含跨域）同样可点。可选 `approach`：渐进移动路径 `[[x,y],...]`，先移向触发点再点目标，模拟多级 hover（如微信封面工具条「从图片库选择」） |
 | `type` | `send <id> type <tab> '{"selector":"#title","text":"标题"}'` | 输入文本：input/textarea 直接赋值；contenteditable 富文本按 `\n` 分段。`mode` 可选：`replace`（默认，清空原内容）/`append`（追加到末尾）/`insert`（光标处插入，有选中则替换选区） |
 | `keyboard` | `send <id> keyboard <tab> '{"selector":"#title","key":"Enter"}'` | 向元素发送按键（keydown/keypress/keyup，合成事件）；selector 省略用当前聚焦元素；支持 `ctrl`/`shift`/`alt`/`meta` 组合键 |
 | `paste_rich` | `send <id> paste_rich <tab> '{"selector":".ProseMirror","html":"<section>..."}'` | 向富文本编辑器注入带样式 HTML（先清空再插入），等价粘贴排好版的文档 |
@@ -88,7 +88,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本（无 selector 取整页；带 selector 自动搜索 iframe） |
 | `get_css` | `send <id> get_css <tab> <selector>` | 获取元素 computed style |
 | `get_page_info` | `send <id> get_page_info <tab>` | 页面信息（url/title/iframes），支持 --field；iframes 对**跨域也补全 url/html** |
-| `screenshot` | `send <id> screenshot <tab> '{"path":"/tmp/shot.png"}'` | CDP 截图（只读），操作前确认页面真实状态 |
+| `screenshot` | `send <id> screenshot <tab> '{"path":"/tmp/shot.png"}'` | 截图（只读），操作前确认页面真实状态 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取页面 JS 报错（跨所有 frame 聚合，每条带 `source` 定位来源 frame） |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空已收集的 JS 报错，配合 get_js_errors 重新计数 |
 | `scroll` | `send <id> scroll <tab> '{"y":500}'` | 滚动页面：无 selector 滚窗口/iframe（`frame` 参数指定）；`{"selector":"..."}` 滚到元素（可滚动容器内滚、普通元素 scrollIntoView，穿透 shadow） |
@@ -96,7 +96,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 ### 关键技巧
 
 1. **等影响落地（settle）**：click/type/keyboard/upload_file/paste_rich/scroll/real_click 返回前会事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），返回 `settledMs`。影响落地晚（服务端请求后才渲染、长 debounce）时加 `waitFor` 谓词：`'{"selector":"#btn","waitFor":{"text":"发布成功"}}'`——50ms 轮询、条件满足瞬间返回 `{"settled":true,"waited":615}`。后台 tab 的 Chrome 定时器节流会让 settle 追加 ~1s 确认期，深度后台等不到就用 waitFor 或把 tab 切前台。
-2. **坐标必须截图确认**：DOM 快照可能有顶部隐藏模板，get_rect 会返回错误坐标（曾把 y=824 误报成 224）。先 `screenshot` 看真实页面再定位。
+2. **坐标必须截图确认**：先 `screenshot` 看真实页面，再取坐标定位。
 3. **hover 菜单用 show 解决**：触发不了 hover 时别硬怼事件模拟，`show` 强制显示元素后普通 `click` 即可命中。操作完 `hide` 还原。确需真实 hover 链（如悬停才展开的嵌套菜单）时，用 `real_click` 的 `approach` 渐进路径逐级触发。
 4. **iframe 自动搜索**：元素命令默认顶层优先搜遍所有 iframe（含跨域），返回带命中 `frame.url`。目标在 iframe 内且自动搜索未命中时，加 `frame` 参数固定：`{"selector":"...","frame":{"url":"子串"}}`（跨域最稳）或 `{"frame":0}`（第 N 个顶层 iframe）。
 5. **shadow DOM 自动穿透**：Web Components 站点（小红书后台等）的按钮/编辑器在 shadow root 里，普通选择器找不到。三种方式：① 直接粘贴 DevTools 元素路径（含 `#shadow-root` 标记）；② `selector: "xhs-publish-btn >>> button"`（`>>>` 穿透所有层）；③ 裸选择器/xpath/text 会自动兜底搜索 open shadow root。closed root 只能用坐标 `real_click {"x":..,"y":..}`。`get_page_info --field html` 默认含 shadow 内容（`<template shadowrootmode="open">` 内联）。

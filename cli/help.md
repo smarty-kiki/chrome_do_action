@@ -38,7 +38,7 @@ cda list
 }
 ```
 
-`iframes` 中**同源与跨域 iframe 都补全 `url` 与 `html`**：跨域 iframe 通过 URL 子串关联到其 frame 后读取内部 document。`src` 为 iframe 标签的原始属性，`url` 为 frame 当前文档地址（跨域也可获取）。
+`iframes` 中**同源与跨域 iframe 都补全 `url` 与 `html`**。`src` 为 iframe 标签的原始属性，`url` 为 frame 当前文档地址（跨域也可获取）。
 
 ### click 返回
 
@@ -71,7 +71,7 @@ cda list
 
 `waitFor` 以 50ms 间隔轮询条件（元素存在且可见 / 可见文本），**条件满足的瞬间返回**（不是等满超时）：`{"settled": true, "waited": 615}`；3s 超时未满足返回 `{"settled": false}`（动作本身已成功，仅影响未确认）。
 
-**后台标签页**：Chrome 对不可见 tab 节流定时器与 MutationObserver（1s 对齐；hidden 超 5 分钟后节流到分钟级）——settle 会追加 1s 确认窗口（无影响动作约 1.6s 返回）；深度后台下影响可能等不到，此时用 `waitFor` 谓词（轮询不受节流）或把 tab 切到前台。
+**后台标签页**：Chrome 对不可见 tab 会节流——settle 可能偏慢（无影响动作约 1.6s 返回），深度后台下影响可能等不到，此时用 `waitFor` 谓词（轮询不受节流）或把 tab 切到前台。
 
 ### iframeChanges
 
@@ -103,7 +103,7 @@ cda list
 
 ## _field 过滤
 
-通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/upload_file/paste_rich/scroll/show/hide/get_rect/get_css/get_page_info/get_js_errors/real_click/open/refresh/close_tab），点路径逐段投影、保留嵌套形状：
+通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/upload_file/paste_rich/scroll/show/hide/get_css/get_page_info/get_js_errors/real_click/open/refresh/close_tab），点路径逐段投影、保留嵌套形状：
 
 - `--field a` → `{a: 完整值}`
 - `--field a.b` → `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）
@@ -161,9 +161,9 @@ cda --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#titl
 {"selector": "#submit", "frame": {"url": "mp.weixin.qq.com"}}  // URL 含子串的首个 frame（跨域最稳）
 ```
 
-- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`（`get_rect` 定位）
-- **跨域 iframe 同样可读可操作**：`get_rect` 会沿 `window.parent` 链换算坐标，跨域边界自动切换 CDP `DOM.getContentQuads` 兜底
-- `real_click` 在 iframe 内同样可用：同源直接复用换算坐标，跨域走 CDP 精确定位后发送真实鼠标事件链
+- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`
+- **跨域 iframe 同样可读可操作**：元素命令自动搜索所有 frame，跨域 iframe 同样能定位命中
+- `real_click` 在 iframe 内同样可用（含跨域）
 - `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；要读 iframe 文本用 `{"selector":"...","frame":{...}}`
 
 ## shadow DOM 定位
@@ -190,7 +190,7 @@ Web Components 站点（小红书创作后台等）把按钮/编辑器包在 sha
    {"text": "发布"}
    ```
 
-- **限制：closed shadow root 无法访问**（`.shadowRoot` 为 null），元素命令一律返回 notFound；此时用坐标点击兜底：`real_click {"x":..., "y":...}`（CDP 在渲染层派发真实鼠标事件，shadow 边界不存在）。
+- **限制：closed shadow root 无法访问**，元素命令一律返回 notFound；此时用坐标点击兜底：`real_click {"x":..., "y":...}`。
 - `get_page_info --field html` 的 html **默认包含 shadow DOM 内容**：open shadow root 以内联 `<template shadowrootmode="open">` 形式出现在宿主元素里；无 shadow 的页面输出与之前完全一致。
 
 ## 常用场景
@@ -379,7 +379,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | 命令 | 用法 | 说明 |
 |------|------|------|
 | `click` | `send <id> click <tab> <params>` | 点击元素（合成事件） |
-| `real_click` | `send <id> real_click <tab> <params>` | 真实点击（CDP，isTrusted=true），参数 {selector} 或 {x,y}，可选 {approach} 渐进移动路径；用于合成事件无效的站点（如微信后台）及 hover 工具条 |
+| `real_click` | `send <id> real_click <tab> <params>` | 真实点击（对忽略合成事件的站点有效），参数 {selector} 或 {x,y}，可选 {approach} 渐进移动路径；用于合成事件无效的站点（如微信后台）及 hover 工具条 |
 | `type` | `send <id> type <tab> <params>` | 输入文本（{selector,text}），支持 input/textarea 与 contenteditable 富文本，富文本按换行分段 |
 | `keyboard` | `send <id> keyboard <tab> <params>` | 向元素发送按键（{selector,key}，selector 可省略用当前聚焦元素），触发页面 keydown/keypress/keyup 处理器；可加 {ctrl,shift,alt,meta} 组合键 |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入本地图片（{selector,base64,filename,mime}），触发 change 事件完成上传 |
@@ -390,7 +390,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取 JS 错误 |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空 JS 错误 |
-| `screenshot` | `send <id> screenshot <tab> <params>` | CDP 截图当前页面（只读，不注入代码）；`{"path":"/tmp/shot.png"}` 保存到本地 |
+| `screenshot` | `send <id> screenshot <tab> <params>` | 截图当前页面（只读，不注入代码）；`{"path":"/tmp/shot.png"}` 保存到本地 |
 | `scroll` | `send <id> scroll <tab> <params>` | 滚动页面 |
 
 ### click 定位方式
@@ -407,18 +407,16 @@ cda send OfficePC get_text current '{"selector":"table"}'
 
 ### real_click
 
-- 与 `click` 参数基本相同（selector 或 x/y），但通过 chrome.debugger（CDP）发送**完整真实鼠标事件链**（isTrusted=true）
-- 事件链：`mouseMoved`（触发 mouseover/mouseenter，激活 hover 状态）→ `mousePressed`(mousedown+focus) → `mouseReleased`(mouseup，浏览器自动合成 click)
-- 鼠标移动采用**渐进步进**（每步 10px）而非瞬移，能真实触发途经元素的 hover 链；点击后鼠标**停留在目标上**，保持 hover 状态供连续操作
+- 与 `click` 参数基本相同（selector 或 x/y），但发送**完整真实鼠标事件链**，对忽略合成事件的站点有效
+- 点击后鼠标**停留在目标上**，保持 hover 状态供连续操作
 - **approach 参数**：模拟"先移到触发点、再移到目标"的多级 hover 场景（如微信封面 hover 工具条：先移向封面按钮，再点击工具条里的菜单项）
   ```json
   // 先渐进经过封面按钮（触发 hover 菜单），最后点击"从图片库选择"菜单项
   {"x": 500, "y": 343, "approach": [[360, 360], [420, 330], [470, 325]]}
   ```
-- 原理：content script 获取元素中心坐标（或直接给 x/y）→ 激活窗口 → CDP `Input.dispatchMouseEvent` 发送完整序列
-- **iframe 支持**：自动搜索所有 iframe（同源 `get_rect` 已换算顶层坐标；跨域切换 CDP 定位），也可用 `frame` 参数指定目标
+- **iframe 支持**：自动搜索所有 iframe（含跨域），也可用 `frame` 参数指定目标
 - 适用：对合成事件免疫的站点（如微信公众平台后台 Vue 组件）、hover 才显示的工具条元素
-- 注意：**坐标必须是元素真实位置**（用截图确认），DOM 快照里可能有顶部隐藏模板导致 get_rect 返回错误坐标（如把 y=824 误报成 y=224）
+- 注意：**坐标必须是元素真实位置**——先 `screenshot` 看真实页面，再取坐标定位。
 - 副作用：attach 瞬间 Chrome 顶部会出现"正在调试此浏览器"横幅，随即消失
 - 使用：`send <id> real_click <tab> '{"selector":"#submit"}'` 或 `'{"x":100,"y":200}'`，iframe 内加 `frame` 参数
 
@@ -445,7 +443,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 - 支持修饰键：`ctrl`/`shift`/`alt`/`meta`（布尔）
 - `key` 取值同 `KeyboardEvent.key`：`Enter`、`Escape`、`Tab`、`Backspace`、`Delete`、`ArrowUp/Down/Left/Right`、`Home`/`End`、`F1`-`F12`，或单个字符（如 `"a"`、`"!"`）
 - 自动补全 `keyCode`/`which` 与 `code`，兼容只监听旧式键码的页面处理器
-- **合成事件**（`isTrusted=false`）：能触发页面 JS 的 keydown/keyup 处理器（Enter 提交、Escape 关闭、方向键导航等通常由 JS 实现），但**不会触发浏览器原生默认行为**（如 input 内 Enter 换行/表单默认提交、Tab 切换焦点）；对依赖原生默认行为的场景，先 `click` 聚焦后结合页面自身 JS 处理器使用
+- **合成事件**：能触发页面 JS 的 keydown/keyup 处理器（Enter 提交、Escape 关闭、方向键导航等通常由 JS 实现），但**不会触发浏览器原生默认行为**（如 input 内 Enter 换行/表单默认提交、Tab 切换焦点）；对依赖原生默认行为的场景，先 `click` 聚焦后结合页面自身 JS 处理器使用
 - 自动搜索 iframe，返回 `{ key, selector, tag, modifiers }`
 
 ### upload_file 参数
@@ -475,14 +473,14 @@ cda send OfficePC get_text current '{"selector":"table"}'
 send <id> show <tabId> '.js_imagedialog'      // selector 直接位置参数
 ```
 
-**设计动机**：hover 才显示的工具条/菜单（如微信后台封面菜单「从图片库选择」）是自动化里的老大难——用 `real_click` + `approach` 模拟 hover 链需要精确坐标和时序，`get_rect` 还可能因页面隐藏模板返回错误坐标；更糟的是，**移动鼠标去 hover 可能触发已打开菜单的 `mouseleave` 使其关闭**（这正是 `noMove` 方案想解决、最终被 show 取代的原因）。
+**适用场景**：hover 才显示的工具条/菜单（如微信后台封面菜单「从图片库选择」）。用 `show` 直接把元素强制显示，随后普通命令即可命中，无需模拟 hover 或精确坐标。
 
-`show` 换个思路：不模拟 hover，而是把元素**直接焊成常驻可见**，让简单命令也能命中：
+`show` 不模拟 hover，而是把元素**直接变为常驻可见**：
 
 - **只改 CSS 样式，不执行代码**：将所有匹配元素的 `visibility` 置为 `visible`、`opacity` 置为 `1`、`display` 若为 `none` 则置为 `block`
-- inline style 优先级最高，不会被 hover CSS 覆盖 → 元素**常驻可见**，不需要模拟鼠标轨迹，也不会因鼠标移动触发 mouseleave
+- 元素**常驻可见**，不会被 hover 样式重新隐藏，也不会因鼠标移动而关闭
 - **默认作用于所有匹配元素**（无需 all 参数）
-- 效果：强制显示后，普通 `click`（合成事件）或 `real_click` 都能直接命中菜单项，绕开坐标/时序/鼠标移动的整条脆弱链
+- 效果：强制显示后，普通 `click` 或 `real_click` 都能直接命中菜单项
 - 组合用法：`show` 显示菜单项 → `click`（或 `real_click`）点击 → 后续流程 → `hide` 还原
 
 ### hide
@@ -512,7 +510,7 @@ send <id> hide <tabId>       // 无参数：还原全部被 show 的元素
 
 - 无 `selector`：滚窗口（缺省顶层 / `frame` 指定的 iframe）
 - 有 `selector`：目标元素经 shadow 穿透查找；元素自身可滚动（scrollHeight > clientHeight）时容器内滚动，否则 scrollIntoView
-- 滚动后等 DOM 稳定（MutationObserver 静默 500ms，3s 上限）才返回
+- 滚动后等 DOM 稳定（无变动 500ms，最长 3s）才返回
 
 ### screenshot
 
@@ -520,7 +518,7 @@ send <id> hide <tabId>       // 无参数：还原全部被 show 的元素
 {"path": "/tmp/shot.png"}    // 截图保存路径（默认 screenshot.png）
 ```
 
-- 通过 CDP `Page.captureScreenshot` 截取当前标签页（PNG），返回 base64，CLI 自动解码保存到 `path`
+- 截取当前标签页（PNG），返回 base64，CLI 自动解码保存到 `path`
 - 只读能力（等同 DevTools 截图），不注入代码、不修改页面
 - 用于确认页面真实视觉状态（元素遮挡、浮层、滚动位置），避免仅凭 DOM 快照盲猜坐标
 - 适用：操作前确认页面状态、排查点击无响应（如浮层遮罩挡住目标元素）

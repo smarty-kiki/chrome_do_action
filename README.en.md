@@ -48,10 +48,10 @@ your command → server → Chrome extension → execute in the page → structu
 | Capability | What it does |
 |---|---|
 | 🖱️ Page actions | Open / refresh / close tabs, click, type, scroll, screenshot — most interactions a browser can do |
-| 🔥 Real clicks (`real_click`) | Sends a full `isTrusted=true` mouse event chain over CDP, breaking through sites that ignore synthetic events (e.g. WeChat MP backend); supports multi-level hover paths |
+| 🔥 Real clicks (`real_click`) | Sends a complete, genuine mouse event chain, breaking through sites that ignore synthetic events (e.g. WeChat MP backend); supports multi-level hover paths |
 | 📝 Rich text | `type` writes plain text into `contenteditable`; `paste_rich` pastes styled HTML, preserving font size / color / bold / layout |
 | 🖼️ File uploads | `upload_file` injects a base64 image into a file input and triggers upload, bypassing the native file dialog |
-| 📸 CDP screenshots | Pixel-accurate "what you see" screenshot, saved to a local PNG — spot overlays, floating layers, scroll position |
+| 📸 Page screenshots | Pixel-accurate "what you see" screenshot, saved to a local PNG — spot overlays, floating layers, scroll position |
 | 🐛 JS error collection | Keeps collecting `error` + `unhandledrejection` from page load; query or clear anytime |
 | ⚡ Selective fields (`--field`) | Every command returning an object supports dot-path projection (`--field "clickDesc.selector,settledMs,currentTab.url"`) — only requested fields are collected and returned; faster commands, leaner output |
 | ⏳ Impact-aware returns | Action commands wait for their impact to land before returning (event-driven via DOM mutations/long tasks, no fixed sleep; `settledMs` reports the wait). For late-arriving effects, pass a `waitFor` predicate (50ms polling, returns the moment the condition holds — reliable even on background tabs) |
@@ -192,7 +192,7 @@ cda send OfficePC upload_file current "{\"selector\":\"input[type=file]\",\"base
 ### Real click on sites that ignore synthetic events
 
 ```bash
-# WeChat MP backend: a genuine mouse event chain (isTrusted=true)
+# WeChat MP backend: genuine click
 cda send OfficePC real_click current '{"selector":"#submit"}'
 
 # Multi-level hover: sweep through the cover preview and the "change" icon
@@ -237,7 +237,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | Command | Usage | Description |
 |---|---|---|
 | `click` | `send <id> click <tab> <params>` | Click an element (selector / text / coordinates) |
-| `real_click` | `send <id> real_click <tab> <params>` | CDP real click (`isTrusted=true`); supports an `approach` hover path |
+| `real_click` | `send <id> real_click <tab> <params>` | Genuine real click (works on sites that ignore synthetic events); supports an `approach` hover path |
 | `type` | `send <id> type <tab> <params>` | Type text; supports input/textarea and `contenteditable` rich text |
 | `keyboard` | `send <id> keyboard <tab> <params>` | Send a key press to an element (`{selector,key}`; selector optional, defaults to the focused element); optional `ctrl`/`shift`/`alt`/`meta` modifiers |
 | `upload_file` | `send <id> upload_file <tab> <params>` | Inject a base64 image into a file input and trigger upload |
@@ -247,7 +247,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | Get page info (url / title / iframes) |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | Get accumulated JS errors |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | Clear accumulated JS errors |
-| `screenshot` | `send <id> screenshot <tab> <params>` | CDP screenshot; `{"path":"/tmp/s.png"}` saves locally |
+| `screenshot` | `send <id> screenshot <tab> <params>` | Page screenshot; `{"path":"/tmp/s.png"}` saves locally |
 | `scroll` | `send <id> scroll <tab> <params>` | Scroll: window/iframe (via `frame`) or `{"selector":...}` to an element (scrollable container / scrollIntoView, pierces shadow DOM); smooth, returns once the DOM settles |
 
 ### Locating an element for click / real_click
@@ -262,7 +262,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 {"selector": "xhs-btn >>> button"}   // pierce all shadow levels
 ```
 
-All element commands automatically pierce **open shadow roots**: if a bare selector (or `xpath:` / `text`) misses in light DOM, cda searches every open shadow root in document order (nested included). `real_click` embeds the same piercing logic in its CDP locating expression. Closed shadow roots stay inaccessible (`.shadowRoot` is null) — fall back to coordinate clicks (`real_click {"x":..., "y":...}`), which bypass the boundary at the render layer. `get_page_info --field html` serializes shadow content by default: open roots appear inline as `<template shadowrootmode="open">` inside their hosts; pages without shadow DOM output exactly as before.
+All element commands automatically pierce **open shadow roots**: if a bare selector (or `xpath:` / `text`) misses in light DOM, cda searches every open shadow root in document order (nested included). `real_click` works on shadow-DOM elements too. Closed shadow roots stay inaccessible — fall back to coordinate clicks (`real_click {"x":..., "y":...}`). `get_page_info --field html` includes shadow content by default: open roots appear inline as `<template shadowrootmode="open">` inside their hosts; pages without shadow DOM output exactly as before.
 
 ### Params for the other commands
 
@@ -286,18 +286,12 @@ All element commands automatically pierce **open shadow roots**: if a bare selec
 
 ### 1. `real_click` — for sites that ignore synthetic events
 
-Many admin backends (e.g. the Vue components behind WeChat MP) ignore `dispatchEvent`-synthesized clicks. `real_click` sends a **complete, genuine mouse event chain** over `chrome.debugger` (CDP):
+Many admin backends (e.g. the Vue components behind WeChat MP) ignore synthesized clicks. `real_click` sends a **complete, genuine mouse event chain**:
 
-```
-progressive mouseMoved (fires mouseover/mouseenter/hover)
-→ mousePressed (mousedown + focus)
-→ mouseReleased (mouseup; the browser synthesizes click itself)
-```
-
-- Mouse movement is **incremental** (10px steps) rather than teleporting, so it genuinely fires the hover chain along the path
+- Mouse movement is **incremental** rather than teleported, so it genuinely fires the hover chain along the path
 - After the click the mouse **stays on the target**, keeping hover state for the next action
 - The `approach` param simulates "move to a trigger point first, then to the target" for multi-level hover scenarios (e.g. a hover toolbar over a cover image)
-- Side effect: Chrome briefly shows the "This browser is being debugged" banner while attached, then it disappears
+- Side effect: Chrome briefly shows the "This browser is being debugged" banner while executing, then it disappears
 
 ### 2. Rich text & file uploads — bypassing the two hardest interactions
 
@@ -316,14 +310,14 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-Supported by **every command returning an object**: `click`/`type`/`keyboard`/`upload_file`/`paste_rich`/`scroll`/`show`/`hide`/`get_rect`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`. Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and has nothing to filter.
+Supported by **every command returning an object**: `click`/`type`/`keyboard`/`upload_file`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`. Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and has nothing to filter.
 
 ### 4. State awareness — commands return the world after the action
 
-- **Navigation detection**: after a click, a `beforeunload` listener (300ms window) sets a `navigated` flag; if navigation happened, the command **waits for the new page to finish loading** and returns its full info
+- **Navigation detection**: if a click causes navigation, the command **waits for the new page to finish loading** and returns its full info (with a `navigated` flag)
 - **New-tab detection**: the tab list is compared before/after a click to catch `target="_blank"` popups, and each new tab is awaited until loaded
 - **iframe change detection**: all iframe `src`s are captured before/after a click and diffed into `iframeChanges` (`srcChanged` / `beforeSrc` / `afterSrc`)
-- **DOM-settling wait**: after scrolling, a `MutationObserver` waits 500ms of quiet before returning (3s timeout cap)
+- **DOM-settling wait**: after scrolling, the command waits for the page to be quiet before returning (3s timeout cap)
 
 ### 5. Reliability
 

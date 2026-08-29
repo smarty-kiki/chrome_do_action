@@ -32,13 +32,12 @@ Page commands (tab required):
                               #shadow-root, ">>>", or bare selector fallback
                               Optional {waitFor: {selector|text}} waits until the
                               condition appears before returning (see Settle below)
-  real_click <tab> <params>   Trusted click chain via CDP (isTrusted=true) for sites
-                              that ignore synthetic events (e.g. WeChat MP).
+  real_click <tab> <params>   Genuine real click (works on sites that ignore
+                              synthetic events, e.g. WeChat MP).
                               Params: {selector} or {x,y}; optional {approach} =
                               [[x,y],...] path to move through progressively,
                               triggering hover chains before clicking.
-                              Works in iframes: same-origin via coordinate
-                              translation, cross-origin via CDP
+                              Works in iframes, including cross-origin.
                               Same settle + waitFor semantics as click
   type <tab> <params>         Type text ({selector,text[,mode][,waitFor]}); mode:
                               replace(default)/append(end)/insert(caret);
@@ -62,7 +61,7 @@ Page commands (tab required):
                               cross-origin frames
   get_js_errors <tab>         Get accumulated JS errors (aggregated across frames)
   clear_js_errors <tab>       Clear accumulated JS errors
-  screenshot <tab> <params>   Capture page screenshot via CDP
+  screenshot <tab> <params>   Capture a page screenshot
                               ({path: "/tmp/shot.png"} saves PNG locally)
   scroll <tab> <params>       Scroll window/iframe ({y} or {x,y}; {frame} picks iframe),
                               or to an element / inside a scrollable container
