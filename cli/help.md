@@ -48,11 +48,30 @@ cda list
 |------|------|------|
 | `navigated` | boolean | 当前标签页是否发生了跳转 |
 | `clickDesc` | object | 点击描述（`selector`/`text`/`x,y` + `tag`） |
+| `settledMs` | number | 等影响落地的耗时（毫秒），见「等影响落地」 |
 | `currentTab` | object | 当前标签页信息（`url`、`title`、`iframes`） |
 | `newTabs` | array | 新打开的标签页列表（每个包含 `tabId`、`url`、`title`、`iframes`） |
 | `iframeChanges` | array | iframe 变化列表，仅在检测到变化时出现 |
+| `waitFor` | object | 传入 `waitFor` 参数时的等待结果（`settled` + `waited`） |
 
 `currentTab` 和 `newTabs` 中的 `iframes` 是该页面当前的 iframe 列表，结构同 `open` 的 `iframes`。
+
+### 等影响落地（settle）
+
+`click`/`type`/`keyboard`/`upload_file`/`paste_rich`/`scroll`/`real_click` 返回前会**等动作的影响落地**——事件驱动（DOM 变化 + 长任务检测），不是固定 sleep：
+
+- **无影响动作**（点击无副作用元素）：约 0.6s 返回（600ms 活动窗口 + 静默确认）
+- **有影响动作**（异步渲染、debounce 重排）：等到 DOM 安静 250ms 后返回，`settledMs` 如实反映等待耗时
+- **影响落地晚于检测窗口**（服务端请求响应后才渲染、长 debounce）→ 传 `waitFor` 谓词：
+
+```json
+{"selector": "#toast", "waitFor": {"selector": "#success-toast"}}
+{"text": "登录", "waitFor": {"text": "发布成功"}}
+```
+
+`waitFor` 以 50ms 间隔轮询条件（元素存在且可见 / 可见文本），**条件满足的瞬间返回**（不是等满超时）：`{"settled": true, "waited": 615}`；3s 超时未满足返回 `{"settled": false}`（动作本身已成功，仅影响未确认）。
+
+**后台标签页**：Chrome 对不可见 tab 节流定时器与 MutationObserver（1s 对齐；hidden 超 5 分钟后节流到分钟级）——settle 会追加 1s 确认窗口（无影响动作约 1.6s 返回）；深度后台下影响可能等不到，此时用 `waitFor` 谓词（轮询不受节流）或把 tab 切到前台。
 
 ### iframeChanges
 
@@ -84,30 +103,49 @@ cda list
 
 ## _field 过滤
 
-通过 `--field` 指定需要的字段，减少不必要的 DOM 操作。
+通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/upload_file/paste_rich/scroll/show/hide/get_rect/get_css/get_page_info/get_js_errors/real_click/open/refresh/close_tab），点路径逐段投影、保留嵌套形状：
 
-### 支持的字段路径
+- `--field a` → `{a: 完整值}`
+- `--field a.b` → `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）
+- `--field arr.k`（arr 为数组）→ `{arr: [k1, k2, ...]}`
+- 不存在的路径忽略，不报错；无 `--field` 时返回全量
+- `get_text` 返回纯文本字符串（单一结果，无字段可滤）
+
+### 常用字段路径
 
 | 字段 | 说明 |
 |------|------|
+| `clickDesc.selector` / `clickDesc.text` / `clickDesc.tag` | 点击命中的元素 |
+| `settledMs` | 等影响落地耗时 |
+| `navigated` | 是否发生导航 |
 | `currentTab` | 当前标签页完整信息（url、title、iframes） |
 | `currentTab.url` | 仅 url |
-| `currentTab.title` | 仅 title |
 | `currentTab.iframes` | 仅 iframe 列表 |
+| `frame.url` | 元素命中的 frame |
 | `newTabs` | 新标签页完整信息（含 iframes） |
+| `newTabs.url` | 各新标签页的 url 数组 |
 | `iframeChanges` | 仅返回 iframe 变化数组 |
+| `count` | show/hide/get_css/get_js_errors 的计数 |
+| `x` / `y` / `trusted` | real_click 的点击坐标与可信标记 |
+| `url` / `title` | open/get_page_info 的页面信息 |
 
 ### 使用示例
 
 ```bash
+# 点完只要命中元素 + 耗时
+cda --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#submit"}' --field "clickDesc.selector,settledMs"
+
 # 只看当前页 url
 cda --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#submit"}' --field "currentTab.url"
 
-# 只看新标签页
-cda --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"打开"}' --field "newTabs"
+# 只看新标签页的 url
+cda --server ws://127.0.0.1:12345 send OfficePC click current '{"text":"打开"}' --field "newTabs.url"
 
 # 只看 iframe 变化
 cda --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges"
+
+# 输入后只看耗时
+cda --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
 ## iframe 定位
@@ -127,6 +165,33 @@ cda --server ws://127.0.0.1:12345 send OfficePC click current '{"selector":"#ref
 - **跨域 iframe 同样可读可操作**：`get_rect` 会沿 `window.parent` 链换算坐标，跨域边界自动切换 CDP `DOM.getContentQuads` 兜底
 - `real_click` 在 iframe 内同样可用：同源直接复用换算坐标，跨域走 CDP 精确定位后发送真实鼠标事件链
 - `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；要读 iframe 文本用 `{"selector":"...","frame":{...}}`
+
+## shadow DOM 定位
+
+Web Components 站点（小红书创作后台等）把按钮/编辑器包在 shadow root 里，普通选择器、XPath 无法穿透。元素命令（`click`/`real_click`/`type`/`keyboard`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）默认**透明穿透 open shadow root**，三种方式从显式到隐式：
+
+1. **路径标记 `#shadow-root`**：直接粘贴 DevTools 元素面板「Copy → Copy element path」复制的完整路径（原生 `querySelector` 就是这么写的）：
+
+   ```json
+   {"selector": "xhs-publish-btn > #shadow-root > div > div.publish-page-publish-btn > button.ce-btn"}
+   ```
+
+2. **`>>>` 组合器**：穿透所有 shadow 层级（Playwright 风格，浏览器原生不支持，这里自行实现）：
+
+   ```json
+   {"selector": "xhs-publish-btn >>> button"}
+   ```
+
+3. **裸选择器自动兜底**：light DOM 未命中时，按文档序自动搜索所有 open shadow root（含嵌套）；`xpath:` 与 `text` 查找同样兜底到 shadow tree 内（`//` 相对 shadow root 展开，shadow tree 里没有 body）：
+
+   ```json
+   {"selector": "button.ce-btn"}
+   {"selector": "xpath://button[contains(.,'发布')]"}
+   {"text": "发布"}
+   ```
+
+- **限制：closed shadow root 无法访问**（`.shadowRoot` 为 null），元素命令一律返回 notFound；此时用坐标点击兜底：`real_click {"x":..., "y":...}`（CDP 在渲染层派发真实鼠标事件，shadow 边界不存在）。
+- `get_page_info --field html` 的 html **默认包含 shadow DOM 内容**：open shadow root 以内联 `<template shadowrootmode="open">` 形式出现在宿主元素里；无 shadow 的页面输出与之前完全一致。
 
 ## 常用场景
 
@@ -428,10 +493,22 @@ send <id> hide <tabId>       // 无参数：还原全部被 show 的元素
 
 ### scroll 参数
 
+滚动作用域由 `frame` 参数选定（语义与其他元素命令一致，见「iframe 定位」）：缺省/`auto` 滚顶层窗口，`top` 明确顶层，数字或 `{"url":"子串"}` 滚指定 iframe。
+
 ```json
-{"y": 500}                   // 垂直滚动
-{"x": 300, "y": 500}         // 水平 + 垂直
+{"y": 500}                        // 滚当前作用域窗口：垂直滚动
+{"x": 300, "y": 500}              // 水平 + 垂直
+{"y": 300, "frame": 0}            // 滚第 1 个顶层 iframe 内部
+{"y": 300, "frame": {"url": "editor"}}  // 滚 url 含 "editor" 的 iframe
+{"selector": ".js_list"}          // 滚动到元素：可滚动容器→容器内滚动到顶部，
+                                  // 普通元素→scrollIntoView 进入可视区（含 shadow 内元素）
+{"selector": ".js_list", "y": 200}    // 可滚动容器内滚动到 200px
+{"selector": "#bottom", "block": "end"}  // scrollIntoView 对齐方式：start/center/end/nearest（默认 center）
 ```
+
+- 无 `selector`：滚窗口（缺省顶层 / `frame` 指定的 iframe）
+- 有 `selector`：目标元素经 shadow 穿透查找；元素自身可滚动（scrollHeight > clientHeight）时容器内滚动，否则 scrollIntoView
+- 滚动后等 DOM 稳定（MutationObserver 静默 500ms，3s 上限）才返回
 
 ### screenshot
 
@@ -447,7 +524,7 @@ send <id> hide <tabId>       // 无参数：还原全部被 show 的元素
 ## 注意事项
 
 - `text` 定位会跳过 `<script>`、`<style>`、`<noscript>` 等不可见元素，优先匹配 `<button>`、`<a>`、`<input>`；自动搜索 iframe，返回带命中 frame 的 `url`
-- `--field` 只对 `click`、`get_page_info`、`open` 有效，在浏览器端按需采集，减少不必要的 DOM 操作
+- `--field` 对所有返回对象的命令有效（点路径投影，见「_field 过滤」章节），在浏览器端按需采集、出口统一裁剪
 - `--field html`（如 `--field "currentTab.html"`）返回该 frame 的**完整 HTML 内容**（服务端与 CLI 原样转发，不会剥离），需抓页面源码时直接用它
 - 同一标签页的命令串行执行，前一条完成后下一条才执行，不需要手动等待
 - 点击后如果页面跳转，会自动等待新页面加载完成再返回结果

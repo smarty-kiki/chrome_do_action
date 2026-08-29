@@ -10,9 +10,12 @@ Actions:
   send <id> <cmd> [tab] [params]    Send command to a client
 
 Options:
-  --field <paths>        Comma-separated field paths to filter response
-                          (e.g. --field "currentTab.url,newTabs")
-                          Supported commands: open, click, get_page_info
+  --field <paths>        Comma-separated dot-paths to filter the response of any
+                          page/browser command returning an object
+                          (e.g. --field "clickDesc.selector,settledMs,currentTab.url"
+                          -> {clickDesc:{selector},settledMs,currentTab:{url}};
+                          --field newTabs.url -> {newTabs:[url,...]}).
+                          get_text returns a plain string and has nothing to filter.
 
 Browser commands (no tab):
   open <url>              Open URL in new tab (supports --field)
@@ -24,7 +27,11 @@ Page commands (tab required):
   click <tab> [params]        Click by selector, text, or {x,y}
                               selector prefixes: "css:" for CSS, "xpath:" for XPath
                               Searches top frame then all iframes automatically;
-                              use {frame} to target a specific frame
+                              use {frame} to target a specific frame.
+                              Pierces open shadow DOM: DevTools path with
+                              #shadow-root, ">>>", or bare selector fallback
+                              Optional {waitFor: {selector|text}} waits until the
+                              condition appears before returning (see Settle below)
   real_click <tab> <params>   Trusted click chain via CDP (isTrusted=true) for sites
                               that ignore synthetic events (e.g. WeChat MP).
                               Params: {selector} or {x,y}; optional {approach} =
@@ -32,15 +39,17 @@ Page commands (tab required):
                               triggering hover chains before clicking.
                               Works in iframes: same-origin via coordinate
                               translation, cross-origin via CDP
-  type <tab> <params>         Type text ({selector,text}); supports input/textarea
-                              and contenteditable (rich text, splits by newline)
-  keyboard <tab> <params>     Send key press to element ({selector,key[,ctrl|shift|alt|meta]});
+                              Same settle + waitFor semantics as click
+  type <tab> <params>         Type text ({selector,text[,waitFor]}); supports
+                              input/textarea and contenteditable (rich text,
+                              splits by newline)
+  keyboard <tab> <params>     Send key press to element ({selector,key[,ctrl|shift|alt|meta][,waitFor]});
                               selector optional (defaults to focused element); key e.g.
                               Enter, Escape, Tab, ArrowDown, or a single char
   upload_file <tab> <params>  Inject base64 image into file input
-                              ({selector,base64,filename,mime}), triggers change
+                              ({selector,base64,filename,mime[,waitFor]}), triggers change
   paste_rich <tab> <params>   Paste styled HTML into contenteditable
-                              ({selector,html}); clears existing content first
+                              ({selector,html[,waitFor]}); clears existing content first
   show <tab> <selector>       Force-show all matching hidden elements
                               (inline style; makes hover-only menus clickable)
   hide <tab>                  Restore all elements shown by show
@@ -54,7 +63,9 @@ Page commands (tab required):
   clear_js_errors <tab>       Clear accumulated JS errors
   screenshot <tab> <params>   Capture page screenshot via CDP
                               ({path: "/tmp/shot.png"} saves PNG locally)
-  scroll <tab> <params>       Scroll page ({y} or {x,y})
+  scroll <tab> <params>       Scroll window/iframe ({y} or {x,y}; {frame} picks iframe),
+                              or to an element / inside a scrollable container
+                              ({selector}[,y][,block]) — pierces shadow DOM
 
 frame param (optional, for element commands that search iframes):
   {frame: "auto"}             (default) top frame first, then all iframes
@@ -62,6 +73,20 @@ frame param (optional, for element commands that search iframes):
   {frame: 0}                  first top-level iframe (0-based index)
   {frame: {url: "substring"}} first frame whose url contains the substring
                               (most reliable for cross-origin iframes)
+
+Settle — impact-aware returns (click/type/keyboard/upload_file/paste_rich/
+scroll/real_click):
+  Commands wait for the action's impact to land before returning. Event-driven
+  (DOM mutations + long tasks, no fixed sleep), returns {settledMs} (ms waited):
+  no-impact actions return ~0.6s; impacted actions return once the DOM is quiet
+  for 250ms after the last activity. Impact that arrives late (network round
+  trip, long debounce) is beyond settle — pass {waitFor: {selector|text}} to
+  poll (50ms, throttle-proof) until the condition holds; returns
+  {waitFor: {settled, waited}}.
+  Background tabs: Chrome throttles timers/MutationObserver while hidden (1s
+  alignment, minutes-level after 5min hidden) — settle then waits an extra 1s
+  confirmation window (~1.6s for no-impact actions); deep-background tabs may
+  need waitFor or a focused tab.
 
 Examples:
   cda list

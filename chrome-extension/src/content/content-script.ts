@@ -88,7 +88,18 @@ async function collectPageInfo(fields: string[]): Promise<{ url?: string; title?
   const has = (name: string) => fields.length === 0 || fields.some(f => f === name || f === `currentTab.${name}`);
   if (has("url")) info.url = window.location.href;
   if (has("title")) info.title = document.title;
-  if (has("html")) info.html = document.documentElement.outerHTML;
+  if (has("html")) {
+    // 默认包含 shadow DOM 内容：getHTML({shadowRoots:[...]}) 把 open shadow root
+    // 以 <template shadowrootmode="open"> 内联进宿主元素；无 shadow 的页面输出与 outerHTML 一致。
+    // 注意：getInnerHTML 从未正式发布，getHTML 的 includeShadowRoots 参数也被忽略，
+    // 必须用 shadowRoots 数组显式列出（Chrome 145+，旧版退化为 outerHTML）
+    const docEl = document.documentElement as HTMLElement & {
+      getHTML?: (opts: { shadowRoots: ShadowRoot[] }) => string;
+    };
+    info.html = typeof docEl.getHTML === "function"
+      ? docEl.getHTML({ shadowRoots: openShadowRootsDeep(document) })
+      : document.documentElement.outerHTML;
+  }
   return info;
 }
 
@@ -167,23 +178,22 @@ async function handleCommand(
         let navigated = false;
         const onBeforeUnload = () => { navigated = true; };
         window.addEventListener("beforeunload", onBeforeUnload, { once: true });
-        await new Promise((r) => setTimeout(r, 200));
+        // 等影响落地：事件驱动的稳定检测（DOM/长任务/渲染 flush），导航发生时提前收尾
+        const stable = await waitForSettled(3000);
         window.removeEventListener("beforeunload", onBeforeUnload);
+        const waitForResult = params.waitFor
+          ? await waitForCondition(params.waitFor as { selector?: string; text?: string }, 3000)
+          : null;
 
         // Build response based on _field
-        const data: Record<string, unknown> = { clickDesc };
+        const data: Record<string, unknown> = { clickDesc, settledMs: stable.waited };
+        if (waitForResult) data.waitFor = waitForResult;
         if (fields.length === 0 || needsField(fields, "navigated")) data.navigated = navigated;
         if (fields.length === 0 || needsField(fields, "current")) {
           const pageInfo = await collectPageInfo(fields);
           data.current = pageInfo;
         }
-        if (fields.length === 0 || needsField(fields, "iframeChanged", "iframeChanges")) {
-          data.iframeChanged = false;
-          data.iframeChanges = [];
-        }
-        if (fields.length === 0 || needsField(fields, "newTabs")) {
-          data.newTabs = [];
-        }
+        // iframeChanged/iframeChanges 由 service worker 做前后快照对比（CS 无权对比），此处不输出
         return { success: true, data };
       }
 
@@ -194,8 +204,8 @@ async function handleCommand(
         // 跨域边界无法读父 frame（getBoundingClientRect 抛 SecurityError）→ 标记 crossOrigin，
         // 返回 iframe 本地坐标，由 service worker 走 CDP getContentQuads 精确定位。
         const selector = params.selector as string;
-        const el = findElement(selector) as HTMLElement | null;
-        if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+        const el = (params.text ? findByText(params.text) : findElement(selector)) as HTMLElement | null;
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text || selector}` };
         const rect = el.getBoundingClientRect();
         const lx = rect.left + rect.width / 2;
         const ly = rect.top + rect.height / 2;
@@ -231,9 +241,9 @@ async function handleCommand(
         // 强制显示隐藏元素（仅改 CSS 样式，不执行代码）。
         // 作用于所有匹配元素：把 hover 才显示的工具条/菜单常驻可见，
         // inline style 优先级最高，不会被 hover CSS 覆盖，随后可被 click 命中。
-        // 记录原样式值，hide 可精确还原。
+        // 记录原样式值，hide 可精确还原。查找穿透 open shadow root（与 findElement 同语义）。
         const selector = params.selector as string;
-        const els = Array.from(document.querySelectorAll(selector)) as HTMLElement[];
+        const els = findAllPierced(selector) as HTMLElement[];
         if (els.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         for (const el of els) {
           if (!showRegistry.has(el)) {
@@ -275,7 +285,8 @@ async function handleCommand(
           el.value = text;
           el.dispatchEvent(new Event("input", { bubbles: true }));
           el.dispatchEvent(new Event("change", { bubbles: true }));
-          return { success: true };
+        } else if (!el.isContentEditable) {
+          return { success: false, error: `Element not typeable: ${selector} (tag=${el.tagName}, contentEditable=${el.contentEditable})` };
         }
         // contenteditable (富文本编辑器如 ProseMirror): 聚焦后用 execCommand 模拟真实输入
         if (el.isContentEditable) {
@@ -295,9 +306,15 @@ async function handleCommand(
             if (i < paragraphs.length - 1) document.execCommand("insertParagraph", false);
           });
           el.dispatchEvent(new Event("input", { bubbles: true }));
-          return { success: true };
         }
-        return { success: false, error: `Element not typeable: ${selector} (tag=${el.tagName}, contentEditable=${el.contentEditable})` };
+        // 等影响落地：事件驱动的稳定检测（编辑器 debounce 重排等）+ 可选 wait_for 谓词
+        const stable = await waitForSettled(3000);
+        const waitForResult = params.waitFor
+          ? await waitForCondition(params.waitFor as { selector?: string; text?: string }, 3000)
+          : null;
+        const typeData: Record<string, unknown> = { selector, tag: el.tagName.toLowerCase(), settledMs: stable.waited };
+        if (waitForResult) typeData.waitFor = waitForResult;
+        return { success: true, data: typeData };
       }
 
       case "keyboard": {
@@ -328,15 +345,20 @@ async function handleCommand(
         // keypress 只对非修饰键派发（真实浏览器里 Control/Shift/Alt/Meta 不产生 keypress）
         if (!MODIFIER_KEYS.has(key)) target.dispatchEvent(new KeyboardEvent("keypress", init));
         target.dispatchEvent(new KeyboardEvent("keyup", init));
-        return {
-          success: true,
-          data: {
-            key,
-            ...(selector ? { selector } : {}),
-            tag: target.tagName.toLowerCase(),
-            modifiers: mods,
-          },
+        // 等影响落地：按键触发的处理器/防抖渲染完成后再返回
+        const stable = await waitForSettled(3000);
+        const waitForResult = params.waitFor
+          ? await waitForCondition(params.waitFor as { selector?: string; text?: string }, 3000)
+          : null;
+        const keyData: Record<string, unknown> = {
+          key,
+          ...(selector ? { selector } : {}),
+          tag: target.tagName.toLowerCase(),
+          modifiers: mods,
+          settledMs: stable.waited,
         };
+        if (waitForResult) keyData.waitFor = waitForResult;
+        return { success: true, data: keyData };
       }
 
       case "upload_file": {
@@ -359,7 +381,22 @@ async function handleCommand(
         dt.items.add(file);
         el.files = dt.files;
         el.dispatchEvent(new Event("change", { bubbles: true }));
-        return { success: true, data: { filename, size: bytes.length, mime } };
+        // 等影响落地：页面 change 处理器可能异步改 DOM（如预览图渲染）；
+        // 上传完成进度不在 cda 控制范围，需要精确等待用 wait_for 谓词
+        const stable = await waitForSettled(3000);
+        const waitForResult = params.waitFor
+          ? await waitForCondition(params.waitFor as { selector?: string; text?: string }, 3000)
+          : null;
+        const uploadData: Record<string, unknown> = {
+          selector,
+          tag: el.tagName.toLowerCase(),
+          filename,
+          size: bytes.length,
+          mime,
+          settledMs: stable.waited,
+        };
+        if (waitForResult) uploadData.waitFor = waitForResult;
+        return { success: true, data: uploadData };
       }
 
       case "paste_rich": {
@@ -383,7 +420,19 @@ async function handleCommand(
         // 直接操作 clipboardData 不可行，用 execCommand insertHTML 保留样式
         document.execCommand("insertHTML", false, html);
         el.dispatchEvent(new Event("input", { bubbles: true }));
-        return { success: true, data: { inserted: true } };
+        // 等影响落地：编辑器收到内容后的重排/防抖渲染完成再返回
+        const stable = await waitForSettled(3000);
+        const waitForResult = params.waitFor
+          ? await waitForCondition(params.waitFor as { selector?: string; text?: string }, 3000)
+          : null;
+        const pasteData: Record<string, unknown> = {
+          selector,
+          tag: el.tagName.toLowerCase(),
+          inserted: true,
+          settledMs: stable.waited,
+        };
+        if (waitForResult) pasteData.waitFor = waitForResult;
+        return { success: true, data: pasteData };
       }
 
       case "get_text": {
@@ -398,7 +447,8 @@ async function handleCommand(
         if (!selector) return { success: false, error: "selector is required" };
         const isCss = selector.startsWith("css:");
         const query = isCss ? selector.slice(4) : selector;
-        const nodes = isCss ? document.querySelectorAll(query) : [findElement(selector)].filter(Boolean) as Element[];
+        // css: 前缀命中全部匹配；其余走 findElement（两者都穿透 open shadow root）
+        const nodes = isCss ? findAllPierced(query) : [findElement(selector)].filter(Boolean) as Element[];
         if (nodes.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         const results = Array.from(nodes).map((el, i) => {
           const computed = window.getComputedStyle(el);
@@ -457,7 +507,7 @@ async function handleCommand(
             if (document.readyState === "complete") {
               settled = true;
               cleanup();
-              waitForDomStable(3000).then(() => {
+              waitForSettled(3000).then(() => {
                 resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
               });
             }
@@ -466,7 +516,7 @@ async function handleCommand(
           if (document.readyState === "complete") {
             settled = true;
             cleanup();
-            waitForDomStable(3000).then(() => {
+            waitForSettled(3000).then(() => {
               resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
             });
           } else {
@@ -480,11 +530,48 @@ async function handleCommand(
       }
 
       case "scroll": {
-        const y = (params.y as number) ?? 0;
+        // 滚动作用域由调用方选定（SW 按 frame 参数分发到目标 frame，缺省顶层）。
+        // {x,y}              滚窗口/iframe；{selector} 滚动到元素：
+        //   - 元素是可滚动容器（scrollHeight/clientHeight 溢出）→ 容器内滚动到 {x,y}
+        //   - 普通元素 → scrollIntoView 进入可视区（shadow 内元素同样生效）
         const x = (params.x as number) ?? 0;
+        const y = (params.y as number) ?? 0;
+        const selector = params.selector as string | undefined;
+        if (selector) {
+          const el = findElement(selector) as HTMLElement | null;
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+          if (el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth) {
+            el.scrollTo({ top: y, left: x, behavior: "smooth" });
+            await waitForSettled(3000);
+            return { success: true, data: { scrollTarget: "container", scrollX: el.scrollLeft, scrollY: el.scrollTop } };
+          }
+          const block = (["start", "center", "end", "nearest"] as string[]).includes(params.block as string)
+            ? (params.block as ScrollLogicalPosition)
+            : "center";
+          el.scrollIntoView({ behavior: "smooth", block });
+          await waitForSettled(3000);
+          return { success: true, data: { scrollTarget: "element", scrolledIntoView: selector } };
+        }
         window.scrollTo({ top: y, left: x, behavior: "smooth" });
-        await waitForDomStable(3000);
+        await waitForSettled(3000);
         return { success: true, data: { scrollX: window.scrollX, scrollY: window.scrollY } };
+      }
+
+      // 内部命令（SW real_click 点击后调用；CLI 不可直接发——BLOCKED）：等影响落地
+      case "wait_for_settle": {
+        const timeout = (params.timeout as number) ?? 3000;
+        const stable = await waitForSettled(timeout);
+        const waitForResult = params.wait_for
+          ? await waitForCondition(params.wait_for as { selector?: string; text?: string }, timeout)
+          : null;
+        return {
+          success: true,
+          data: {
+            settled: stable.waited < timeout,
+            settledMs: stable.waited,
+            ...(waitForResult ? { waitFor: waitForResult } : {}),
+          },
+        };
       }
 
       default:
@@ -495,45 +582,199 @@ async function handleCommand(
   }
 }
 
-function waitForDomStable(maxWaitMs: number): Promise<void> {
-  return new Promise((resolve) => {
-    let quietTimer: number;
-    const observer = new MutationObserver(() => {
-      clearTimeout(quietTimer);
-      quietTimer = window.setTimeout(() => {
-        observer.disconnect();
-        resolve();
-      }, 250);
+// 节流安全计时器：hidden 页面（后台 tab）的 setTimeout 被 Chrome 节流
+// （对齐到 ~1s；hidden 超 5 分钟更进一步节流到 1 次/分钟），静默判定/谓词轮询
+// 会因此被拉长。hidden 时改用 MessageChannel 忙循环计时——postMessage 消息事件
+// 不受 timer throttling 影响（短暂忙循环，后台页不渲染，可接受）；
+// 可见页面走正常 setTimeout，零额外开销。返回 {promise, cancel}。
+function throttleSafeTimer(ms: number): { promise: Promise<void>; cancel: () => void } {
+  if (document.visibilityState !== "hidden") {
+    let timer: number | undefined;
+    const promise = new Promise<void>((resolve) => {
+      timer = window.setTimeout(resolve, ms);
     });
-    observer.observe(document.body, { childList: true, subtree: true });
-    quietTimer = window.setTimeout(() => {
-      observer.disconnect();
-      resolve();
-    }, 500);
-    setTimeout(() => {
-      observer.disconnect();
-      clearTimeout(quietTimer);
-      resolve();
-    }, maxWaitMs);
+    return {
+      promise,
+      cancel: () => { if (timer != null) clearTimeout(timer); },
+    };
+  }
+  let cancelled = false;
+  const start = performance.now();
+  const ch = new MessageChannel();
+  const promise = new Promise<void>((resolve) => {
+    ch.port1.onmessage = () => {
+      if (cancelled) return;
+      if (performance.now() - start >= ms) {
+        ch.port1.onmessage = null;
+        ch.port1.close();
+        ch.port2.close();
+        resolve();
+      } else {
+        ch.port2.postMessage(0);
+      }
+    };
+    ch.port2.postMessage(0);
+  });
+  return {
+    promise,
+    cancel: () => {
+      cancelled = true;
+      ch.port1.onmessage = null;
+      ch.port1.close();
+      ch.port2.close();
+    },
+  };
+}
+
+// 动作后的稳定检测（事件驱动，非 sleep）。两阶段：
+//   阶段 1「活动窗口」（600ms）：等待动作影响的第一波信号（DOM 变化/长任务）——
+//     信号到达立即进入阶段 2；窗口耗尽仍无信号（动作无影响或影响超窗口）→ 放行。
+//     窗口是「等第一个信号的观察期」，不是固定等待：影响 100ms 到就 100ms 推进。
+//   阶段 2「静默判定」（250ms）：每次活动信号重启静默计时，真正安静 250ms
+//     （事件处理/渲染/debounce 都落地）即放行。
+// 信号源：① MutationObserver（childList/attributes/characterData，覆盖文字/属性修改）
+//         ② PerformanceObserver longtask（主线程繁忙）
+// 双 rAF 只作渲染 flush 锚点（动作后的第一帧），不视为活动信号。
+// maxWaitMs 只是防挂死保险，不是推进机制。返回等待耗时（≈maxWaitMs 说明超时兜底）。
+// 注意：纯网络等待（fetch 响应前无 DOM 活动）超出本检测的覆盖，用 wait_for 谓词等待。
+function waitForSettled(maxWaitMs: number): Promise<{ waited: number }> {
+  const QUIET_MS = 250;
+  const ACTIVITY_WINDOW_MS = 600;
+  const start = Date.now();
+  return new Promise((resolve) => {
+    let quiet: { cancel: () => void } | undefined;
+    let inQuiet = false;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      domObserver?.disconnect();
+      longtaskObserver?.disconnect();
+      quiet?.cancel();
+      resolve({ waited: Date.now() - start });
+    };
+    const onActivity = () => {
+      if (!inQuiet) {
+        inQuiet = true; // 阶段 1 → 2：首个影响信号
+        activity?.cancel();
+        // 补挂动态新增的 open shadow root（其后续变化 light DOM 观察器看不到）
+        for (const sr of openShadowRootsDeep(document)) {
+          try { domObserver?.observe(sr, { childList: true, subtree: true, attributes: true, characterData: true }); } catch { /* 单个 root 失败忽略 */ }
+        }
+      }
+      quiet?.cancel();
+      quiet = throttleSafeTimer(QUIET_MS);
+      quiet.promise.then(finish);
+    };
+    // 阶段 1 的观察窗口：无信号时在此放行（动作无影响 / 影响在窗口外）
+    // 计时走 throttleSafeTimer：后台 tab 的 setTimeout 被节流会拉长窗口。
+    // 后台 tab（hidden）额外问题：页面自身的 setTimeout 与 MutationObserver 回调
+    // 也被 Chrome 节流（hidden 时 1s 唤醒对齐，5 分钟后更甚）——「影响落地」本身
+    // 会被推迟、信号会迟到。窗口耗尽后追加一个节流周期确认期：影响被节流推迟到
+    // ~1s 内落地时能等到；确认期结束仍无信号才放行（此时代价是慢 ~1s，换来正确）。
+    // 深度后台（intensive throttling，节流到分钟级）等不到，用 wait_for 谓词等待。
+    const activity = throttleSafeTimer(ACTIVITY_WINDOW_MS);
+    activity.promise.then(() => {
+      if (inQuiet) return;
+      if (document.visibilityState !== "hidden") {
+        finish();
+        return;
+      }
+      const confirm = throttleSafeTimer(1000);
+      confirm.promise.then(() => {
+        if (!inQuiet) finish();
+      });
+    });
+    let domObserver: MutationObserver | undefined;
+    try {
+      domObserver = new MutationObserver(() => onActivity());
+      // MutationObserver 不穿透 shadow boundary：除 document.body 外，对当前所有
+      // open shadow root 也挂观察（shadow tree 内的文字/属性/结构变化同样算活动信号）
+      const observeRoot = (root: Document | ShadowRoot) => {
+        try {
+          domObserver?.observe(root, { childList: true, subtree: true, attributes: true, characterData: true });
+        } catch { /* 单个 root 失败忽略 */ }
+      };
+      observeRoot(document.body);
+      for (const sr of openShadowRootsDeep(document)) observeRoot(sr);
+    } catch { /* body 不存在等极端情况：跳过 DOM 信号 */ }
+    let longtaskObserver: PerformanceObserver | undefined;
+    try {
+      if (typeof PerformanceObserver !== "undefined") {
+        longtaskObserver = new PerformanceObserver(() => onActivity());
+        longtaskObserver.observe({ entryTypes: ["longtask"] });
+      }
+    } catch { /* 不支持 longtask 的浏览器：跳过 */ }
+    // 双 rAF：动作后的渲染 flush 锚点（后台 tab 不触发 rAF 时由活动窗口兜底）
+    requestAnimationFrame(() => requestAnimationFrame(() => { /* no-op */ }));
+    setTimeout(finish, maxWaitMs);
   });
 }
 
-function findByText(text: string): Element | null {
-  const q = xpathStr(text);
-  const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
-  const xpath = [
-    `//body//button[contains(normalize-space(.), ${q})]`,
-    `//body//a[contains(normalize-space(.), ${q})]`,
-    `//body//input[contains(@value, ${q})]`,
-    `//body//*[not(${hidden})][contains(normalize-space(.), ${q}) and not(./*[not(${hidden})][contains(normalize-space(.), ${q})])]`,
-  ].join(" | ");
+// wait_for 谓词等待：轮询检查条件（50ms 间隔），条件满足的瞬间立即返回（不是 sleep——
+// 100ms 落地就 100ms 返回）；超时返回 settled:false（动作本身已成功，仅影响未确认）。
+// waitFor 格式：{"selector": "..."} 找元素且可见（含 shadow 穿透）；{"text": "..."} 按可见文本找。
+async function waitForCondition(
+  waitFor: { selector?: string; text?: string },
+  timeoutMs: number,
+): Promise<{ settled: boolean; waited: number }> {
+  const start = Date.now();
+  const check = () => {
+    if (waitFor.text) return !!findByText(waitFor.text);
+    if (waitFor.selector) {
+      const el = findElement(waitFor.selector) as HTMLElement | null;
+      return !!el && isVisible(el);
+    }
+    return false;
+  };
+  if (check()) return { settled: true, waited: 0 };
+  while (Date.now() - start < timeoutMs) {
+    // throttleSafeTimer：后台 tab 的 setTimeout 被节流（~1s 对齐），轮询会因此失效
+    await throttleSafeTimer(50).promise;
+    if (check()) return { settled: true, waited: Date.now() - start };
+  }
+  return { settled: false, waited: timeoutMs };
+}
 
-  const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
+// 在指定上下文内按文本 XPath 查找第一个可见元素（light DOM 与 shadow root 共用，
+// shadow tree 内没有 body，用不带 //body// 前缀的变体）
+function evalTextXPath(xpath: string, context: Document | ShadowRoot): Element | null {
+  // Chrome 的 document.evaluate 不接受 ShadowRoot（#document-fragment）作 context node，
+  // 对 shadow tree 改按顶层子元素逐个求值（// 相对 context 节点展开，覆盖整棵子树）
+  if (context instanceof ShadowRoot) {
+    for (const child of Array.from(context.children)) {
+      const hit = evalTextXPath(xpath, child);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  const result = document.evaluate(xpath, context, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
   let el = result.iterateNext();
   while (el) {
     const htmlEl = el as HTMLElement;
     if (isVisible(htmlEl)) return htmlEl;
     el = result.iterateNext();
+  }
+  return null;
+}
+
+function findByText(text: string): Element | null {
+  const q = xpathStr(text);
+  const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
+  const bodyXpath = [
+    `//body//button[contains(normalize-space(.), ${q})]`,
+    `//body//a[contains(normalize-space(.), ${q})]`,
+    `//body//input[contains(@value, ${q})]`,
+    `//body//*[not(${hidden})][contains(normalize-space(.), ${q}) and not(./*[not(${hidden})][contains(normalize-space(.), ${q})])]`,
+  ].join(" | ");
+  const shadowXpath = bodyXpath.split("//body//").join("//");
+
+  const hit = evalTextXPath(bodyXpath, document);
+  if (hit) return hit;
+  // light DOM 未命中 → 按文档序搜索所有 open shadow root（含嵌套）
+  for (const sr of openShadowRootsDeep(document)) {
+    const h = evalTextXPath(shadowXpath, sr);
+    if (h) return h;
   }
   return null;
 }
@@ -579,16 +820,215 @@ function keyboardEventInit(
   return { key, code, keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true, ...mods };
 }
 
+// --- Shadow DOM 穿透查找 ---
+// 目标：元素命令透明穿透 open shadow root。
+// 三种方式，从显式到隐式：
+//   1. 路径标记 #shadow-root（可直接粘贴 DevTools 的完整元素路径）
+//   2. 组合器 >>>（穿透所有层级，浏览器原生不支持，这里自行实现）
+//   3. 兜底：裸选择器 / xpath / 文本在 light DOM 未命中时，按文档序自动搜索所有 open shadow root
+// 限制：closed shadow root 无法访问（.shadowRoot 为 null），只能用坐标点击（real_click）。
+
+// 收集 root 下所有 open shadow root（含嵌套），按文档序。
+// root 为 Element 时也包含其自身的 shadowRoot（>>> 穿透宿主自身边界的场景，如 `my-host >>> button`）
+function openShadowRootsDeep(root: Document | ShadowRoot | Element): ShadowRoot[] {
+  const out: ShadowRoot[] = [];
+  const walk = (r: Document | ShadowRoot | Element) => {
+    if (r instanceof Element && r.shadowRoot) {
+      out.push(r.shadowRoot);
+      walk(r.shadowRoot);
+    }
+    for (const el of Array.from(r.querySelectorAll("*"))) {
+      const sr = el.shadowRoot;
+      if (sr) {
+        out.push(sr);
+        walk(sr);
+      }
+    }
+  };
+  walk(root);
+  return out;
+}
+
+// 选择器是否含 shadow 标记（>>> 或 #shadow-root），跳过引号/括号内的出现
+function hasShadowToken(sel: string): boolean {
+  let quote: "'" | '"' | null = null;
+  let depth = 0;
+  for (let i = 0; i < sel.length; i++) {
+    const ch = sel[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "(" || ch === "[") { depth++; continue; }
+    if (ch === ")" || ch === "]") { depth = Math.max(0, depth - 1); continue; }
+    if (depth > 0) continue;
+    if (ch === ">" && sel[i + 1] === ">" && sel[i + 2] === ">") return true;
+    if (ch === "#" && sel.startsWith("shadow-root", i + 1)) {
+      const after = sel[i + 1 + "shadow-root".length];
+      if (after === undefined || !/[a-zA-Z0-9_-]/.test(after)) return true;
+    }
+  }
+  return false;
+}
+
+// 路径 token：CSS 段 / #shadow-root 边界 / >>> 边界
+interface ShadowPathToken {
+  kind: "css" | "shadowroot" | "pierce";
+  value: string;
+}
+
+// 把含 shadow 标记的路径拆成 token（括号深度与引号感知，避免拆坏 :nth-child / [attr="a > b"]）
+function tokenizeShadowPath(sel: string): ShadowPathToken[] {
+  const tokens: ShadowPathToken[] = [];
+  let quote: "'" | '"' | null = null;
+  let depth = 0;
+  let cur = "";
+  const flush = () => {
+    const s = cur.trim();
+    if (s) tokens.push({ kind: "css", value: s });
+    cur = "";
+  };
+  for (let i = 0; i < sel.length; i++) {
+    const ch = sel[i];
+    if (quote) {
+      cur += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === "(" || ch === "[") { depth++; cur += ch; continue; }
+    if (ch === ")" || ch === "]") { depth = Math.max(0, depth - 1); cur += ch; continue; }
+    if (depth > 0) { cur += ch; continue; }
+    if (ch === ">" && sel[i + 1] === ">" && sel[i + 2] === ">") {
+      flush();
+      tokens.push({ kind: "pierce", value: ">>>" });
+      i += 2;
+      continue;
+    }
+    if (ch === ">") {
+      flush();
+      continue;
+    }
+    if (ch === "#" && sel.startsWith("shadow-root", i + 1)) {
+      const after = sel[i + 1 + "shadow-root".length];
+      if (after === undefined || !/[a-zA-Z0-9_-]/.test(after)) {
+        flush();
+        tokens.push({ kind: "shadowroot", value: "#shadow-root" });
+        i += "shadow-root".length;
+        continue;
+      }
+    }
+    cur += ch;
+  }
+  flush();
+  return tokens;
+}
+
+type ShadowCtx = Document | ShadowRoot | Element;
+
+// 在上下文集合内匹配一个 CSS 段；未命中时兜底在 open shadow root 内再搜
+// （宿主本身嵌在 shadow 里、或路径省略了 #shadow-root 标记时仍可用）
+function matchCssSegment(segment: string, contexts: ShadowCtx[]): ShadowCtx[] {
+  const out: ShadowCtx[] = [];
+  for (const ctx of contexts) {
+    try {
+      for (const el of Array.from(ctx.querySelectorAll(segment))) out.push(el);
+    } catch { /* 非法段选择器：跳过该上下文 */ }
+  }
+  if (out.length > 0) return out;
+  for (const ctx of contexts) {
+    for (const sr of openShadowRootsDeep(ctx)) {
+      try {
+        for (const el of Array.from(sr.querySelectorAll(segment))) out.push(el);
+      } catch { /* 同上 */ }
+    }
+  }
+  return out;
+}
+
+// 路径行走：CSS 段在当前候选内查找，#shadow-root 取宿主的 shadowRoot，>>> 穿透所有层。
+// 返回全部命中（可能含 ShadowRoot 本身，调用方过滤 Element）。
+function walkShadowPath(sel: string): ShadowCtx[] {
+  const tokens = tokenizeShadowPath(sel);
+  let cands: ShadowCtx[] = []; // 空 = 从 document 开始
+  for (const tok of tokens) {
+    if (tok.kind === "css") {
+      const contexts = cands.length > 0 ? cands : [document];
+      cands = Array.from(new Set(matchCssSegment(tok.value, contexts)));
+      if (cands.length === 0) return [];
+    } else if (tok.kind === "shadowroot") {
+      cands = cands
+        .filter((c): c is Element => c instanceof Element && !!c.shadowRoot)
+        .map((c) => c.shadowRoot as ShadowRoot);
+      if (cands.length === 0) return [];
+    } else {
+      // >>>
+      const next: ShadowCtx[] = [];
+      for (const c of cands) {
+        for (const sr of openShadowRootsDeep(c)) next.push(sr);
+      }
+      cands = Array.from(new Set(next));
+      if (cands.length === 0) return [];
+    }
+  }
+  return cands;
+}
+
+function findCssPierced(css: string): Element | null {
+  if (hasShadowToken(css)) {
+    const hit = walkShadowPath(css).find((c): c is Element => c instanceof Element);
+    return hit ?? null;
+  }
+  const direct = document.querySelector(css);
+  if (direct) return direct;
+  for (const sr of openShadowRootsDeep(document)) {
+    const el = sr.querySelector(css);
+    if (el) return el;
+  }
+  return null;
+}
+
+// 返回全部匹配（show / get_css 的 css: 分支用）；与 findElement 同为「light DOM 优先、shadow 兜底」
+function findAllPierced(selector: string): Element[] {
+  const css = selector.startsWith("css:") ? selector.slice(4) : selector;
+  if (hasShadowToken(css)) {
+    return walkShadowPath(css).filter((c): c is Element => c instanceof Element);
+  }
+  const direct = Array.from(document.querySelectorAll(css));
+  if (direct.length > 0) return direct;
+  const out: Element[] = [];
+  for (const sr of openShadowRootsDeep(document)) {
+    for (const el of Array.from(sr.querySelectorAll(css))) out.push(el);
+  }
+  return out;
+}
+
+function findXPathPierced(xpath: string): Element | null {
+  const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+  const direct = result.singleNodeValue as Element | null;
+  if (direct) return direct;
+  // ShadowRoot 不能作 XPath context node（#document-fragment 非法），按顶层子元素逐个求值
+  for (const sr of openShadowRootsDeep(document)) {
+    for (const child of Array.from(sr.children)) {
+      try {
+        const r = document.evaluate(xpath, child, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+        const hit = r.singleNodeValue as Element | null;
+        if (hit) return hit;
+      } catch { /* 绝对路径（如 /html/...）在 shadow tree 内无意义，跳过 */ }
+    }
+  }
+  return null;
+}
+
 function findElement(selector: string): Element | null {
   if (selector.startsWith("css:")) {
-    return document.querySelector(selector.slice(4));
+    return findCssPierced(selector.slice(4));
   }
   if (selector.startsWith("xpath:")) {
-    const xpath = selector.slice(6);
-    const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-    return result.singleNodeValue as Element | null;
+    return findXPathPierced(selector.slice(6));
   }
-  return document.querySelector(selector);
+  return findCssPierced(selector);
 }
 
 // 就绪信号：动态注入（chrome.scripting.executeScript）时告知 service worker 已注册完成；

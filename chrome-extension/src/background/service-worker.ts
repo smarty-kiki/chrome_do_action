@@ -25,6 +25,27 @@ let lastMouseY = 0;
 // 从当前模拟鼠标位置渐进移动到目标点：分小步连续移动，触发途经元素的
 // mouseover/mouseenter（真实 hover 链）。瞬移（单次 mouseMoved）不会触发
 // weui popover 等依赖逐级 hover 的组件。
+// CDP 命令带超时：Chrome 在窗口未聚焦/页面加载中等场景可能不回调，
+// 无超时会让命令挂到 server 60s 超时且 debugger 残留（finally detach 走不到）。
+// 超时后主动 detach 并 reject，保证调用方能走 finally 清理。
+function cdpSend(tabId: number, method: string, params?: Record<string, unknown>, timeoutMs = 10000): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.debugger.detach({ tabId }).catch(() => {});
+      reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    try {
+      chrome.debugger.sendCommand({ tabId }, method, params as never, (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+    }
+  });
+}
+
 async function moveMouseInSteps(tabId: number, tx: number, ty: number): Promise<void> {
   const dx = tx - lastMouseX;
   const dy = ty - lastMouseY;
@@ -33,7 +54,7 @@ async function moveMouseInSteps(tabId: number, tx: number, ty: number): Promise<
   for (let i = 1; i <= steps; i++) {
     const px = Math.round(lastMouseX + (dx * i) / steps);
     const py = Math.round(lastMouseY + (dy * i) / steps);
-    await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
       type: "mouseMoved", x: px, y: py, button: "none",
     });
     await new Promise((r) => setTimeout(r, 15));
@@ -43,7 +64,8 @@ async function moveMouseInSteps(tabId: number, tx: number, ty: number): Promise<
 }
 
 // Commands that exist in content script but are not exposed via remote control
-const BLOCKED_COMMANDS = new Set(["wait_for_page"]);
+// 内部命令：CLI 不可直接发（real_click 等经 SW 内部调用）
+const BLOCKED_COMMANDS = new Set(["wait_for_page", "wait_for_settle"]);
 
 const GROUP_TITLE = "chrome_do_action";
 let groupId: number | null = null;
@@ -157,6 +179,50 @@ async function ensureAlarm(): Promise<void> {
   }
 }
 
+/**
+ * 统一字段过滤（--field 点路径投影，作用于所有页面命令的对象型返回）。
+ * 无 _field → 原样返回；标量/数组原样返回（无字段可滤）。
+ * 路径 a.b.c 逐段取值并重建嵌套形状，输出保留完整路径
+ * （--field currentTab.url → {currentTab: {url}}，脚本 res.currentTab.url 恒可读）。
+ * 路径段遇数组时对每项投影同段路径：叶子段返回标量数组
+ * （--field newTabs.url → {newTabs: [url1, url2]}），深层段保留嵌套
+ * （--field newTabs.title.iframes 之类 → [{title: {...}}]）；缺字段的项丢弃。
+ * 不存在的路径忽略（不报错）。
+ */
+function applyFieldFilter(data: unknown, fields: string[]): unknown {
+  if (fields.length === 0) return data;
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return data;
+  const src = data as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const f of fields) {
+    const keys = f.split(".").filter(Boolean);
+    const root = keys[0];
+    if (!keys.length || !(root in src)) continue;
+    const picked = pickPath(src[root], keys.slice(1));
+    if (picked !== undefined) out[root] = picked;
+  }
+  return out;
+}
+
+function pickPath(value: unknown, keys: string[]): unknown {
+  if (keys.length === 0) return value;
+  const [k, ...rest] = keys;
+  if (Array.isArray(value)) {
+    const items = value
+      .map((item) => (item !== null && typeof item === "object" ? pickPath((item as Record<string, unknown>)[k], rest) : undefined))
+      .filter((v) => v !== undefined);
+    if (items.length === 0) return undefined;
+    if (rest.length === 0) return items; // 叶子段：标量数组
+    return items.map((picked) => ({ [k]: picked })); // 深层段：包回路径键
+  }
+  if (value !== null && typeof value === "object" && k in (value as Record<string, unknown>)) {
+    const picked = pickPath((value as Record<string, unknown>)[k], rest);
+    if (picked === undefined) return undefined;
+    return { [k]: picked }; // 每段都重建嵌套：a.b → {b: 值}，a.b.c → {b: {c: 值}}
+  }
+  return undefined;
+}
+
 interface QueuedCommand {
   cmd: CommandMessage;
   params: Record<string, unknown>;
@@ -204,7 +270,11 @@ async function sendToTab(
   const needBeforeInfo = isClick && needIframe;
 
   const sendResult = (payload: { commandId: string; success: boolean; data?: unknown; error?: string }): void => {
-    wsClient.send({ type: "command_result", payload: { ...payload, data: payload.data } });
+    // 统一出口过滤：success 时按 _field 点路径投影（getFullPageInfo 等只控制采集，输出裁剪在这里）
+    wsClient.send({
+      type: "command_result",
+      payload: { ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data },
+    });
   };
 
   // before 信息（新标签检测需要 beforeTabs；click+iframeChanges 需要 beforeFullInfo）
@@ -216,7 +286,7 @@ async function sendToTab(
       beforeTabs = await chrome.tabs.query({ windowId: tab.windowId! });
     }
     if (needBeforeInfo) {
-      beforeFullInfo = await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined);
+      beforeFullInfo = await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined, true);
     }
   } catch {
     // 预读失败不阻断命令
@@ -255,6 +325,22 @@ async function sendToTab(
     onDone?.();
     return;
   }
+  // scroll：按 frame 参数选目标 frame（缺省/auto 滚顶层；top/数字/{url} 滚指定 frame）。
+  // 不参与元素搜索（无命中概念），resolveSearchFrames 的排序保证缺省时第一项是顶层。
+  if (command === "scroll") {
+    const frames = await resolveSearchFrames(tabId, params.frame);
+    const f = frames[0];
+    if (!f) {
+      sendResult({ commandId: cmd.id!, success: false, error: "No matching frame for scroll" });
+      onDone?.();
+      return;
+    }
+    // scroll 带 settle（前台 ~0.6s、后台 ~1.6s），超时放宽到 10s，避免 1200ms 误判 missing
+    const { response } = await sendToFrame(tabId, f.frameId, msg, 10000);
+    sendResult({ commandId: cmd.id!, success: response?.success ?? false, data: response?.data, error: response?.error });
+    onDone?.();
+    return;
+  }
 
   // 坐标 click 只在顶层（elementFromPoint 语义）；其余元素命令按 frame 搜索
   const isCoordinateClick = isClick && params.x !== undefined && params.y !== undefined;
@@ -271,8 +357,12 @@ async function sendToTab(
       return;
     }
     const frames = await resolveSearchFrames(tabId, params.frame);
+    // 会跑稳定检测 + wait_for 谓词的动作命令（CS 侧最坏 ≈ 6s）超时放宽到 10s：
+    // 1200ms 默认超时会把慢响应误判为 missing → frame 导航误报 / 元素未找到误报。
+    // （导航时端口立即关闭，不受超时影响；get_text 等快命令仍用 1200ms）
+    const slowCommands = new Set(["click", "type", "keyboard", "upload_file", "paste_rich", "scroll"]);
     for (const f of frames) {
-      const r = await sendToFrame(tabId, f.frameId, msg);
+      const r = await sendToFrame(tabId, f.frameId, msg, slowCommands.has(command) ? 10000 : 1200);
       if (r.missing) {
         // 点击导致该 frame 导航：端口关闭、无响应 → 按「已点击 + 导航」处理
         if (isClick) { navigatedFallback = true; matchedFrame = f; break; }
@@ -299,6 +389,11 @@ async function sendToTab(
     }
   }
 
+  // 所有 frame 都 notFound（或无 frame 响应）时给出明确错误，避免 CLI 显示 "unknown"
+  if (!response && !navigatedFallback) {
+    response = { success: false, error: "Element not found: no match in any frame" };
+  }
+
   const frameAttribution = matchedFrame
     ? { frame: { frameId: matchedFrame.frameId, url: matchedFrame.url } }
     : {};
@@ -322,8 +417,9 @@ async function sendToTab(
     }
 
     if (isClick) {
-      const afterInfo = needCurrent
-        ? await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined)
+      // after 信息：currentTab 与 iframeChanges 对比都需要（before 按 needIframe 预取，这里必须对称）
+      const afterInfo = (needCurrent || needIframe)
+        ? await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined, true)
         : null;
       let newTabInfos: NewTabInfo[] = [];
       if (needNewTabs) {
@@ -396,7 +492,7 @@ interface FullPageInfo {
   jsErrors?: { message: string; source: string; lineno?: number }[];
 }
 
-// 需要在每个 frame 中查找元素的命令（首个命中即返回；坐标 click / scroll 只在顶层）
+// 需要在每个 frame 中查找元素的命令（首个命中即返回；坐标 click 只在顶层——elementFromPoint 语义）
 const ELEMENT_SEARCH_COMMANDS = new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect"]);
 
 interface SearchFrame {
@@ -584,7 +680,7 @@ async function broadcastClearJsErrors(tabId: number): Promise<void> {
   }
 }
 
-async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown>): Promise<FullPageInfo | null> {
+async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown>, forDiff = false): Promise<FullPageInfo | null> {
   try {
     const tab = await chrome.tabs.get(tabId);
     if (tab.status !== "complete" || !tab.url) {
@@ -600,12 +696,13 @@ async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown
     // 将 currentTab.xxx 映射为 xxx 传给 content script
     const fields = (cmdParams as Record<string, string[]> | undefined)?._field || [];
     const mappedFields = fields.map(f => f.replace(/^currentTab\./, ""));
+    // forDiff（iframeChanges 前后快照）：无论 _field 如何都必须采集完整 iframes
     // 无 _field 时默认也要取 iframes（页面结构的一部分）；有 _field 时按需采集
-    const needContentScript = fields.length === 0 || mappedFields.some(f => f === "iframes" || f === "html" || f === "jsErrors");
-    const needIframes = fields.length === 0 || fields.some(f => f === "iframes" || f === `currentTab.iframes`);
-    const needHtml = fields.some(f => f === "html" || f === `currentTab.html`);
+    const needContentScript = forDiff || fields.length === 0 || mappedFields.some(f => f === "iframes" || f === "html" || f === "jsErrors");
+    const needIframes = forDiff || fields.length === 0 || fields.some(f => f === "iframes" || f === `currentTab.iframes`);
+    const needHtml = !forDiff && fields.some(f => f === "html" || f === `currentTab.html`);
     // 默认只向内容脚本要 iframes（url/title 直接用 tabs API；html 仅在显式请求时采集）
-    const csFields = fields.length === 0 ? ["iframes"] : mappedFields;
+    const csFields = forDiff ? ["iframes"] : (fields.length === 0 ? ["iframes"] : mappedFields);
 
     if (needContentScript) {
       await waitForTabLoad(tabId);
@@ -632,17 +729,8 @@ async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown
       if (needHtml && html !== undefined) result.html = html;
     }
 
-    // 根据 _field 过滤返回字段
-    if (fields.length > 0) {
-      const filtered: Record<string, unknown> = {};
-      const hasField = (name: string) => fields.some(f => f === name || f === `currentTab.${name}`);
-      if (hasField("url")) filtered.url = result.url;
-      if (hasField("title")) filtered.title = result.title;
-      if (hasField("iframes")) filtered.iframes = result.iframes;
-      if (hasField("html")) filtered.html = result.html;
-      return filtered as unknown as FullPageInfo;
-    }
-
+    // 输出不在此处按 _field 裁剪——采集控制（needContentScript/needIframes/needHtml）
+    // 在上方完成，输出过滤统一由 sendResult 出口的 applyFieldFilter 做点路径投影。
     return result;
   } catch {
     return null;
@@ -783,9 +871,13 @@ chrome.tabGroups.onRemoved.addListener((group: chrome.tabGroups.TabGroup) => {
 
 async function handleBrowserCommand(cmd: CommandMessage): Promise<void> {
   const { command, params = {} } = cmd.payload;
+  const fieldFilter = ((params as Record<string, unknown>)._field as string[] | undefined) || [];
 
   function sendResult(payload: { commandId: string; success: boolean; data?: unknown; error?: string }): void {
-    wsClient.send({ type: "command_result", payload: { ...payload, data: payload.data } });
+    wsClient.send({
+      type: "command_result",
+      payload: { ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data },
+    });
   }
 
   try {
@@ -904,9 +996,13 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
   const selector = params.selector as string;
   // approach: 渐进移动路径 [[x,y],...]，模拟真实鼠标轨迹逐级触发 hover
   const approach = params.approach as [number, number][] | undefined;
+  const fieldFilter = ((params as Record<string, unknown>)._field as string[] | undefined) || [];
 
   function sendResult(payload: { success: boolean; data?: unknown; error?: string }): void {
-    wsClient.send({ type: "command_result", payload: { commandId: cmd.id!, ...payload } });
+    wsClient.send({
+      type: "command_result",
+      payload: { commandId: cmd.id!, ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data },
+    });
   }
 
   try {
@@ -919,7 +1015,7 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
     if (cmd.payload.command === "screenshot") {
       await chrome.debugger.attach({ tabId }, "1.3");
       try {
-        const result = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", {
+        const result = await cdpSend(tabId, "Page.captureScreenshot", {
           format: "png",
         }) as { data?: string };
         sendResult({ success: true, data: result?.data ?? null });
@@ -935,26 +1031,29 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
     let x = params.x as number | undefined;
     let y = params.y as number | undefined;
     let cdpFrameId: number | undefined;
+    let hitFrame: SearchFrame | undefined; // 元素命中的 frame（点击后向它发 wait_for_settle）
     if (x == null || y == null) {
       const frames = await resolveSearchFrames(tabId, params.frame);
       for (const f of frames) {
         const r = await sendToFrame(tabId, f.frameId, {
           type: "execute_command",
-          payload: { command: "get_rect", params: { selector } },
+          payload: { command: "get_rect", params: { selector, text: params.text } },
         }, 8000);
         if (r.missing || r.response?.notFound) continue;
         const d = r.response?.data as { x?: number; y?: number; crossOrigin?: boolean } | undefined;
         if (d?.crossOrigin) {
           cdpFrameId = f.frameId;
+          hitFrame = f;
           break;
         }
         x = d?.x;
         y = d?.y;
+        hitFrame = f;
         break;
       }
     }
     if (x == null || y == null) {
-      sendResult({ success: false, error: `Could not locate element: ${selector || "unknown"}` });
+      sendResult({ success: false, error: `Could not locate element: ${selector || params.text || "unknown"}` });
       return;
     }
 
@@ -998,11 +1097,11 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       // 3.2 短暂停留，让 hover/样式生效（有 approach 时等 popover 展开）
       await new Promise((r) => setTimeout(r, approach && approach.length ? 400 : 120));
       // 3.3 按下（触发 mousedown + focus）
-      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+      await cdpSend(tabId, "Input.dispatchMouseEvent", {
         type: "mousePressed", ...clickPoint,
       });
       // 3.4 松开（触发 mouseup，浏览器自动合成 click）
-      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+      await cdpSend(tabId, "Input.dispatchMouseEvent", {
         type: "mouseReleased", ...clickPoint,
       });
       // 鼠标保持在目标上（不移开），保留 hover 状态供后续操作（如点击 hover 工具条子项）
@@ -1010,7 +1109,16 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       await chrome.debugger.detach({ tabId }).catch(() => {});
     }
 
-    sendResult({ success: true, data: { x, y, trusted: true } });
+    // 等影响落地：向命中 frame 发事件驱动的稳定检测（DOM/长任务静默），可选 wait_for 谓词
+    let settleInfo: { settled: boolean; settledMs: number; waitFor?: { settled: boolean; waited: number } } | undefined;
+    if (hitFrame) {
+      const { response } = await sendToFrame(tabId, hitFrame.frameId, {
+        type: "execute_command",
+        payload: { command: "wait_for_settle", params: { timeout: 3000, wait_for: params.waitFor } },
+      }, 8000);
+      settleInfo = response?.data as typeof settleInfo | undefined;
+    }
+    sendResult({ success: true, data: { x, y, trusted: true, ...(settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...(settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {}) } : {}) } });
   } catch (err) {
     sendResult({ success: false, error: String(err) });
   }
@@ -1026,9 +1134,9 @@ async function getElementCenterViaCdp(
   frameId: number,
   params: Record<string, unknown>,
 ): Promise<{ x: number; y: number } | null> {
-  await chrome.debugger.sendCommand({ tabId }, "DOM.enable");
-  await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
-  await chrome.debugger.sendCommand({ tabId }, "Page.enable");
+  await cdpSend(tabId, "DOM.enable");
+  await cdpSend(tabId, "Runtime.enable");
+  await cdpSend(tabId, "Page.enable");
 
   // 收集 execution contexts（Runtime.enable 会重放已存在的 context 创建事件），
   // 选目标 frame 的默认主世界 context
@@ -1052,23 +1160,128 @@ async function getElementCenterViaCdp(
   const ctx = contexts.find((c) => c.isDefault && c.frameId === String(frameId));
   if (!ctx) return null;
 
-  // 构建查找表达式：与 content script 的 findElement / findByText 语义一致
+  // 构建查找表达式：与 content script 的 findElement / findByText 语义一致（含 shadow DOM 穿透）：
+  // 先 light DOM，未命中再按文档序搜索所有 open shadow root（含嵌套）；
+  // 支持 >>> 与 #shadow-root 路径标记（tokenize 后逐段行走）。
   const selector = params.selector as string | undefined;
   const text = params.text as string | undefined;
-  let expression: string;
-  if (text) {
-    const q = JSON.stringify(text);
-    const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
-    expression = `(()=>{const xpath=[`//body//button[contains(normalize-space(.),${q})]`,`//body//a[contains(normalize-space(.),${q})]`,`//body//input[contains(@value,${q})]`,`//body//*[not(${hidden})][contains(normalize-space(.),${q}) and not(./*[not(${hidden})][contains(normalize-space(.),${q})])]`].join(" | ");const res=document.evaluate(xpath,document,null,XPathResult.ORDERED_NODE_ITERATOR_TYPE,null);let el=res.iterateNext();while(el){const s=getComputedStyle(el);if(s.display!=="none"&&s.visibility!=="hidden"&&el.getBoundingClientRect().width>0&&el.getBoundingClientRect().height>0)return el;el=res.iterateNext()}return null})()`;
-  } else if ((selector || "").startsWith("xpath:")) {
-    const xpath = (selector || "").slice(6);
-    expression = `(()=>{const r=document.evaluate(${JSON.stringify(xpath)},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null);return r.singleNodeValue||null})()`;
-  } else {
-    const css = (selector || "").replace(/^css:/, "");
-    expression = `document.querySelector(${JSON.stringify(css)})`;
-  }
+  const expression = `(()=>{
+    const roots = function(root){
+      // root 为元素时包含其自身 shadowRoot（>>> 穿透宿主自身边界），再递归收集嵌套 root
+      const out=[];
+      const walk = function(r){
+        if(r instanceof Element && r.shadowRoot){ out.push(r.shadowRoot); walk(r.shadowRoot); }
+        r.querySelectorAll("*").forEach(function(el){
+          if(el.shadowRoot){ out.push(el.shadowRoot); walk(el.shadowRoot); }
+        });
+      };
+      walk(root);
+      return out;
+    };
+    const hasShadowToken = function(sel){
+      let quote=null, depth=0;
+      for(let i=0;i<sel.length;i++){
+        const ch=sel[i];
+        if(quote){ if(ch===quote) quote=null; continue; }
+        if(ch==="'"||ch==='"'){ quote=ch; continue; }
+        if(ch==="("||ch==="["){ depth++; continue; }
+        if(ch===")"||ch==="]"){ depth=Math.max(0,depth-1); continue; }
+        if(depth>0) continue;
+        if(ch===">"&&sel[i+1]===">"&&sel[i+2]===">") return true;
+        if(ch==="#"&&sel.slice(i+1).startsWith("shadow-root")) return true;
+      }
+      return false;
+    };
+    const q = function(ctx, seg){
+      try { return Array.from(ctx.querySelectorAll(seg)); } catch(e){ return []; }
+    };
+    // 路径行走：CSS 段在当前候选内查找，#shadow-root 取宿主 shadowRoot，>>> 穿透所有层
+    const walk = function(sel){
+      const tokens=[]; let quote=null, depth=0, cur="";
+      const flush=function(){ const s=cur.trim(); if(s) tokens.push({kind:"css",value:s}); cur=""; };
+      for(let i=0;i<sel.length;i++){
+        const ch=sel[i];
+        if(quote){ cur+=ch; if(ch===quote) quote=null; continue; }
+        if(ch==="'"||ch==='"'){ quote=ch; cur+=ch; continue; }
+        if(ch==="("||ch==="["){ depth++; cur+=ch; continue; }
+        if(ch===")"||ch==="]"){ depth=Math.max(0,depth-1); cur+=ch; continue; }
+        if(depth>0){ cur+=ch; continue; }
+        if(ch===">"&&sel[i+1]===">"&&sel[i+2]===">"){ flush(); tokens.push({kind:"pierce",value:">>>"}); i+=2; continue; }
+        if(ch===">"){ flush(); continue; }
+        if(ch==="#"&&sel.slice(i+1).startsWith("shadow-root")){ flush(); tokens.push({kind:"shadowroot",value:"#shadow-root"}); i+="shadow-root".length; continue; }
+        cur+=ch;
+      }
+      flush();
+      let cands=[];
+      for(const tok of tokens){
+        if(tok.kind==="css"){
+          const contexts = cands.length?cands:[document];
+          let next=[];
+          for(const ctx of contexts){ next=next.concat(q(ctx,tok.value)); }
+          if(next.length===0){ for(const ctx of contexts){ for(const sr of roots(ctx)){ next=next.concat(q(sr,tok.value)); } } }
+          cands=next;
+        } else if(tok.kind==="shadowroot"){
+          const next=[];
+          for(const c of cands){ if(c.shadowRoot) next.push(c.shadowRoot); }
+          cands=next;
+        } else {
+          const next=[];
+          for(const c of cands){ next=next.concat(roots(c)); }
+          cands=next;
+        }
+        if(cands.length===0) return null;
+      }
+      return cands.find(function(c){ return c instanceof Element; }) || null;
+    };
+    const findCss = function(sel){
+      if(hasShadowToken(sel)) return walk(sel);
+      const e=document.querySelector(sel);
+      if(e) return e;
+      const all=roots(document);
+      for(let i=0;i<all.length;i++){ const el=all[i].querySelector(sel); if(el) return el; }
+      return null;
+    };
+    const findXPath = function(xpath){
+      const r=document.evaluate(xpath,document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null);
+      const e=r.singleNodeValue; if(e) return e;
+      // ShadowRoot 不能作 XPath context node（#document-fragment 非法），按顶层子元素逐个求值
+      const all=roots(document);
+      for(let i=0;i<all.length;i++){
+        const kids=all[i].children||[];
+        for(let k=0;k<kids.length;k++){
+          try{ const rr=document.evaluate(xpath,kids[k],null,XPathResult.FIRST_ORDERED_NODE_TYPE,null); if(rr.singleNodeValue) return rr.singleNodeValue; }catch(err){}
+        }
+      }
+      return null;
+    };
+    const findText = function(text){
+      const qq=JSON.stringify(text);
+      const hidden="self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
+      const build=function(prefix){
+        return [prefix+"button[contains(normalize-space(.),"+qq+")]",prefix+"a[contains(normalize-space(.),"+qq+")]",prefix+"input[contains(@value,"+qq+")]",prefix+"*[not("+hidden+")][contains(normalize-space(.),"+qq+") and not(./*[not("+hidden+")][contains(normalize-space(.),"+qq+")])]"].join(" | ");
+      };
+      const vis=function(el){ const s=getComputedStyle(el); return s.display!=="none"&&s.visibility!=="hidden"&&el.getBoundingClientRect().width>0&&el.getBoundingClientRect().height>0; };
+      const res=document.evaluate(build("//body//"),document,null,XPathResult.ORDERED_NODE_ITERATOR_TYPE,null);
+      let el=res.iterateNext();
+      while(el){ if(vis(el)) return el; el=res.iterateNext(); }
+      const all=roots(document);
+      for(let i=0;i<all.length;i++){
+        const kids=all[i].children||[];
+        for(let k=0;k<kids.length;k++){
+          const rr=document.evaluate(build("//"),kids[k],null,XPathResult.ORDERED_NODE_ITERATOR_TYPE,null);
+          let e2=rr.iterateNext();
+          while(e2){ if(vis(e2)) return e2; e2=rr.iterateNext(); }
+        }
+      }
+      return null;
+    };
+    const selector=${JSON.stringify(selector ?? "")};
+    const text=${JSON.stringify(text ?? "")};
+    const found = text ? findText(text) : (selector.slice(0,6)==="xpath:" ? findXPath(selector.slice(6)) : findCss(selector.replace(/^css:/,"")));
+    return found || null;
+  })()`;
 
-  const evalRes = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+  const evalRes = await cdpSend(tabId, "Runtime.evaluate", {
     contextId: ctx.id,
     expression,
     userGesture: true,
@@ -1076,12 +1289,12 @@ async function getElementCenterViaCdp(
   const objectId = evalRes?.result?.objectId;
   if (!objectId) return null;
 
-  const nodeRes = await chrome.debugger.sendCommand({ tabId }, "DOM.requestNode", { objectId }) as { nodeId?: number };
+  const nodeRes = await cdpSend(tabId, "DOM.requestNode", { objectId }) as { nodeId?: number };
   const nodeId = nodeRes?.nodeId;
   if (nodeId == null) return null;
 
   // quads 为顶层视口坐标（含 iframe 偏移与父滚动），取包围盒中心
-  const quadsRes = await chrome.debugger.sendCommand({ tabId }, "DOM.getContentQuads", { nodeId }) as { quads?: number[][] };
+  const quadsRes = await cdpSend(tabId, "DOM.getContentQuads", { nodeId }) as { quads?: number[][] };
   const quads = quadsRes?.quads;
   if (!quads || quads.length === 0) return null;
 

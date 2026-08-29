@@ -53,8 +53,10 @@ your command → server → Chrome extension → execute in the page → structu
 | 🖼️ File uploads | `upload_file` injects a base64 image into a file input and triggers upload, bypassing the native file dialog |
 | 📸 CDP screenshots | Pixel-accurate "what you see" screenshot, saved to a local PNG — spot overlays, floating layers, scroll position |
 | 🐛 JS error collection | Keeps collecting `error` + `unhandledrejection` from page load; query or clear anytime |
-| ⚡ Selective fields (`--field`) | Ask for only the fields you need; skips unnecessary DOM work — faster commands, leaner output |
+| ⚡ Selective fields (`--field`) | Every command returning an object supports dot-path projection (`--field "clickDesc.selector,settledMs,currentTab.url"`) — only requested fields are collected and returned; faster commands, leaner output |
+| ⏳ Impact-aware returns | Action commands wait for their impact to land before returning (event-driven via DOM mutations/long tasks, no fixed sleep; `settledMs` reports the wait). For late-arriving effects, pass a `waitFor` predicate (50ms polling, returns the moment the condition holds — reliable even on background tabs) |
 | 🔎 State-aware | Detects page navigations, newly opened tabs, and iframe changes, so a command returns the world *after* the action, not a bare event |
+| 🌘 Shadow DOM support | Every element command transparently pierces open shadow roots (DevTools `#shadow-root` paths / `>>>` / bare-selector fallback); `get_page_info` html includes shadow content by default |
 | 🔁 High availability | Auto-reconnect, per-tab serial command queue, automatic content-script re-injection |
 | 🌐 Multi-browser | One server connects to multiple browser clients; target any one by node name |
 
@@ -246,7 +248,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | `get_js_errors` | `send <id> get_js_errors <tab>` | Get accumulated JS errors |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | Clear accumulated JS errors |
 | `screenshot` | `send <id> screenshot <tab> <params>` | CDP screenshot; `{"path":"/tmp/s.png"}` saves locally |
-| `scroll` | `send <id> scroll <tab> <params>` | Scroll the page (smooth; returns once the DOM settles) |
+| `scroll` | `send <id> scroll <tab> <params>` | Scroll: window/iframe (via `frame`) or `{"selector":...}` to an element (scrollable container / scrollIntoView, pierces shadow DOM); smooth, returns once the DOM settles |
 
 ### Locating an element for click / real_click
 
@@ -256,7 +258,11 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 {"x": 100, "y": 200}                 // by coordinates
 {"selector": "css:button"}           // explicit CSS prefix
 {"selector": "xpath://btn"}          // XPath prefix
+{"selector": "xhs-btn > #shadow-root > div > button"}  // DevTools shadow path
+{"selector": "xhs-btn >>> button"}   // pierce all shadow levels
 ```
+
+All element commands automatically pierce **open shadow roots**: if a bare selector (or `xpath:` / `text`) misses in light DOM, cda searches every open shadow root in document order (nested included). `real_click` embeds the same piercing logic in its CDP locating expression. Closed shadow roots stay inaccessible (`.shadowRoot` is null) — fall back to coordinate clicks (`real_click {"x":..., "y":...}`), which bypass the boundary at the render layer. `get_page_info --field html` serializes shadow content by default: open roots appear inline as `<template shadowrootmode="open">` inside their hosts; pages without shadow DOM output exactly as before.
 
 ### Params for the other commands
 
@@ -301,15 +307,16 @@ progressive mouseMoved (fires mouseover/mouseenter/hover)
 
 ### 3. `--field` selective collection
 
-The field list is evaluated inside the browser *before* running the command, so **unnecessary DOM work is skipped** — faster and lighter.
+The field list is evaluated inside the browser *before* running the command, so **unnecessary DOM work is skipped** — and the response is trimmed via dot-path projection at the exit — faster and lighter.
 
 ```bash
-cda send OfficePC click current '{"text":"Login"}' --field "currentTab.url,navigated"
-cda send OfficePC click current '{"text":"Open"}' --field "newTabs"
+cda send OfficePC click current '{"text":"Login"}' --field "clickDesc.selector,settledMs,currentTab.url"
+cda send OfficePC click current '{"text":"Open"}' --field "newTabs.url"
 cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges"
+cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-Supported by `click`, `get_page_info` and `open`. Paths are comma-separated, dotted for nesting: `currentTab.url`, `currentTab.iframes`, `navigated`, `newTabs`, `iframeChanges`, `jsErrors`, …
+Supported by **every command returning an object**: `click`/`type`/`keyboard`/`upload_file`/`paste_rich`/`scroll`/`show`/`hide`/`get_rect`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`. Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and has nothing to filter.
 
 ### 4. State awareness — commands return the world after the action
 

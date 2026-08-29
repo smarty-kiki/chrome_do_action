@@ -192,6 +192,24 @@
   var REAL_CLICK_COMMANDS = /* @__PURE__ */ new Set(["real_click", "screenshot"]);
   var lastMouseX = 0;
   var lastMouseY = 0;
+  function cdpSend(tabId, method, params, timeoutMs = 1e4) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        chrome.debugger.detach({ tabId }).catch(() => {
+        });
+        reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      try {
+        chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        });
+      } catch (err) {
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+  }
   async function moveMouseInSteps(tabId, tx, ty) {
     const dx = tx - lastMouseX;
     const dy = ty - lastMouseY;
@@ -200,7 +218,7 @@
     for (let i = 1; i <= steps; i++) {
       const px = Math.round(lastMouseX + dx * i / steps);
       const py = Math.round(lastMouseY + dy * i / steps);
-      await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+      await cdpSend(tabId, "Input.dispatchMouseEvent", {
         type: "mouseMoved",
         x: px,
         y: py,
@@ -211,7 +229,7 @@
     lastMouseX = tx;
     lastMouseY = ty;
   }
-  var BLOCKED_COMMANDS = /* @__PURE__ */ new Set(["wait_for_page"]);
+  var BLOCKED_COMMANDS = /* @__PURE__ */ new Set(["wait_for_page", "wait_for_settle"]);
   var GROUP_TITLE = "chrome_do_action";
   var groupId = null;
   var groupWindowId = null;
@@ -307,6 +325,36 @@
       chrome.alarms.create("keepalive", { periodInMinutes: 15 / 60 });
     }
   }
+  function applyFieldFilter(data, fields) {
+    if (fields.length === 0) return data;
+    if (data === null || typeof data !== "object" || Array.isArray(data)) return data;
+    const src = data;
+    const out = {};
+    for (const f of fields) {
+      const keys = f.split(".").filter(Boolean);
+      const root = keys[0];
+      if (!keys.length || !(root in src)) continue;
+      const picked = pickPath(src[root], keys.slice(1));
+      if (picked !== void 0) out[root] = picked;
+    }
+    return out;
+  }
+  function pickPath(value, keys) {
+    if (keys.length === 0) return value;
+    const [k, ...rest] = keys;
+    if (Array.isArray(value)) {
+      const items = value.map((item) => item !== null && typeof item === "object" ? pickPath(item[k], rest) : void 0).filter((v) => v !== void 0);
+      if (items.length === 0) return void 0;
+      if (rest.length === 0) return items;
+      return items.map((picked) => ({ [k]: picked }));
+    }
+    if (value !== null && typeof value === "object" && k in value) {
+      const picked = pickPath(value[k], rest);
+      if (picked === void 0) return void 0;
+      return { [k]: picked };
+    }
+    return void 0;
+  }
   var tabQueues = /* @__PURE__ */ new Map();
   function enqueueCommand(tabId, cmd, params) {
     const entry = tabQueues.get(tabId) || [];
@@ -340,7 +388,10 @@
     const needNewTabs = fieldFilter.length === 0 || fieldFilter.some((f) => f === "newTabs" || f.startsWith("newTabs."));
     const needBeforeInfo = isClick && needIframe;
     const sendResult = (payload) => {
-      wsClient.send({ type: "command_result", payload: { ...payload, data: payload.data } });
+      wsClient.send({
+        type: "command_result",
+        payload: { ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data }
+      });
     };
     let beforeTabs = [];
     let beforeFullInfo = null;
@@ -350,7 +401,7 @@
         beforeTabs = await chrome.tabs.query({ windowId: tab.windowId });
       }
       if (needBeforeInfo) {
-        beforeFullInfo = await getFullPageInfo(tabId, cmd.payload.params);
+        beforeFullInfo = await getFullPageInfo(tabId, cmd.payload.params, true);
       }
     } catch {
     }
@@ -384,6 +435,19 @@
       onDone?.();
       return;
     }
+    if (command === "scroll") {
+      const frames = await resolveSearchFrames(tabId, params.frame);
+      const f = frames[0];
+      if (!f) {
+        sendResult({ commandId: cmd.id, success: false, error: "No matching frame for scroll" });
+        onDone?.();
+        return;
+      }
+      const { response: response2 } = await sendToFrame(tabId, f.frameId, msg, 1e4);
+      sendResult({ commandId: cmd.id, success: response2?.success ?? false, data: response2?.data, error: response2?.error });
+      onDone?.();
+      return;
+    }
     const isCoordinateClick = isClick && params.x !== void 0 && params.y !== void 0;
     const searchable = ELEMENT_SEARCH_COMMANDS.has(command) && !isCoordinateClick;
     let response;
@@ -396,8 +460,9 @@
         return;
       }
       const frames = await resolveSearchFrames(tabId, params.frame);
+      const slowCommands = /* @__PURE__ */ new Set(["click", "type", "keyboard", "upload_file", "paste_rich", "scroll"]);
       for (const f of frames) {
-        const r = await sendToFrame(tabId, f.frameId, msg);
+        const r = await sendToFrame(tabId, f.frameId, msg, slowCommands.has(command) ? 1e4 : 1200);
         if (r.missing) {
           if (isClick) {
             navigatedFallback = true;
@@ -424,6 +489,9 @@
         break;
       }
     }
+    if (!response && !navigatedFallback) {
+      response = { success: false, error: "Element not found: no match in any frame" };
+    }
     const frameAttribution = matchedFrame ? { frame: { frameId: matchedFrame.frameId, url: matchedFrame.url } } : {};
     try {
       const wasNavigated = navigatedFallback || response?.data?.navigated === true;
@@ -440,7 +508,7 @@
         return;
       }
       if (isClick) {
-        const afterInfo = needCurrent ? await getFullPageInfo(tabId, cmd.payload.params) : null;
+        const afterInfo = needCurrent || needIframe ? await getFullPageInfo(tabId, cmd.payload.params, true) : null;
         let newTabInfos = [];
         if (needNewTabs) {
           try {
@@ -634,7 +702,7 @@
       });
     }
   }
-  async function getFullPageInfo(tabId, cmdParams) {
+  async function getFullPageInfo(tabId, cmdParams, forDiff = false) {
     try {
       const tab = await chrome.tabs.get(tabId);
       if (tab.status !== "complete" || !tab.url) {
@@ -648,10 +716,10 @@
       };
       const fields = cmdParams?._field || [];
       const mappedFields = fields.map((f) => f.replace(/^currentTab\./, ""));
-      const needContentScript = fields.length === 0 || mappedFields.some((f) => f === "iframes" || f === "html" || f === "jsErrors");
-      const needIframes = fields.length === 0 || fields.some((f) => f === "iframes" || f === `currentTab.iframes`);
-      const needHtml = fields.some((f) => f === "html" || f === `currentTab.html`);
-      const csFields = fields.length === 0 ? ["iframes"] : mappedFields;
+      const needContentScript = forDiff || fields.length === 0 || mappedFields.some((f) => f === "iframes" || f === "html" || f === "jsErrors");
+      const needIframes = forDiff || fields.length === 0 || fields.some((f) => f === "iframes" || f === `currentTab.iframes`);
+      const needHtml = !forDiff && fields.some((f) => f === "html" || f === `currentTab.html`);
+      const csFields = forDiff ? ["iframes"] : fields.length === 0 ? ["iframes"] : mappedFields;
       if (needContentScript) {
         await waitForTabLoad(tabId);
         let iframes = null;
@@ -671,15 +739,6 @@
           result.iframes = await enrichCrossOriginIframes(tabId, iframes, needIframes);
         }
         if (needHtml && html !== void 0) result.html = html;
-      }
-      if (fields.length > 0) {
-        const filtered = {};
-        const hasField = (name) => fields.some((f) => f === name || f === `currentTab.${name}`);
-        if (hasField("url")) filtered.url = result.url;
-        if (hasField("title")) filtered.title = result.title;
-        if (hasField("iframes")) filtered.iframes = result.iframes;
-        if (hasField("html")) filtered.html = result.html;
-        return filtered;
       }
       return result;
     } catch {
@@ -792,8 +851,12 @@
   });
   async function handleBrowserCommand(cmd) {
     const { command, params = {} } = cmd.payload;
+    const fieldFilter = params._field || [];
     function sendResult(payload) {
-      wsClient.send({ type: "command_result", payload: { ...payload, data: payload.data } });
+      wsClient.send({
+        type: "command_result",
+        payload: { ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data }
+      });
     }
     try {
       switch (command) {
@@ -897,8 +960,12 @@
     const tabId = params.tabId;
     const selector = params.selector;
     const approach = params.approach;
+    const fieldFilter = params._field || [];
     function sendResult(payload) {
-      wsClient.send({ type: "command_result", payload: { commandId: cmd.id, ...payload } });
+      wsClient.send({
+        type: "command_result",
+        payload: { commandId: cmd.id, ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data }
+      });
     }
     try {
       if (tabId == null) {
@@ -908,7 +975,7 @@
       if (cmd.payload.command === "screenshot") {
         await chrome.debugger.attach({ tabId }, "1.3");
         try {
-          const result = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", {
+          const result = await cdpSend(tabId, "Page.captureScreenshot", {
             format: "png"
           });
           sendResult({ success: true, data: result?.data ?? null });
@@ -921,26 +988,29 @@
       let x = params.x;
       let y = params.y;
       let cdpFrameId;
+      let hitFrame;
       if (x == null || y == null) {
         const frames = await resolveSearchFrames(tabId, params.frame);
         for (const f of frames) {
           const r = await sendToFrame(tabId, f.frameId, {
             type: "execute_command",
-            payload: { command: "get_rect", params: { selector } }
+            payload: { command: "get_rect", params: { selector, text: params.text } }
           }, 8e3);
           if (r.missing || r.response?.notFound) continue;
           const d = r.response?.data;
           if (d?.crossOrigin) {
             cdpFrameId = f.frameId;
+            hitFrame = f;
             break;
           }
           x = d?.x;
           y = d?.y;
+          hitFrame = f;
           break;
         }
       }
       if (x == null || y == null) {
-        sendResult({ success: false, error: `Could not locate element: ${selector || "unknown"}` });
+        sendResult({ success: false, error: `Could not locate element: ${selector || params.text || "unknown"}` });
         return;
       }
       await chrome.debugger.attach({ tabId }, "1.3");
@@ -971,11 +1041,11 @@
         }
         await moveMouseInSteps(tabId, x, y);
         await new Promise((r) => setTimeout(r, approach && approach.length ? 400 : 120));
-        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        await cdpSend(tabId, "Input.dispatchMouseEvent", {
           type: "mousePressed",
           ...clickPoint
         });
-        await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+        await cdpSend(tabId, "Input.dispatchMouseEvent", {
           type: "mouseReleased",
           ...clickPoint
         });
@@ -983,15 +1053,23 @@
         await chrome.debugger.detach({ tabId }).catch(() => {
         });
       }
-      sendResult({ success: true, data: { x, y, trusted: true } });
+      let settleInfo;
+      if (hitFrame) {
+        const { response } = await sendToFrame(tabId, hitFrame.frameId, {
+          type: "execute_command",
+          payload: { command: "wait_for_settle", params: { timeout: 3e3, wait_for: params.waitFor } }
+        }, 8e3);
+        settleInfo = response?.data;
+      }
+      sendResult({ success: true, data: { x, y, trusted: true, ...settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {} } : {} } });
     } catch (err) {
       sendResult({ success: false, error: String(err) });
     }
   }
   async function getElementCenterViaCdp(tabId, frameId, params) {
-    await chrome.debugger.sendCommand({ tabId }, "DOM.enable");
-    await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
-    await chrome.debugger.sendCommand({ tabId }, "Page.enable");
+    await cdpSend(tabId, "DOM.enable");
+    await cdpSend(tabId, "Runtime.enable");
+    await cdpSend(tabId, "Page.enable");
     const contexts = [];
     const onEvent = (_src, method, eventParams) => {
       if (method === "Runtime.executionContextCreated") {
@@ -1012,29 +1090,132 @@
     if (!ctx) return null;
     const selector = params.selector;
     const text = params.text;
-    let expression;
-    if (text) {
-      const q = JSON.stringify(text);
-      const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
-      expression = `(()=>{const xpath=[`;
-    } else if ((selector || "").startsWith("xpath:")) {
-      const xpath = (selector || "").slice(6);
-      expression = `(()=>{const r=document.evaluate(${JSON.stringify(xpath)},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null);return r.singleNodeValue||null})()`;
-    } else {
-      const css = (selector || "").replace(/^css:/, "");
-      expression = `document.querySelector(${JSON.stringify(css)})`;
-    }
-    const evalRes = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+    const expression = `(()=>{
+    const roots = function(root){
+      // root \u4E3A\u5143\u7D20\u65F6\u5305\u542B\u5176\u81EA\u8EAB shadowRoot\uFF08>>> \u7A7F\u900F\u5BBF\u4E3B\u81EA\u8EAB\u8FB9\u754C\uFF09\uFF0C\u518D\u9012\u5F52\u6536\u96C6\u5D4C\u5957 root
+      const out=[];
+      const walk = function(r){
+        if(r instanceof Element && r.shadowRoot){ out.push(r.shadowRoot); walk(r.shadowRoot); }
+        r.querySelectorAll("*").forEach(function(el){
+          if(el.shadowRoot){ out.push(el.shadowRoot); walk(el.shadowRoot); }
+        });
+      };
+      walk(root);
+      return out;
+    };
+    const hasShadowToken = function(sel){
+      let quote=null, depth=0;
+      for(let i=0;i<sel.length;i++){
+        const ch=sel[i];
+        if(quote){ if(ch===quote) quote=null; continue; }
+        if(ch==="'"||ch==='"'){ quote=ch; continue; }
+        if(ch==="("||ch==="["){ depth++; continue; }
+        if(ch===")"||ch==="]"){ depth=Math.max(0,depth-1); continue; }
+        if(depth>0) continue;
+        if(ch===">"&&sel[i+1]===">"&&sel[i+2]===">") return true;
+        if(ch==="#"&&sel.slice(i+1).startsWith("shadow-root")) return true;
+      }
+      return false;
+    };
+    const q = function(ctx, seg){
+      try { return Array.from(ctx.querySelectorAll(seg)); } catch(e){ return []; }
+    };
+    // \u8DEF\u5F84\u884C\u8D70\uFF1ACSS \u6BB5\u5728\u5F53\u524D\u5019\u9009\u5185\u67E5\u627E\uFF0C#shadow-root \u53D6\u5BBF\u4E3B shadowRoot\uFF0C>>> \u7A7F\u900F\u6240\u6709\u5C42
+    const walk = function(sel){
+      const tokens=[]; let quote=null, depth=0, cur="";
+      const flush=function(){ const s=cur.trim(); if(s) tokens.push({kind:"css",value:s}); cur=""; };
+      for(let i=0;i<sel.length;i++){
+        const ch=sel[i];
+        if(quote){ cur+=ch; if(ch===quote) quote=null; continue; }
+        if(ch==="'"||ch==='"'){ quote=ch; cur+=ch; continue; }
+        if(ch==="("||ch==="["){ depth++; cur+=ch; continue; }
+        if(ch===")"||ch==="]"){ depth=Math.max(0,depth-1); cur+=ch; continue; }
+        if(depth>0){ cur+=ch; continue; }
+        if(ch===">"&&sel[i+1]===">"&&sel[i+2]===">"){ flush(); tokens.push({kind:"pierce",value:">>>"}); i+=2; continue; }
+        if(ch===">"){ flush(); continue; }
+        if(ch==="#"&&sel.slice(i+1).startsWith("shadow-root")){ flush(); tokens.push({kind:"shadowroot",value:"#shadow-root"}); i+="shadow-root".length; continue; }
+        cur+=ch;
+      }
+      flush();
+      let cands=[];
+      for(const tok of tokens){
+        if(tok.kind==="css"){
+          const contexts = cands.length?cands:[document];
+          let next=[];
+          for(const ctx of contexts){ next=next.concat(q(ctx,tok.value)); }
+          if(next.length===0){ for(const ctx of contexts){ for(const sr of roots(ctx)){ next=next.concat(q(sr,tok.value)); } } }
+          cands=next;
+        } else if(tok.kind==="shadowroot"){
+          const next=[];
+          for(const c of cands){ if(c.shadowRoot) next.push(c.shadowRoot); }
+          cands=next;
+        } else {
+          const next=[];
+          for(const c of cands){ next=next.concat(roots(c)); }
+          cands=next;
+        }
+        if(cands.length===0) return null;
+      }
+      return cands.find(function(c){ return c instanceof Element; }) || null;
+    };
+    const findCss = function(sel){
+      if(hasShadowToken(sel)) return walk(sel);
+      const e=document.querySelector(sel);
+      if(e) return e;
+      const all=roots(document);
+      for(let i=0;i<all.length;i++){ const el=all[i].querySelector(sel); if(el) return el; }
+      return null;
+    };
+    const findXPath = function(xpath){
+      const r=document.evaluate(xpath,document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null);
+      const e=r.singleNodeValue; if(e) return e;
+      // ShadowRoot \u4E0D\u80FD\u4F5C XPath context node\uFF08#document-fragment \u975E\u6CD5\uFF09\uFF0C\u6309\u9876\u5C42\u5B50\u5143\u7D20\u9010\u4E2A\u6C42\u503C
+      const all=roots(document);
+      for(let i=0;i<all.length;i++){
+        const kids=all[i].children||[];
+        for(let k=0;k<kids.length;k++){
+          try{ const rr=document.evaluate(xpath,kids[k],null,XPathResult.FIRST_ORDERED_NODE_TYPE,null); if(rr.singleNodeValue) return rr.singleNodeValue; }catch(err){}
+        }
+      }
+      return null;
+    };
+    const findText = function(text){
+      const qq=JSON.stringify(text);
+      const hidden="self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
+      const build=function(prefix){
+        return [prefix+"button[contains(normalize-space(.),"+qq+")]",prefix+"a[contains(normalize-space(.),"+qq+")]",prefix+"input[contains(@value,"+qq+")]",prefix+"*[not("+hidden+")][contains(normalize-space(.),"+qq+") and not(./*[not("+hidden+")][contains(normalize-space(.),"+qq+")])]"].join(" | ");
+      };
+      const vis=function(el){ const s=getComputedStyle(el); return s.display!=="none"&&s.visibility!=="hidden"&&el.getBoundingClientRect().width>0&&el.getBoundingClientRect().height>0; };
+      const res=document.evaluate(build("//body//"),document,null,XPathResult.ORDERED_NODE_ITERATOR_TYPE,null);
+      let el=res.iterateNext();
+      while(el){ if(vis(el)) return el; el=res.iterateNext(); }
+      const all=roots(document);
+      for(let i=0;i<all.length;i++){
+        const kids=all[i].children||[];
+        for(let k=0;k<kids.length;k++){
+          const rr=document.evaluate(build("//"),kids[k],null,XPathResult.ORDERED_NODE_ITERATOR_TYPE,null);
+          let e2=rr.iterateNext();
+          while(e2){ if(vis(e2)) return e2; e2=rr.iterateNext(); }
+        }
+      }
+      return null;
+    };
+    const selector=${JSON.stringify(selector ?? "")};
+    const text=${JSON.stringify(text ?? "")};
+    const found = text ? findText(text) : (selector.slice(0,6)==="xpath:" ? findXPath(selector.slice(6)) : findCss(selector.replace(/^css:/,"")));
+    return found || null;
+  })()`;
+    const evalRes = await cdpSend(tabId, "Runtime.evaluate", {
       contextId: ctx.id,
       expression,
       userGesture: true
     });
     const objectId = evalRes?.result?.objectId;
     if (!objectId) return null;
-    const nodeRes = await chrome.debugger.sendCommand({ tabId }, "DOM.requestNode", { objectId });
+    const nodeRes = await cdpSend(tabId, "DOM.requestNode", { objectId });
     const nodeId = nodeRes?.nodeId;
     if (nodeId == null) return null;
-    const quadsRes = await chrome.debugger.sendCommand({ tabId }, "DOM.getContentQuads", { nodeId });
+    const quadsRes = await cdpSend(tabId, "DOM.getContentQuads", { nodeId });
     const quads = quadsRes?.quads;
     if (!quads || quads.length === 0) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;

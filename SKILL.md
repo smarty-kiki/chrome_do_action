@@ -90,17 +90,20 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | `get_page_info` | `send <id> get_page_info <tab>` | 页面信息（url/title/iframes），支持 --field；iframes 对**跨域也补全 url/html** |
 | `screenshot` | `send <id> screenshot <tab> '{"path":"/tmp/shot.png"}'` | CDP 截图（只读），操作前确认页面真实状态 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取页面 JS 报错 |
-| `scroll` | `send <id> scroll <tab> '{"y":500}'` | 滚动页面 |
+| `scroll` | `send <id> scroll <tab> '{"y":500}'` | 滚动页面：无 selector 滚窗口/iframe（`frame` 参数指定）；`{"selector":"..."}` 滚到元素（可滚动容器内滚、普通元素 scrollIntoView，穿透 shadow） |
 
 ### 关键技巧
 
-1. **坐标必须截图确认**：DOM 快照可能有顶部隐藏模板，get_rect 会返回错误坐标（曾把 y=824 误报成 224）。先 `screenshot` 看真实页面再定位。
-2. **hover 菜单用 show 解决**：触发不了 hover 时别硬怼事件模拟，`show` 强制显示元素后普通 `click` 即可命中。操作完 `hide` 还原。
-3. **iframe 自动搜索**：元素命令默认顶层优先搜遍所有 iframe（含跨域），返回带命中 `frame.url`。目标在 iframe 内且自动搜索未命中时，加 `frame` 参数固定：`{"selector":"...","frame":{"url":"子串"}}`（跨域最稳）或 `{"frame":0}`（第 N 个顶层 iframe）。
-4. **paste_rich 传参**：HTML 含英文引号时 shell 单引号会截断参数，用 Node `spawnSync`（参数数组，不经 shell）传参。
-5. **富文本输入**：公众号正文是 ProseMirror（contenteditable），用 `type` 支持富文本；标题 `#title`（textarea）。
-6. **登录态**：直接复用本机已登录浏览器，无需处理 cookie。
-7. **发送按键**：表单提交/关闭弹窗/方向键导航等，用 `keyboard` 向目标元素发键：`send <id> keyboard current '{"selector":"#title","key":"Enter"}'`；组合键加 `ctrl`/`shift` 等布尔参数。合成事件触发页面 keydown 处理器，但不会触发浏览器原生默认行为（如原生表单提交、Tab 切换焦点）。
+1. **等影响落地（settle）**：click/type/keyboard/upload_file/paste_rich/scroll/real_click 返回前会事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），返回 `settledMs`。影响落地晚（服务端请求后才渲染、长 debounce）时加 `waitFor` 谓词：`'{"selector":"#btn","waitFor":{"text":"发布成功"}}'`——50ms 轮询、条件满足瞬间返回 `{"settled":true,"waited":615}`。后台 tab 的 Chrome 定时器节流会让 settle 追加 ~1s 确认期，深度后台等不到就用 waitFor 或把 tab 切前台。
+2. **坐标必须截图确认**：DOM 快照可能有顶部隐藏模板，get_rect 会返回错误坐标（曾把 y=824 误报成 224）。先 `screenshot` 看真实页面再定位。
+3. **hover 菜单用 show 解决**：触发不了 hover 时别硬怼事件模拟，`show` 强制显示元素后普通 `click` 即可命中。操作完 `hide` 还原。
+4. **iframe 自动搜索**：元素命令默认顶层优先搜遍所有 iframe（含跨域），返回带命中 `frame.url`。目标在 iframe 内且自动搜索未命中时，加 `frame` 参数固定：`{"selector":"...","frame":{"url":"子串"}}`（跨域最稳）或 `{"frame":0}`（第 N 个顶层 iframe）。
+5. **shadow DOM 自动穿透**：Web Components 站点（小红书后台等）的按钮/编辑器在 shadow root 里，普通选择器找不到。三种方式：① 直接粘贴 DevTools 元素路径（含 `#shadow-root` 标记）；② `selector: "xhs-publish-btn >>> button"`（`>>>` 穿透所有层）；③ 裸选择器/xpath/text 会自动兜底搜索 open shadow root。closed root 只能用坐标 `real_click {"x":..,"y":..}`。`get_page_info --field html` 默认含 shadow 内容（`<template shadowrootmode="open">` 内联）。
+6. **paste_rich 传参**：HTML 含英文引号时 shell 单引号会截断参数，用 Node `spawnSync`（参数数组，不经 shell）传参。
+7. **富文本输入**：公众号正文是 ProseMirror（contenteditable），用 `type` 支持富文本；标题 `#title`（textarea）。
+8. **登录态**：直接复用本机已登录浏览器，无需处理 cookie。
+9. **发送按键**：表单提交/关闭弹窗/方向键导航等，用 `keyboard` 向目标元素发键：`send <id> keyboard current '{"selector":"#title","key":"Enter"}'`；组合键加 `ctrl`/`shift` 等布尔参数。合成事件触发页面 keydown 处理器，但不会触发浏览器原生默认行为（如原生表单提交、Tab 切换焦点）。
+10. **--field 精确取结果**：所有返回对象的命令都支持 `--field` 点路径裁剪：`--field "clickDesc.selector,settledMs,currentTab.url"` → `{clickDesc:{selector},settledMs,currentTab:{url}}`；`--field "newTabs.url"` → `{newTabs:[url,...]}`。只取需要字段，减少输出、加快响应（不采集未请求的页面信息）。`get_text` 返回纯文本无字段可滤。
 
 ## 实战：公众号文章全自动化
 

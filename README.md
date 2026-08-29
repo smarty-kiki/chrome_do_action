@@ -53,9 +53,11 @@
 | 🖼️ 图片上传 | `upload_file` 将 base64 图片注入文件输入框并触发上传，绕过系统文件对话框 |
 | 📸 CDP 截图 | 对页面「所见即所得」截图，本地自动保存 PNG，排查元素遮挡/浮层/滚动位置 |
 | 🐛 JS 错误收集 | 页面加载即持续监听 `error` 与 `unhandledrejection`，随时查询/清空 |
-| ⚡ 按需采集 `--field` | 指定返回字段，跳过不必要的 DOM 操作，命令更快、结果更精简 |
+| ⚡ 按需采集 `--field` | 所有返回对象的命令都支持点路径投影（`--field "clickDesc.selector,settledMs,currentTab.url"`），只采集/返回需要的字段，命令更快、结果更精简 |
+| ⏳ 等影响落地 | 操作命令返回前事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），`settledMs` 如实反映；影响晚到的场景用 `waitFor` 谓词（50ms 轮询、条件满足瞬间返回，后台 tab 亦可靠） |
 | 🔎 状态感知 | 自动检测页面跳转、新开标签页、iframe 变化，命令返回「操作后的世界」而非裸事件 |
 | 🧩 iframe 支持 | 所有元素命令自动搜索 iframe（含跨域）并可直接读写操作，`iframes` 元数据对跨域也补全 `url`/`html` |
+| 🌘 shadow DOM 支持 | 所有元素命令透明穿透 open shadow root（DevTools 路径 `#shadow-root` / `>>>` / 裸选择器自动兜底），`get_page_info` 的 html 默认包含 shadow 内容 |
 | 🔁 高可用 | 断线自动重连、同一标签页命令串行排队、Content Script 丢失自动恢复注入 |
 | 🌐 多浏览器 | 一个服务端连接多个浏览器客户端，用节点名精确定位目标 |
 
@@ -245,7 +247,7 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取累积的 JS 错误 |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空累积的 JS 错误 |
 | `screenshot` | `send <id> screenshot <tab> <params>` | CDP 截图，`{"path":"/tmp/s.png"}` 本地保存 |
-| `scroll` | `send <id> scroll <tab> <params>` | 滚动页面（smooth，等 DOM 稳定后返回） |
+| `scroll` | `send <id> scroll <tab> <params>` | 滚动：窗口/iframe（`frame` 参数）或 `{"selector":...}` 滚到元素（可滚动容器内滚 / scrollIntoView，穿透 shadow）；smooth，等 DOM 稳定后返回 |
 
 ### click / real_click 定位方式
 
@@ -302,15 +304,16 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 
 ### 3. `--field` 按需采集
 
-在浏览器端执行命令前判断所需字段，**跳过不必要的 DOM 操作**，更快更省。
+在浏览器端执行命令前判断所需字段，**跳过不必要的 DOM 操作**，返回前统一做点路径投影裁剪，更快更省。
 
 ```bash
-cda send OfficePC click current '{"text":"登录"}' --field "currentTab.url,navigated"
-cda send OfficePC click current '{"text":"打开"}' --field "newTabs"
+cda send OfficePC click current '{"text":"登录"}' --field "clickDesc.selector,settledMs,currentTab.url"
+cda send OfficePC click current '{"text":"打开"}' --field "newTabs.url"
 cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges"
+cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-支持 `click`、`get_page_info`、`open`。字段路径逗号分隔、点号嵌套：`currentTab.url`、`currentTab.iframes`、`navigated`、`newTabs`、`iframeChanges`、`jsErrors` 等。
+**所有返回对象的命令**都支持：`click`/`type`/`keyboard`/`upload_file`/`paste_rich`/`scroll`/`show`/`hide`/`get_rect`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`。字段路径逗号分隔、点号嵌套投影：`--field a.b` 返回 `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）；路径段遇数组逐项投影（`newTabs.url` → `{newTabs: [url, ...]}`）；不存在的路径忽略。`get_text` 返回纯文本，无字段可滤。
 
 ### 4. 状态感知：操作之后自动「看结果」
 
@@ -355,6 +358,30 @@ cda send OfficePC get_text current '{"selector":"#editor","frame":0}'
 - **`real_click` 在 iframe 内同样有效**：同源复用换算坐标，跨域走 CDP 精确定位后发送 `isTrusted=true` 的真实鼠标事件链
 - **`frame` 参数**：`"auto"`（缺省，顶层优先全 frame）、`"top"`（仅顶层）、数字（顶层 iframe 序号）、`{url:"子串"}`（URL 匹配首个 frame）
 - `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；`get_page_info --field iframes` 直接看所有 frame 的元数据与内容快照
+
+### 8. shadow DOM 读写操作
+
+Web Components 站点（小红书创作后台、部分中后台系统）把发布按钮、编辑器包在 shadow root 里——浏览器原生 `querySelector` 不认 `>>>`、XPath 不穿透 shadow 边界，普通选择器全都找不到。cda 让所有元素命令**透明穿透 open shadow root**，三种方式从显式到隐式：
+
+```bash
+# 1. DevTools 路径：直接粘贴元素面板「Copy → Copy element path」的完整路径（含 #shadow-root）
+cda send OfficePC click current '{"selector":"xhs-publish-btn > #shadow-root > div > div.publish-page-publish-btn > button.ce-btn"}'
+
+# 2. >>> 组合器：穿透所有 shadow 层级
+cda send OfficePC click current '{"selector":"xhs-publish-btn >>> button"}'
+
+# 3. 裸选择器自动兜底：light DOM 未命中时自动搜索所有 open shadow root（含嵌套）
+cda send OfficePC click current '{"selector":"button.ce-btn"}'
+
+# xpath 与文本查找同样兜底到 shadow tree 内
+cda send OfficePC click current '{"selector":"xpath://button[contains(.,'"'"'发布'"'"')]"}'
+cda send OfficePC click current '{"text":"发布"}'
+```
+
+- **实现方式**：`#shadow-root` 与 `>>>` 是路径标记（浏览器原生不支持，cda 自行 tokenize 行走）；裸选择器 / `xpath:` / `text` 在 light DOM 未命中后，按文档序递归搜索所有 open shadow root
+- **`real_click` 同样支持 shadow 内元素**：CDP 定位表达式内嵌同一套穿透逻辑，取渲染层坐标后发送真实鼠标事件
+- **限制：closed shadow root 无法访问**（`.shadowRoot` 为 null），元素命令返回 notFound；此时用坐标点击兜底：`real_click {"x":..., "y":...}`（CDP 在渲染层派发真实鼠标事件，shadow 边界不存在）
+- **html 默认包含 shadow 内容**：`get_page_info --field html` 用 `Element.getHTML({shadowRoots:[...]})` 序列化，open shadow root 以内联 `<template shadowrootmode="open">` 出现在宿主元素里；无 shadow 的页面输出与之前完全一致
 
 ---
 

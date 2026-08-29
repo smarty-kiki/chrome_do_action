@@ -62,7 +62,10 @@
     const has = (name) => fields.length === 0 || fields.some((f) => f === name || f === `currentTab.${name}`);
     if (has("url")) info.url = window.location.href;
     if (has("title")) info.title = document.title;
-    if (has("html")) info.html = document.documentElement.outerHTML;
+    if (has("html")) {
+      const docEl = document.documentElement;
+      info.html = typeof docEl.getHTML === "function" ? docEl.getHTML({ shadowRoots: openShadowRootsDeep(document) }) : document.documentElement.outerHTML;
+    }
     return info;
   }
   async function collectIframes(fields) {
@@ -133,27 +136,22 @@
             navigated = true;
           };
           window.addEventListener("beforeunload", onBeforeUnload, { once: true });
-          await new Promise((r) => setTimeout(r, 200));
+          const stable = await waitForSettled(3e3);
           window.removeEventListener("beforeunload", onBeforeUnload);
-          const data = { clickDesc };
+          const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
+          const data = { clickDesc, settledMs: stable.waited };
+          if (waitForResult) data.waitFor = waitForResult;
           if (fields.length === 0 || needsField(fields, "navigated")) data.navigated = navigated;
           if (fields.length === 0 || needsField(fields, "current")) {
             const pageInfo = await collectPageInfo(fields);
             data.current = pageInfo;
           }
-          if (fields.length === 0 || needsField(fields, "iframeChanged", "iframeChanges")) {
-            data.iframeChanged = false;
-            data.iframeChanges = [];
-          }
-          if (fields.length === 0 || needsField(fields, "newTabs")) {
-            data.newTabs = [];
-          }
           return { success: true, data };
         }
         case "get_rect": {
           const selector = params.selector;
-          const el = findElement(selector);
-          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+          const el = params.text ? findByText(params.text) : findElement(selector);
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text || selector}` };
           const rect = el.getBoundingClientRect();
           const lx = rect.left + rect.width / 2;
           const ly = rect.top + rect.height / 2;
@@ -186,7 +184,7 @@
         }
         case "show": {
           const selector = params.selector;
-          const els = Array.from(document.querySelectorAll(selector));
+          const els = findAllPierced(selector);
           if (els.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           for (const el of els) {
             if (!showRegistry.has(el)) {
@@ -224,7 +222,8 @@
             el.value = text;
             el.dispatchEvent(new Event("input", { bubbles: true }));
             el.dispatchEvent(new Event("change", { bubbles: true }));
-            return { success: true };
+          } else if (!el.isContentEditable) {
+            return { success: false, error: `Element not typeable: ${selector} (tag=${el.tagName}, contentEditable=${el.contentEditable})` };
           }
           if (el.isContentEditable) {
             el.focus();
@@ -242,9 +241,12 @@
               if (i < paragraphs.length - 1) document.execCommand("insertParagraph", false);
             });
             el.dispatchEvent(new Event("input", { bubbles: true }));
-            return { success: true };
           }
-          return { success: false, error: `Element not typeable: ${selector} (tag=${el.tagName}, contentEditable=${el.contentEditable})` };
+          const stable = await waitForSettled(3e3);
+          const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
+          const typeData = { selector, tag: el.tagName.toLowerCase(), settledMs: stable.waited };
+          if (waitForResult) typeData.waitFor = waitForResult;
+          return { success: true, data: typeData };
         }
         case "keyboard": {
           const key = params.key;
@@ -272,15 +274,17 @@
           target.dispatchEvent(new KeyboardEvent("keydown", init));
           if (!MODIFIER_KEYS.has(key)) target.dispatchEvent(new KeyboardEvent("keypress", init));
           target.dispatchEvent(new KeyboardEvent("keyup", init));
-          return {
-            success: true,
-            data: {
-              key,
-              ...selector ? { selector } : {},
-              tag: target.tagName.toLowerCase(),
-              modifiers: mods
-            }
+          const stable = await waitForSettled(3e3);
+          const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
+          const keyData = {
+            key,
+            ...selector ? { selector } : {},
+            tag: target.tagName.toLowerCase(),
+            modifiers: mods,
+            settledMs: stable.waited
           };
+          if (waitForResult) keyData.waitFor = waitForResult;
+          return { success: true, data: keyData };
         }
         case "upload_file": {
           const selector = params.selector;
@@ -301,7 +305,18 @@
           dt.items.add(file);
           el.files = dt.files;
           el.dispatchEvent(new Event("change", { bubbles: true }));
-          return { success: true, data: { filename, size: bytes.length, mime } };
+          const stable = await waitForSettled(3e3);
+          const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
+          const uploadData = {
+            selector,
+            tag: el.tagName.toLowerCase(),
+            filename,
+            size: bytes.length,
+            mime,
+            settledMs: stable.waited
+          };
+          if (waitForResult) uploadData.waitFor = waitForResult;
+          return { success: true, data: uploadData };
         }
         case "paste_rich": {
           const selector = params.selector;
@@ -322,7 +337,16 @@
           }
           document.execCommand("insertHTML", false, html);
           el.dispatchEvent(new Event("input", { bubbles: true }));
-          return { success: true, data: { inserted: true } };
+          const stable = await waitForSettled(3e3);
+          const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
+          const pasteData = {
+            selector,
+            tag: el.tagName.toLowerCase(),
+            inserted: true,
+            settledMs: stable.waited
+          };
+          if (waitForResult) pasteData.waitFor = waitForResult;
+          return { success: true, data: pasteData };
         }
         case "get_text": {
           const selector = params.selector;
@@ -335,7 +359,7 @@
           if (!selector) return { success: false, error: "selector is required" };
           const isCss = selector.startsWith("css:");
           const query = isCss ? selector.slice(4) : selector;
-          const nodes = isCss ? document.querySelectorAll(query) : [findElement(selector)].filter(Boolean);
+          const nodes = isCss ? findAllPierced(query) : [findElement(selector)].filter(Boolean);
           if (nodes.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           const results = Array.from(nodes).map((el, i) => {
             const computed = window.getComputedStyle(el);
@@ -388,7 +412,7 @@
               if (document.readyState === "complete") {
                 settled = true;
                 cleanup();
-                waitForDomStable(3e3).then(() => {
+                waitForSettled(3e3).then(() => {
                   resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
                 });
               }
@@ -397,7 +421,7 @@
             if (document.readyState === "complete") {
               settled = true;
               cleanup();
-              waitForDomStable(3e3).then(() => {
+              waitForSettled(3e3).then(() => {
                 resolve({ success: true, data: { readyState: "complete", elapsed: Date.now() - start } });
               });
             } else {
@@ -410,11 +434,39 @@
           });
         }
         case "scroll": {
-          const y = params.y ?? 0;
           const x = params.x ?? 0;
+          const y = params.y ?? 0;
+          const selector = params.selector;
+          if (selector) {
+            const el = findElement(selector);
+            if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+            if (el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth) {
+              el.scrollTo({ top: y, left: x, behavior: "smooth" });
+              await waitForSettled(3e3);
+              return { success: true, data: { scrollTarget: "container", scrollX: el.scrollLeft, scrollY: el.scrollTop } };
+            }
+            const block = ["start", "center", "end", "nearest"].includes(params.block) ? params.block : "center";
+            el.scrollIntoView({ behavior: "smooth", block });
+            await waitForSettled(3e3);
+            return { success: true, data: { scrollTarget: "element", scrolledIntoView: selector } };
+          }
           window.scrollTo({ top: y, left: x, behavior: "smooth" });
-          await waitForDomStable(3e3);
+          await waitForSettled(3e3);
           return { success: true, data: { scrollX: window.scrollX, scrollY: window.scrollY } };
+        }
+        // 内部命令（SW real_click 点击后调用；CLI 不可直接发——BLOCKED）：等影响落地
+        case "wait_for_settle": {
+          const timeout = params.timeout ?? 3e3;
+          const stable = await waitForSettled(timeout);
+          const waitForResult = params.wait_for ? await waitForCondition(params.wait_for, timeout) : null;
+          return {
+            success: true,
+            data: {
+              settled: stable.waited < timeout,
+              settledMs: stable.waited,
+              ...waitForResult ? { waitFor: waitForResult } : {}
+            }
+          };
         }
         default:
           return { success: false, error: `Unknown command: ${command}` };
@@ -423,43 +475,164 @@
       return { success: false, error: String(err) };
     }
   }
-  function waitForDomStable(maxWaitMs) {
-    return new Promise((resolve) => {
-      let quietTimer;
-      const observer = new MutationObserver(() => {
-        clearTimeout(quietTimer);
-        quietTimer = window.setTimeout(() => {
-          observer.disconnect();
-          resolve();
-        }, 250);
+  function throttleSafeTimer(ms) {
+    if (document.visibilityState !== "hidden") {
+      let timer;
+      const promise2 = new Promise((resolve) => {
+        timer = window.setTimeout(resolve, ms);
       });
-      observer.observe(document.body, { childList: true, subtree: true });
-      quietTimer = window.setTimeout(() => {
-        observer.disconnect();
-        resolve();
-      }, 500);
-      setTimeout(() => {
-        observer.disconnect();
-        clearTimeout(quietTimer);
-        resolve();
-      }, maxWaitMs);
+      return {
+        promise: promise2,
+        cancel: () => {
+          if (timer != null) clearTimeout(timer);
+        }
+      };
+    }
+    let cancelled = false;
+    const start = performance.now();
+    const ch = new MessageChannel();
+    const promise = new Promise((resolve) => {
+      ch.port1.onmessage = () => {
+        if (cancelled) return;
+        if (performance.now() - start >= ms) {
+          ch.port1.onmessage = null;
+          ch.port1.close();
+          ch.port2.close();
+          resolve();
+        } else {
+          ch.port2.postMessage(0);
+        }
+      };
+      ch.port2.postMessage(0);
+    });
+    return {
+      promise,
+      cancel: () => {
+        cancelled = true;
+        ch.port1.onmessage = null;
+        ch.port1.close();
+        ch.port2.close();
+      }
+    };
+  }
+  function waitForSettled(maxWaitMs) {
+    const QUIET_MS = 250;
+    const ACTIVITY_WINDOW_MS = 600;
+    const start = Date.now();
+    return new Promise((resolve) => {
+      let quiet;
+      let inQuiet = false;
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        domObserver?.disconnect();
+        longtaskObserver?.disconnect();
+        quiet?.cancel();
+        resolve({ waited: Date.now() - start });
+      };
+      const onActivity = () => {
+        if (!inQuiet) {
+          inQuiet = true;
+          activity?.cancel();
+          for (const sr of openShadowRootsDeep(document)) {
+            try {
+              domObserver?.observe(sr, { childList: true, subtree: true, attributes: true, characterData: true });
+            } catch {
+            }
+          }
+        }
+        quiet?.cancel();
+        quiet = throttleSafeTimer(QUIET_MS);
+        quiet.promise.then(finish);
+      };
+      const activity = throttleSafeTimer(ACTIVITY_WINDOW_MS);
+      activity.promise.then(() => {
+        if (inQuiet) return;
+        if (document.visibilityState !== "hidden") {
+          finish();
+          return;
+        }
+        const confirm = throttleSafeTimer(1e3);
+        confirm.promise.then(() => {
+          if (!inQuiet) finish();
+        });
+      });
+      let domObserver;
+      try {
+        domObserver = new MutationObserver(() => onActivity());
+        const observeRoot = (root) => {
+          try {
+            domObserver?.observe(root, { childList: true, subtree: true, attributes: true, characterData: true });
+          } catch {
+          }
+        };
+        observeRoot(document.body);
+        for (const sr of openShadowRootsDeep(document)) observeRoot(sr);
+      } catch {
+      }
+      let longtaskObserver;
+      try {
+        if (typeof PerformanceObserver !== "undefined") {
+          longtaskObserver = new PerformanceObserver(() => onActivity());
+          longtaskObserver.observe({ entryTypes: ["longtask"] });
+        }
+      } catch {
+      }
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+      }));
+      setTimeout(finish, maxWaitMs);
     });
   }
-  function findByText(text) {
-    const q = xpathStr(text);
-    const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
-    const xpath = [
-      `//body//button[contains(normalize-space(.), ${q})]`,
-      `//body//a[contains(normalize-space(.), ${q})]`,
-      `//body//input[contains(@value, ${q})]`,
-      `//body//*[not(${hidden})][contains(normalize-space(.), ${q}) and not(./*[not(${hidden})][contains(normalize-space(.), ${q})])]`
-    ].join(" | ");
-    const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
+  async function waitForCondition(waitFor, timeoutMs) {
+    const start = Date.now();
+    const check = () => {
+      if (waitFor.text) return !!findByText(waitFor.text);
+      if (waitFor.selector) {
+        const el = findElement(waitFor.selector);
+        return !!el && isVisible(el);
+      }
+      return false;
+    };
+    if (check()) return { settled: true, waited: 0 };
+    while (Date.now() - start < timeoutMs) {
+      await throttleSafeTimer(50).promise;
+      if (check()) return { settled: true, waited: Date.now() - start };
+    }
+    return { settled: false, waited: timeoutMs };
+  }
+  function evalTextXPath(xpath, context) {
+    if (context instanceof ShadowRoot) {
+      for (const child of Array.from(context.children)) {
+        const hit = evalTextXPath(xpath, child);
+        if (hit) return hit;
+      }
+      return null;
+    }
+    const result = document.evaluate(xpath, context, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
     let el = result.iterateNext();
     while (el) {
       const htmlEl = el;
       if (isVisible(htmlEl)) return htmlEl;
       el = result.iterateNext();
+    }
+    return null;
+  }
+  function findByText(text) {
+    const q = xpathStr(text);
+    const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
+    const bodyXpath = [
+      `//body//button[contains(normalize-space(.), ${q})]`,
+      `//body//a[contains(normalize-space(.), ${q})]`,
+      `//body//input[contains(@value, ${q})]`,
+      `//body//*[not(${hidden})][contains(normalize-space(.), ${q}) and not(./*[not(${hidden})][contains(normalize-space(.), ${q})])]`
+    ].join(" | ");
+    const shadowXpath = bodyXpath.split("//body//").join("//");
+    const hit = evalTextXPath(bodyXpath, document);
+    if (hit) return hit;
+    for (const sr of openShadowRootsDeep(document)) {
+      const h = evalTextXPath(shadowXpath, sr);
+      if (h) return h;
     }
     return null;
   }
@@ -511,16 +684,205 @@
     const code = key === " " || key === "Space" ? "Space" : single ? /[0-9]/.test(key) ? `Digit${key}` : `Key${key.toUpperCase()}` : key;
     return { key, code, keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true, ...mods };
   }
+  function openShadowRootsDeep(root) {
+    const out = [];
+    const walk = (r) => {
+      if (r instanceof Element && r.shadowRoot) {
+        out.push(r.shadowRoot);
+        walk(r.shadowRoot);
+      }
+      for (const el of Array.from(r.querySelectorAll("*"))) {
+        const sr = el.shadowRoot;
+        if (sr) {
+          out.push(sr);
+          walk(sr);
+        }
+      }
+    };
+    walk(root);
+    return out;
+  }
+  function hasShadowToken(sel) {
+    let quote = null;
+    let depth = 0;
+    for (let i = 0; i < sel.length; i++) {
+      const ch = sel[i];
+      if (quote) {
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        continue;
+      }
+      if (ch === "(" || ch === "[") {
+        depth++;
+        continue;
+      }
+      if (ch === ")" || ch === "]") {
+        depth = Math.max(0, depth - 1);
+        continue;
+      }
+      if (depth > 0) continue;
+      if (ch === ">" && sel[i + 1] === ">" && sel[i + 2] === ">") return true;
+      if (ch === "#" && sel.startsWith("shadow-root", i + 1)) {
+        const after = sel[i + 1 + "shadow-root".length];
+        if (after === void 0 || !/[a-zA-Z0-9_-]/.test(after)) return true;
+      }
+    }
+    return false;
+  }
+  function tokenizeShadowPath(sel) {
+    const tokens = [];
+    let quote = null;
+    let depth = 0;
+    let cur = "";
+    const flush = () => {
+      const s = cur.trim();
+      if (s) tokens.push({ kind: "css", value: s });
+      cur = "";
+    };
+    for (let i = 0; i < sel.length; i++) {
+      const ch = sel[i];
+      if (quote) {
+        cur += ch;
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        cur += ch;
+        continue;
+      }
+      if (ch === "(" || ch === "[") {
+        depth++;
+        cur += ch;
+        continue;
+      }
+      if (ch === ")" || ch === "]") {
+        depth = Math.max(0, depth - 1);
+        cur += ch;
+        continue;
+      }
+      if (depth > 0) {
+        cur += ch;
+        continue;
+      }
+      if (ch === ">" && sel[i + 1] === ">" && sel[i + 2] === ">") {
+        flush();
+        tokens.push({ kind: "pierce", value: ">>>" });
+        i += 2;
+        continue;
+      }
+      if (ch === ">") {
+        flush();
+        continue;
+      }
+      if (ch === "#" && sel.startsWith("shadow-root", i + 1)) {
+        const after = sel[i + 1 + "shadow-root".length];
+        if (after === void 0 || !/[a-zA-Z0-9_-]/.test(after)) {
+          flush();
+          tokens.push({ kind: "shadowroot", value: "#shadow-root" });
+          i += "shadow-root".length;
+          continue;
+        }
+      }
+      cur += ch;
+    }
+    flush();
+    return tokens;
+  }
+  function matchCssSegment(segment, contexts) {
+    const out = [];
+    for (const ctx of contexts) {
+      try {
+        for (const el of Array.from(ctx.querySelectorAll(segment))) out.push(el);
+      } catch {
+      }
+    }
+    if (out.length > 0) return out;
+    for (const ctx of contexts) {
+      for (const sr of openShadowRootsDeep(ctx)) {
+        try {
+          for (const el of Array.from(sr.querySelectorAll(segment))) out.push(el);
+        } catch {
+        }
+      }
+    }
+    return out;
+  }
+  function walkShadowPath(sel) {
+    const tokens = tokenizeShadowPath(sel);
+    let cands = [];
+    for (const tok of tokens) {
+      if (tok.kind === "css") {
+        const contexts = cands.length > 0 ? cands : [document];
+        cands = Array.from(new Set(matchCssSegment(tok.value, contexts)));
+        if (cands.length === 0) return [];
+      } else if (tok.kind === "shadowroot") {
+        cands = cands.filter((c) => c instanceof Element && !!c.shadowRoot).map((c) => c.shadowRoot);
+        if (cands.length === 0) return [];
+      } else {
+        const next = [];
+        for (const c of cands) {
+          for (const sr of openShadowRootsDeep(c)) next.push(sr);
+        }
+        cands = Array.from(new Set(next));
+        if (cands.length === 0) return [];
+      }
+    }
+    return cands;
+  }
+  function findCssPierced(css) {
+    if (hasShadowToken(css)) {
+      const hit = walkShadowPath(css).find((c) => c instanceof Element);
+      return hit ?? null;
+    }
+    const direct = document.querySelector(css);
+    if (direct) return direct;
+    for (const sr of openShadowRootsDeep(document)) {
+      const el = sr.querySelector(css);
+      if (el) return el;
+    }
+    return null;
+  }
+  function findAllPierced(selector) {
+    const css = selector.startsWith("css:") ? selector.slice(4) : selector;
+    if (hasShadowToken(css)) {
+      return walkShadowPath(css).filter((c) => c instanceof Element);
+    }
+    const direct = Array.from(document.querySelectorAll(css));
+    if (direct.length > 0) return direct;
+    const out = [];
+    for (const sr of openShadowRootsDeep(document)) {
+      for (const el of Array.from(sr.querySelectorAll(css))) out.push(el);
+    }
+    return out;
+  }
+  function findXPathPierced(xpath) {
+    const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+    const direct = result.singleNodeValue;
+    if (direct) return direct;
+    for (const sr of openShadowRootsDeep(document)) {
+      for (const child of Array.from(sr.children)) {
+        try {
+          const r = document.evaluate(xpath, child, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+          const hit = r.singleNodeValue;
+          if (hit) return hit;
+        } catch {
+        }
+      }
+    }
+    return null;
+  }
   function findElement(selector) {
     if (selector.startsWith("css:")) {
-      return document.querySelector(selector.slice(4));
+      return findCssPierced(selector.slice(4));
     }
     if (selector.startsWith("xpath:")) {
-      const xpath = selector.slice(6);
-      const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-      return result.singleNodeValue;
+      return findXPathPierced(selector.slice(6));
     }
-    return document.querySelector(selector);
+    return findCssPierced(selector);
   }
   chrome.runtime.sendMessage({ type: "cs_injected" }).catch(() => {
   });
