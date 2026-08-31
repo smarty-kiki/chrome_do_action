@@ -84,6 +84,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | `trigger` | `send <id> trigger <tab> '{"selector":"#username","event":"blur"}'` | 触发元素事件：`blur` 触发表单校验、`change`+`value` 选下拉选项（React 受控组件同样生效）、自定义事件；`focus`/`blur` 触发真实焦点转移（表单校验生效）；带 settle + waitFor；`{options}` 透传事件属性 |
 | `paste_rich` | `send <id> paste_rich <tab> '{"selector":".ProseMirror","html":"<section>..."}'` | 向富文本编辑器注入带样式 HTML（先清空再插入），等价粘贴排好版的文档 |
 | `upload_file` | `send <id> upload_file <tab> '{"selector":"input[type=file]","base64":"...","filename":"a.jpg","mime":"image/jpeg"}'` | base64 图片注入 file input，触发 change 上传 |
+| `upload_dragdrop` | `send <id> upload_dragdrop <tab> '{"selector":".js_upload_area","data":{"base64":"...","filename":"a.jpg","mime":"image/jpeg"}}'` | 向无 file input、只认 drop 的上传区（AntD Dragger 等）拖入文件，派发 dragenter/dragover/drop；`data` 支持 base64 或 `{url}` |
 | `show` | `send <id> show <tab> '.js_imagedialog'` | 强制显示隐藏元素（仅改 CSS：visibility/opacity/display），让 hover 菜单常驻可见后可点击 |
 | `hide` | `send <id> hide <tab>` | 还原所有被 show 的元素（清 inline style 回 CSS 控制） |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本（无 selector 取整页；带 selector 自动搜索 iframe） |
@@ -96,7 +97,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 
 ### 关键技巧
 
-1. **等影响落地（settle）**：click/type/keyboard/trigger/upload_file/paste_rich/scroll/real_click 返回前会事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），返回 `settledMs`。影响落地晚（服务端请求后才渲染、长 debounce）时加 `waitFor` 谓词：`'{"selector":"#btn","waitFor":{"text":"发布成功"}}'`——50ms 轮询、条件满足瞬间返回 `{"settled":true,"waited":615}`。后台 tab 的 Chrome 定时器节流会让 settle 追加 ~1s 确认期，深度后台等不到就用 waitFor 或把 tab 切前台。
+1. **等影响落地（settle）**：click/type/keyboard/trigger/upload_file/upload_dragdrop/paste_rich/scroll/real_click 返回前会事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），返回 `settledMs`。影响落地晚（服务端请求后才渲染、长 debounce）时加 `waitFor` 谓词：`'{"selector":"#btn","waitFor":{"text":"发布成功"}}'`——50ms 轮询、条件满足瞬间返回 `{"settled":true,"waited":615}`。后台 tab 的 Chrome 定时器节流会让 settle 追加 ~1s 确认期，深度后台等不到就用 waitFor 或把 tab 切前台。
 2. **坐标必须截图确认**：先 `screenshot` 看真实页面，再取坐标定位。
 3. **hover 菜单用 show 解决**：触发不了 hover 时别硬怼事件模拟，`show` 强制显示元素后普通 `click` 即可命中。操作完 `hide` 还原。确需真实 hover 链（如悬停才展开的嵌套菜单）时，用 `real_click` 的 `approach` 渐进路径逐级触发。
 4. **iframe 自动搜索**：元素命令默认顶层优先搜遍所有 iframe（含跨域），返回带命中 `frame.url`。目标在 iframe 内且自动搜索未命中时，加 `frame` 参数固定：`{"selector":"...","frame":{"url":"子串"}}`（跨域最稳）或 `{"frame":0}`（第 N 个顶层 iframe）。

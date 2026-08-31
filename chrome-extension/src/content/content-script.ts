@@ -443,6 +443,80 @@ async function handleCommand(
         return { success: true, data: uploadData };
       }
 
+      case "upload_dragdrop": {
+        // 向没有 file input、只认 drop 事件的上传组件（AntD Upload.Dragger、自定义拖拽区等）
+        // 拖入文件：构造带 File 的 DataTransfer，派发 dragenter → dragover → drop。
+        // 与 upload_file 互补：有 input[type=file] 用 upload_file，只有 drop 区域用本命令。
+        // 注意合成 drop 是页面内拖拽模拟（isTrusted=false）：能触发页面 JS 的 drop 处理器，
+        // 但无法模拟从系统文件管理器拖入的真实拖拽（浏览器原生 DnD），校验 isTrusted 的站点无效。
+        const selector = params.selector as string;
+        const data = params.data as Record<string, unknown> | undefined;
+        if (!selector) return { success: false, error: 'Need "selector" parameter' };
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          return { success: false, error: '"data" must be an object: {"base64":"...","filename":"a.jpg","mime":"image/jpeg"} or {"url":"https://..."}' };
+        }
+        const known = ["selector", "data", "waitFor", "frame"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown upload_dragdrop parameter(s): ${unknown.join(", ")} (expected selector, data, waitFor, frame)` };
+        }
+        const knownData = ["base64", "filename", "mime", "url"];
+        const unknownData = Object.keys(data).filter((k) => !knownData.includes(k));
+        if (unknownData.length) {
+          return { success: false, error: `Unknown data field(s): ${unknownData.join(", ")} (expected base64, filename, mime, url)` };
+        }
+        if ((data.base64 !== undefined) === (data.url !== undefined)) {
+          return { success: false, error: '"data" must have exactly one of "base64" or "url"' };
+        }
+        const el = findElement(selector) as HTMLElement | null;
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+
+        let file: File;
+        if (data.base64 !== undefined) {
+          const filename = (data.filename as string) || "upload.png";
+          const mime = (data.mime as string) || "image/png";
+          try {
+            file = base64ToFile(data.base64 as string, filename, mime);
+          } catch {
+            return { success: false, error: "Invalid base64 in data" };
+          }
+        } else {
+          const url = data.url as string;
+          try {
+            const resp = await fetch(url);
+            if (!resp.ok) {
+              return { success: false, error: `Failed to fetch url: ${url} (HTTP ${resp.status})` };
+            }
+            const blob = await resp.blob();
+            const name = (data.filename as string) || url.split("/").pop() || "download";
+            file = new File([blob], name, { type: blob.type || "application/octet-stream" });
+          } catch (e) {
+            return { success: false, error: `Failed to fetch url: ${url} (${(e as Error).message})` };
+          }
+        }
+
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        for (const type of ["dragenter", "dragover", "drop"] as const) {
+          el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
+        }
+        // 等影响落地：drop 处理器可能异步渲染预览 / 发起上传，落地后再返回
+        const stable = await waitForSettled(3000);
+        const waitForResult = params.waitFor
+          ? await waitForCondition(params.waitFor as { selector?: string; text?: string }, 3000)
+          : null;
+        const dropData: Record<string, unknown> = {
+          selector,
+          tag: el.tagName.toLowerCase(),
+          filename: file.name,
+          size: file.size,
+          mime: file.type,
+          settledMs: stable.waited,
+        };
+        if (waitForResult) dropData.waitFor = waitForResult;
+        return { success: true, data: dropData };
+      }
+
       case "paste_rich": {
         // 向富文本编辑器(contenteditable)粘贴带样式的 HTML 内容，等价于粘贴一份排好版的文档
         const selector = params.selector as string;
@@ -977,6 +1051,15 @@ function setNativeChecked(el: HTMLInputElement, checked: boolean): void {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked")?.set;
   if (setter) setter.call(el, checked);
   else el.checked = checked;
+}
+
+// base64（可带 data: URL 前缀）→ File
+function base64ToFile(base64: string, filename: string, mime: string): File {
+  const clean = base64.replace(/^data:[^;]+;base64,/, "");
+  const bin = atob(clean);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new File([bytes], filename, { type: mime });
 }
 
 // 按事件名选构造器：key* → KeyboardEvent、mouse* → MouseEvent，

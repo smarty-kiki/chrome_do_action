@@ -58,7 +58,7 @@ cda list
 
 ### 等影响落地（settle）
 
-`click`/`type`/`keyboard`/`trigger`/`upload_file`/`paste_rich`/`scroll`/`real_click` 返回前会**等动作的影响落地**——事件驱动（DOM 变化 + 长任务检测），不是固定 sleep：
+`click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`scroll`/`real_click` 返回前会**等动作的影响落地**——事件驱动（DOM 变化 + 长任务检测），不是固定 sleep：
 
 - **无影响动作**（点击无副作用元素）：约 0.6s 返回（600ms 活动窗口 + 静默确认）
 - **有影响动作**（异步渲染、debounce 重排）：等到 DOM 安静 250ms 后返回，`settledMs` 如实反映等待耗时
@@ -103,7 +103,7 @@ cda list
 
 ## _field 过滤
 
-通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/trigger/upload_file/paste_rich/scroll/show/hide/get_css/get_page_info/get_js_errors/real_click/open/refresh/close_tab），点路径逐段投影、保留嵌套形状：
+通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/trigger/upload_file/upload_dragdrop/paste_rich/scroll/show/hide/get_css/get_page_info/get_js_errors/real_click/open/refresh/close_tab），点路径逐段投影、保留嵌套形状：
 
 - `--field a` → `{a: 完整值}`
 - `--field a.b` → `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）
@@ -150,7 +150,7 @@ cda --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#titl
 
 ## iframe 定位
 
-元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
 
 如需指定 frame，加 `frame` 参数：
 
@@ -161,14 +161,14 @@ cda --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#titl
 {"selector": "#submit", "frame": {"url": "mp.weixin.qq.com"}}  // URL 含子串的首个 frame（跨域最稳）
 ```
 
-- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`
+- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`
 - **跨域 iframe 同样可读可操作**：元素命令自动搜索所有 frame，跨域 iframe 同样能定位命中
 - `real_click` 在 iframe 内同样可用（含跨域）
 - `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；要读 iframe 文本用 `{"selector":"...","frame":{...}}`
 
 ## shadow DOM 定位
 
-Web Components 站点（小红书创作后台等）把按钮/编辑器包在 shadow root 里，普通选择器、XPath 无法穿透。元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）默认**透明穿透 open shadow root**，三种方式从显式到隐式：
+Web Components 站点（小红书创作后台等）把按钮/编辑器包在 shadow root 里，普通选择器、XPath 无法穿透。元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`）默认**透明穿透 open shadow root**，三种方式从显式到隐式：
 
 1. **路径标记 `#shadow-root`**：直接粘贴 DevTools 元素面板「Copy → Copy element path」复制的完整路径（原生 `querySelector` 就是这么写的）：
 
@@ -397,6 +397,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | `keyboard` | `send <id> keyboard <tab> <params>` | 向元素发送按键（{selector,key}，selector 可省略用当前聚焦元素），触发页面 keydown/keypress/keyup 处理器；可加 {ctrl,shift,alt,meta} 组合键 |
 | `trigger` | `send <id> trigger <tab> <params>` | 触发元素事件（{selector,event}，可选 {value}/{options}）：blur 校验、change+value 选下拉选项、自定义事件；focus/blur 触发真实焦点转移；带 settle + waitFor |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入本地图片（{selector,base64,filename,mime}），触发 change 事件完成上传 |
+| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | 向拖拽上传区（无 file input、只认 drop 的组件，如 AntD Dragger）拖入文件（{selector,data}，data 为 {base64,filename,mime} 或 {url}），派发 dragenter/dragover/drop |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | 向 contenteditable 富文本编辑器粘贴带样式的 HTML（{selector,html}），等价于粘贴排好版的文档 |
 | `show` | `send <id> show <tab> <params>` | 强制显示隐藏元素（{selector}），仅改 CSS 样式不执行代码；让 hover 才显示的菜单/工具条常驻可见，随后可被 click 命中 |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本内容 |
@@ -492,6 +493,19 @@ cda send OfficePC get_text current '{"selector":"table"}'
 - 将 base64 图片注入 file input 并触发 `change` 事件，页面监听到后自动上传
 - 适用于无法手动操作系统文件对话框的场景（如无辅助功能权限时上传公众号封面）
 - 图片建议先压缩（如 900x383 JPEG、<100KB），避免 base64 过大
+
+### upload_dragdrop 参数
+
+```json
+{"selector": ".js_upload_area", "data": {"base64": "<base64内容>", "filename": "cover.jpg", "mime": "image/jpeg"}}
+{"selector": ".js_upload_area", "data": {"url": "https://example.com/a.jpg"}}
+```
+
+- 向**没有文件输入框、只认拖拽（drop）事件**的上传区域拖入文件：派发 `dragenter` → `dragover` → `drop` 携带文件，页面 drop 处理器收到后自动上传
+- 适用于 `upload_file` 打不进去的组件：AntD `Upload.Dragger`、自定义拖拽区、富文本编辑器拖图上传等
+- `data` 二选一：`{base64, filename, mime}`（本地文件，推荐，与 upload_file 同源）或 `{url}`（命令内部拉取后拖入，受 CORS 限制）
+- 与 `upload_file` 互补：能找到 `input[type=file]` 用 `upload_file`，找不到（拖拽区）用 `upload_dragdrop`
+- 拖拽区域在 iframe/shadow DOM 内同样生效；带 settle + waitFor，返回 `{selector, tag, filename, size, mime, settledMs}`
 
 ### paste_rich 参数
 

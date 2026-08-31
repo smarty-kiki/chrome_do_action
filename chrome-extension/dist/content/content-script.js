@@ -357,6 +357,69 @@
           if (waitForResult) uploadData.waitFor = waitForResult;
           return { success: true, data: uploadData };
         }
+        case "upload_dragdrop": {
+          const selector = params.selector;
+          const data = params.data;
+          if (!selector) return { success: false, error: 'Need "selector" parameter' };
+          if (!data || typeof data !== "object" || Array.isArray(data)) {
+            return { success: false, error: '"data" must be an object: {"base64":"...","filename":"a.jpg","mime":"image/jpeg"} or {"url":"https://..."}' };
+          }
+          const known = ["selector", "data", "waitFor", "frame"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown upload_dragdrop parameter(s): ${unknown.join(", ")} (expected selector, data, waitFor, frame)` };
+          }
+          const knownData = ["base64", "filename", "mime", "url"];
+          const unknownData = Object.keys(data).filter((k) => !knownData.includes(k));
+          if (unknownData.length) {
+            return { success: false, error: `Unknown data field(s): ${unknownData.join(", ")} (expected base64, filename, mime, url)` };
+          }
+          if (data.base64 !== void 0 === (data.url !== void 0)) {
+            return { success: false, error: '"data" must have exactly one of "base64" or "url"' };
+          }
+          const el = findElement(selector);
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+          let file;
+          if (data.base64 !== void 0) {
+            const filename = data.filename || "upload.png";
+            const mime = data.mime || "image/png";
+            try {
+              file = base64ToFile(data.base64, filename, mime);
+            } catch {
+              return { success: false, error: "Invalid base64 in data" };
+            }
+          } else {
+            const url = data.url;
+            try {
+              const resp = await fetch(url);
+              if (!resp.ok) {
+                return { success: false, error: `Failed to fetch url: ${url} (HTTP ${resp.status})` };
+              }
+              const blob = await resp.blob();
+              const name = data.filename || url.split("/").pop() || "download";
+              file = new File([blob], name, { type: blob.type || "application/octet-stream" });
+            } catch (e) {
+              return { success: false, error: `Failed to fetch url: ${url} (${e.message})` };
+            }
+          }
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          for (const type of ["dragenter", "dragover", "drop"]) {
+            el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
+          }
+          const stable = await waitForSettled(3e3);
+          const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
+          const dropData = {
+            selector,
+            tag: el.tagName.toLowerCase(),
+            filename: file.name,
+            size: file.size,
+            mime: file.type,
+            settledMs: stable.waited
+          };
+          if (waitForResult) dropData.waitFor = waitForResult;
+          return { success: true, data: dropData };
+        }
         case "paste_rich": {
           const selector = params.selector;
           const html = params.html;
@@ -806,6 +869,13 @@
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked")?.set;
     if (setter) setter.call(el, checked);
     else el.checked = checked;
+  }
+  function base64ToFile(base64, filename, mime) {
+    const clean = base64.replace(/^data:[^;]+;base64,/, "");
+    const bin = atob(clean);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new File([bytes], filename, { type: mime });
   }
   function constructTriggerEvent(name, init) {
     if (name.startsWith("key")) return new KeyboardEvent(name, init);

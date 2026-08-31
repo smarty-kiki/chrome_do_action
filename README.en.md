@@ -51,6 +51,7 @@ your command → server → Chrome extension → execute in the page → structu
 | 🔥 Real clicks (`real_click`) | Sends a complete, genuine mouse event chain, breaking through sites that ignore synthetic events (e.g. WeChat MP backend); supports multi-level hover paths |
 | 📝 Rich text | `type` writes plain text into `contenteditable`; `paste_rich` pastes styled HTML, preserving font size / color / bold / layout |
 | 🖼️ File uploads | `upload_file` injects a base64 image into a file input and triggers upload, bypassing the native file dialog |
+| 🎯 Drag-drop uploads (`upload_dragdrop`) | Drags a file into an upload area that has no file input and only accepts drops (e.g. AntD Dragger), dispatching dragenter/dragover/drop |
 | 📸 Page screenshots | Pixel-accurate "what you see" screenshot, saved to a local PNG — spot overlays, floating layers, scroll position |
 | 🐛 JS error collection | Keeps collecting `error` + `unhandledrejection` from page load; query or clear anytime |
 | ⚡ Selective fields (`--field`) | Every command returning an object supports dot-path projection (`--field "clickDesc.selector,settledMs,currentTab.url"`) — only requested fields are collected and returned; faster commands, leaner output |
@@ -242,6 +243,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | `keyboard` | `send <id> keyboard <tab> <params>` | Send a key press to an element (`{selector,key}`; selector optional, defaults to the focused element); optional `ctrl`/`shift`/`alt`/`meta` modifiers |
 | `trigger` | `send <id> trigger <tab> <params>` | Dispatch an event on an element (`{selector,event}`): `blur` for form validation, `change`+`value` to pick a `<select>` option (React controlled components included), custom events; `focus`/`blur` move real focus (form validation works); settle + waitFor semantics |
 | `upload_file` | `send <id> upload_file <tab> <params>` | Inject a base64 image into a file input and trigger upload |
+| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | Drag a file into an upload area with no file input that only accepts drops (e.g. AntD Dragger): `{selector,data}` where data is `{base64,filename,mime}` or `{url}` |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | Paste styled HTML into a rich-text editor |
 | `get_text` | `send <id> get_text <tab> [selector]` | Get an element's / the page's text |
 | `get_css` | `send <id> get_css <tab> <selector>` | Get computed styles of all matching elements |
@@ -299,6 +301,7 @@ Many admin backends (e.g. the Vue components behind WeChat MP) ignore synthesize
 - **`type`**: regular inputs get their value set plus `input`/`change` events; `contenteditable` (ProseMirror, UEditor, …) is focused and paragraphs are inserted one per newline, preserving structure
 - **`paste_rich`**: pastes HTML with inline styles into a rich-text editor, preserving font size / color / bold / spacing — equivalent to "select all, delete, paste a formatted document"
 - **`upload_file`**: injects a base64 image into `input[type=file]` and fires `change`, so the page uploads it — no native file dialog needed (works even without accessibility permission, e.g. posting WeChat MP covers)
+- **`upload_dragdrop`**: when there is no file input — only a drag-drop zone (AntD `Upload.Dragger` etc.) — dispatches dragenter/dragover/drop carrying the file at the target area, and the page's drop handler uploads it; complements `upload_file`
 
 ### 3. `--field` selective collection
 
@@ -311,7 +314,7 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-Supported by **every command returning an object**: `click`/`type`/`keyboard`/`trigger`/`upload_file`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`. Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and has nothing to filter.
+Supported by **every command returning an object**: `click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`. Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and has nothing to filter.
 
 ### 4. State awareness — commands return the world after the action
 
@@ -376,7 +379,7 @@ Cross-origin iframes expose only `src` and `sameOrigin: false`; same-origin ones
 | `get_text` | a string, e.g. `"Login"` |
 | `get_css` | `{ selector, count, results: [{index, css: {display, …}}] }` |
 | `type` / `clear_js_errors` | `{ success: true }` |
-| `upload_file` | `{ success: true, data: { filename, size, mime } }` |
+| `upload_file` / `upload_dragdrop` | `{ success: true, data: { filename, size, mime } }` |
 | `scroll` | `{ success: true, data: { scrollX, scrollY } }` |
 | `get_js_errors` | `{ errors: [{message, source, lineno}], count }` |
 | `close_tab` | `{ success: true, data: { tabId } }` |
