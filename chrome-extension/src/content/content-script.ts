@@ -481,6 +481,94 @@ async function handleCommand(
         return { success: true, data: pasteData };
       }
 
+      case "trigger": {
+        // 触发元素的事件（blur/change/input/focus/select/自定义事件等），常用于：
+        //   - blur：表单校验（Element UI / Ant Design 等在 blur 上触发校验）
+        //   - change + value：选择下拉框选项 / 更新 input 值后派发 change
+        //   - 自定义事件：框架驱动的站点监听自定义事件时
+        // 可选 {value} 先设属性再派发：select 选项 / input 值 / checkbox 勾选。
+        //   React 受控组件同样生效——走原型链原生 setter 绕过 React 的 value tracker，
+        //   否则受控组件比对 tracker 认为"值没变"而不更新 state。
+        // 可选 {options} 透传给事件构造器（bubbles/cancelable/composed/detail 等）。
+        // focus/blur 优先走真实方法（activeElement 真的转移、:focus 样式生效）；
+        // 目标不在焦点上时真实方法是 no-op，退化为合成事件，保证处理器必然触发。
+        // 注意合成事件 isTrusted=false，与 click 同类；对校验 isTrusted 的站点无效
+        // （此类站点对任意事件都无效，需 real_click 级别的真实事件）。
+        const selector = params.selector as string;
+        const event = params.event as string;
+        if (!selector) return { success: false, error: 'Need "selector" parameter' };
+        if (!event) {
+          return { success: false, error: 'Need "event" parameter (e.g. "change", "blur", "focus", "input", "select", or a custom event name)' };
+        }
+        const known = ["selector", "event", "value", "options", "frame", "waitFor"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown trigger parameter(s): ${unknown.join(", ")} (expected selector, event, value, options)` };
+        }
+        const el = findElement(selector) as HTMLElement | null;
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+
+        let valueApplied = false;
+        if (params.value !== undefined) {
+          if (el instanceof HTMLInputElement && (el.type === "checkbox" || el.type === "radio")) {
+            let checked: boolean;
+            if (typeof params.value === "boolean") {
+              checked = params.value;
+            } else if (params.value === "true" || params.value === "false") {
+              checked = params.value === "true";
+            } else {
+              return { success: false, error: `Invalid value for ${el.type}: ${params.value} (expected true/false)` };
+            }
+            setNativeChecked(el, checked);
+            valueApplied = true;
+          } else if (el instanceof HTMLSelectElement || el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+            if (typeof params.value !== "string" && typeof params.value !== "number" && typeof params.value !== "boolean") {
+              return { success: false, error: `Invalid value: ${JSON.stringify(params.value)} (expected string or number)` };
+            }
+            setNativeValue(el, params.value);
+            valueApplied = true;
+          } else {
+            return { success: false, error: `"value" only applies to input/textarea/select (got ${el.tagName.toLowerCase()})` };
+          }
+        }
+
+        let options: Record<string, unknown> = {};
+        if (params.options !== undefined) {
+          if (typeof params.options !== "object" || params.options === null || Array.isArray(params.options)) {
+            return { success: false, error: '"options" must be an object (EventInit properties, e.g. {"detail": {...}, "cancelable": false})' };
+          }
+          options = params.options as Record<string, unknown>;
+        }
+        const init = { bubbles: true, cancelable: true, composed: true, ...options };
+
+        // focus/blur：真实方法优先（activeElement 转移、:focus 样式、React onFocus/onBlur 都正确）；
+        // 目标不在焦点上时真实方法是 no-op → 退化为合成事件，确保处理器至少触发一次
+        if (event === "focus") {
+          if (document.activeElement !== el) el.focus();
+          else el.dispatchEvent(new Event("focus", init));
+        } else if (event === "blur") {
+          if (document.activeElement === el) el.blur();
+          else el.dispatchEvent(new Event("blur", init));
+        } else {
+          el.dispatchEvent(constructTriggerEvent(event, init));
+        }
+
+        // 等影响落地：事件处理器可能异步改 DOM（校验提示、联动重排等），落地后再返回
+        const stable = await waitForSettled(3000);
+        const waitForResult = params.waitFor
+          ? await waitForCondition(params.waitFor as { selector?: string; text?: string }, 3000)
+          : null;
+        const triggerData: Record<string, unknown> = {
+          selector,
+          event,
+          tag: el.tagName.toLowerCase(),
+          ...(valueApplied ? { value: params.value } : {}),
+          settledMs: stable.waited,
+        };
+        if (waitForResult) triggerData.waitFor = waitForResult;
+        return { success: true, data: triggerData };
+      }
+
       case "get_text": {
         const selector = params.selector as string;
         const el = selector ? findElement(selector) : document.body;
@@ -870,6 +958,33 @@ function keyboardEventInit(
       ? (/[0-9]/.test(key) ? `Digit${key}` : `Key${key.toUpperCase()}`)
       : key;
   return { key, code, keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true, ...mods };
+}
+
+// React 受控组件兼容的属性赋值：直接 el.value = x 会被 React 的 value tracker 拦截
+// （change 事件到达时 React 比对 tracker 记录认为"值没变"而不更新 state），
+// 走原型链原生 setter 可绕过 tracker，受控与非受控组件都生效。
+function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, value: unknown): void {
+  const proto =
+    el instanceof HTMLSelectElement ? HTMLSelectElement.prototype :
+    el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype :
+    HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+  if (setter) setter.call(el, String(value));
+  else (el as { value: string }).value = String(value);
+}
+
+function setNativeChecked(el: HTMLInputElement, checked: boolean): void {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked")?.set;
+  if (setter) setter.call(el, checked);
+  else el.checked = checked;
+}
+
+// 按事件名选构造器：key* → KeyboardEvent、mouse* → MouseEvent，
+// 其余（含自定义事件名）→ CustomEvent（options.detail 透传）
+function constructTriggerEvent(name: string, init: Record<string, unknown>): Event {
+  if (name.startsWith("key")) return new KeyboardEvent(name, init as KeyboardEventInit);
+  if (name.startsWith("mouse")) return new MouseEvent(name, init as MouseEventInit);
+  return new CustomEvent(name, init as CustomEventInit);
 }
 
 // --- Shadow DOM 穿透查找 ---

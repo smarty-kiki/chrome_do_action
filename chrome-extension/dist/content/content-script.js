@@ -389,6 +389,72 @@
           if (waitForResult) pasteData.waitFor = waitForResult;
           return { success: true, data: pasteData };
         }
+        case "trigger": {
+          const selector = params.selector;
+          const event = params.event;
+          if (!selector) return { success: false, error: 'Need "selector" parameter' };
+          if (!event) {
+            return { success: false, error: 'Need "event" parameter (e.g. "change", "blur", "focus", "input", "select", or a custom event name)' };
+          }
+          const known = ["selector", "event", "value", "options", "frame", "waitFor"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown trigger parameter(s): ${unknown.join(", ")} (expected selector, event, value, options)` };
+          }
+          const el = findElement(selector);
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+          let valueApplied = false;
+          if (params.value !== void 0) {
+            if (el instanceof HTMLInputElement && (el.type === "checkbox" || el.type === "radio")) {
+              let checked;
+              if (typeof params.value === "boolean") {
+                checked = params.value;
+              } else if (params.value === "true" || params.value === "false") {
+                checked = params.value === "true";
+              } else {
+                return { success: false, error: `Invalid value for ${el.type}: ${params.value} (expected true/false)` };
+              }
+              setNativeChecked(el, checked);
+              valueApplied = true;
+            } else if (el instanceof HTMLSelectElement || el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+              if (typeof params.value !== "string" && typeof params.value !== "number" && typeof params.value !== "boolean") {
+                return { success: false, error: `Invalid value: ${JSON.stringify(params.value)} (expected string or number)` };
+              }
+              setNativeValue(el, params.value);
+              valueApplied = true;
+            } else {
+              return { success: false, error: `"value" only applies to input/textarea/select (got ${el.tagName.toLowerCase()})` };
+            }
+          }
+          let options = {};
+          if (params.options !== void 0) {
+            if (typeof params.options !== "object" || params.options === null || Array.isArray(params.options)) {
+              return { success: false, error: '"options" must be an object (EventInit properties, e.g. {"detail": {...}, "cancelable": false})' };
+            }
+            options = params.options;
+          }
+          const init = { bubbles: true, cancelable: true, composed: true, ...options };
+          if (event === "focus") {
+            if (document.activeElement !== el) el.focus();
+            else el.dispatchEvent(new Event("focus", init));
+          } else if (event === "blur") {
+            if (document.activeElement === el) el.blur();
+            else el.dispatchEvent(new Event("blur", init));
+          } else {
+            el.dispatchEvent(constructTriggerEvent(event, init));
+          }
+          const stable = await waitForSettled(3e3);
+          const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
+          const triggerData = {
+            selector,
+            event,
+            tag: el.tagName.toLowerCase(),
+            ...valueApplied ? { value: params.value } : {},
+            settledMs: stable.waited
+          };
+          if (waitForResult) triggerData.waitFor = waitForResult;
+          return { success: true, data: triggerData };
+        }
         case "get_text": {
           const selector = params.selector;
           const el = selector ? findElement(selector) : document.body;
@@ -729,6 +795,22 @@
     const keyCode = KEY_CODE_MAP[key] ?? (single ? key.toUpperCase().charCodeAt(0) : 0);
     const code = key === " " || key === "Space" ? "Space" : single ? /[0-9]/.test(key) ? `Digit${key}` : `Key${key.toUpperCase()}` : key;
     return { key, code, keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true, ...mods };
+  }
+  function setNativeValue(el, value) {
+    const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) setter.call(el, String(value));
+    else el.value = String(value);
+  }
+  function setNativeChecked(el, checked) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked")?.set;
+    if (setter) setter.call(el, checked);
+    else el.checked = checked;
+  }
+  function constructTriggerEvent(name, init) {
+    if (name.startsWith("key")) return new KeyboardEvent(name, init);
+    if (name.startsWith("mouse")) return new MouseEvent(name, init);
+    return new CustomEvent(name, init);
   }
   function openShadowRootsDeep(root) {
     const out = [];

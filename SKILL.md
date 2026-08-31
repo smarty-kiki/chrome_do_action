@@ -1,11 +1,11 @@
 ---
 name: cda-chrome-control
-description: 通过 cda CLI 控制本机 Chrome 浏览器执行页面操作：打开网页、点击、输入文本、富文本排版、上传图片、截图、显示隐藏菜单、提取内容、监听 JS 错误、管理标签页。当用户要求"用 Chrome 打开某网页"、"控制浏览器做 XX"、"自动化公众号文章"、"抓取网页内容"、"填表单"等场景时使用。前置条件：Node.js 18+、本机 Chrome，按"安装"章节完成一次配置。
+description: 通过 cda CLI 控制本机 Chrome 浏览器执行页面操作：打开网页、点击、输入文本、触发事件、富文本排版、上传图片、截图、显示隐藏菜单、提取内容、监听 JS 错误、管理标签页。当用户要求"用 Chrome 打开某网页"、"控制浏览器做 XX"、"自动化公众号文章"、"抓取网页内容"、"填表单"等场景时使用。前置条件：Node.js 18+、本机 Chrome，按"安装"章节完成一次配置。
 version: 1.3.0
 display_name: cda Chrome 控制
 display_name_en: cda Chrome Control
-description_zh: 用命令行控制本机 Chrome 浏览器（打开/点击/输入/排版/上传/截图/公众号自动化）
-description_en: Control local Chrome via CLI (open/click/type/paste/upload/screenshot/WeChat MP automation)
+description_zh: 用命令行控制本机 Chrome 浏览器（打开/点击/输入/触发事件/排版/上传/截图/公众号自动化）
+description_en: Control local Chrome via CLI (open/click/type/trigger/paste/upload/screenshot/WeChat MP automation)
 visibility: public
 ---
 
@@ -81,6 +81,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | `real_click` | `send <id> real_click <tab> '{"selector":"#submit"}'` | 真实点击，对合成事件免疫的站点（如微信后台）有效；iframe（含跨域）同样可点。可选 `approach`：渐进移动路径 `[[x,y],...]`，先移向触发点再点目标，模拟多级 hover（如微信封面工具条「从图片库选择」） |
 | `type` | `send <id> type <tab> '{"selector":"#title","text":"标题"}'` | 输入文本：input/textarea 直接赋值；contenteditable 富文本按 `\n` 分段。`mode` 可选：`replace`（默认，清空原内容）/`append`（追加到末尾）/`insert`（光标处插入，有选中则替换选区） |
 | `keyboard` | `send <id> keyboard <tab> '{"selector":"#title","key":"Enter"}'` | 向元素发送按键（keydown/keypress/keyup，合成事件）；selector 省略用当前聚焦元素；支持 `ctrl`/`shift`/`alt`/`meta` 组合键 |
+| `trigger` | `send <id> trigger <tab> '{"selector":"#username","event":"blur"}'` | 触发元素事件：`blur` 触发表单校验、`change`+`value` 选下拉选项（React 受控组件同样生效）、自定义事件；`focus`/`blur` 触发真实焦点转移（表单校验生效）；带 settle + waitFor；`{options}` 透传事件属性 |
 | `paste_rich` | `send <id> paste_rich <tab> '{"selector":".ProseMirror","html":"<section>..."}'` | 向富文本编辑器注入带样式 HTML（先清空再插入），等价粘贴排好版的文档 |
 | `upload_file` | `send <id> upload_file <tab> '{"selector":"input[type=file]","base64":"...","filename":"a.jpg","mime":"image/jpeg"}'` | base64 图片注入 file input，触发 change 上传 |
 | `show` | `send <id> show <tab> '.js_imagedialog'` | 强制显示隐藏元素（仅改 CSS：visibility/opacity/display），让 hover 菜单常驻可见后可点击 |
@@ -95,7 +96,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 
 ### 关键技巧
 
-1. **等影响落地（settle）**：click/type/keyboard/upload_file/paste_rich/scroll/real_click 返回前会事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），返回 `settledMs`。影响落地晚（服务端请求后才渲染、长 debounce）时加 `waitFor` 谓词：`'{"selector":"#btn","waitFor":{"text":"发布成功"}}'`——50ms 轮询、条件满足瞬间返回 `{"settled":true,"waited":615}`。后台 tab 的 Chrome 定时器节流会让 settle 追加 ~1s 确认期，深度后台等不到就用 waitFor 或把 tab 切前台。
+1. **等影响落地（settle）**：click/type/keyboard/trigger/upload_file/paste_rich/scroll/real_click 返回前会事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），返回 `settledMs`。影响落地晚（服务端请求后才渲染、长 debounce）时加 `waitFor` 谓词：`'{"selector":"#btn","waitFor":{"text":"发布成功"}}'`——50ms 轮询、条件满足瞬间返回 `{"settled":true,"waited":615}`。后台 tab 的 Chrome 定时器节流会让 settle 追加 ~1s 确认期，深度后台等不到就用 waitFor 或把 tab 切前台。
 2. **坐标必须截图确认**：先 `screenshot` 看真实页面，再取坐标定位。
 3. **hover 菜单用 show 解决**：触发不了 hover 时别硬怼事件模拟，`show` 强制显示元素后普通 `click` 即可命中。操作完 `hide` 还原。确需真实 hover 链（如悬停才展开的嵌套菜单）时，用 `real_click` 的 `approach` 渐进路径逐级触发。
 4. **iframe 自动搜索**：元素命令默认顶层优先搜遍所有 iframe（含跨域），返回带命中 `frame.url`。目标在 iframe 内且自动搜索未命中时，加 `frame` 参数固定：`{"selector":"...","frame":{"url":"子串"}}`（跨域最稳）或 `{"frame":0}`（第 N 个顶层 iframe）。

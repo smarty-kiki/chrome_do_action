@@ -366,7 +366,7 @@ async function sendToTab(
     // 会跑稳定检测 + wait_for 谓词的动作命令（CS 侧最坏 ≈ 6s）超时放宽到 10s：
     // 1200ms 默认超时会把慢响应误判为 missing → frame 导航误报 / 元素未找到误报。
     // （导航时端口立即关闭，不受超时影响；get_text 等快命令仍用 1200ms）
-    const slowCommands = new Set(["click", "type", "keyboard", "upload_file", "paste_rich", "scroll"]);
+    const slowCommands = new Set(["click", "type", "keyboard", "upload_file", "paste_rich", "scroll", "trigger"]);
     for (const f of frames) {
       const r = await sendToFrame(tabId, f.frameId, msg, slowCommands.has(command) ? 10000 : 1200);
       if (r.missing) {
@@ -499,7 +499,7 @@ interface FullPageInfo {
 }
 
 // 需要在每个 frame 中查找元素的命令（首个命中即返回；坐标 click 只在顶层——elementFromPoint 语义）
-const ELEMENT_SEARCH_COMMANDS = new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect"]);
+const ELEMENT_SEARCH_COMMANDS = new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect", "trigger"]);
 
 interface SearchFrame {
   frameId: number;

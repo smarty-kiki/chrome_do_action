@@ -1,6 +1,6 @@
 # cda
 
-远程控制 Chrome 浏览器执行页面操作：打开页面、点击元素、输入文本、提取内容、监听 JS 错误。通过一条命令即可完成，无需编写脚本。
+远程控制 Chrome 浏览器执行页面操作：打开页面、点击元素、输入文本、触发事件、提取内容、监听 JS 错误。通过一条命令即可完成，无需编写脚本。
 
 ## 前提
 
@@ -58,7 +58,7 @@ cda list
 
 ### 等影响落地（settle）
 
-`click`/`type`/`keyboard`/`upload_file`/`paste_rich`/`scroll`/`real_click` 返回前会**等动作的影响落地**——事件驱动（DOM 变化 + 长任务检测），不是固定 sleep：
+`click`/`type`/`keyboard`/`trigger`/`upload_file`/`paste_rich`/`scroll`/`real_click` 返回前会**等动作的影响落地**——事件驱动（DOM 变化 + 长任务检测），不是固定 sleep：
 
 - **无影响动作**（点击无副作用元素）：约 0.6s 返回（600ms 活动窗口 + 静默确认）
 - **有影响动作**（异步渲染、debounce 重排）：等到 DOM 安静 250ms 后返回，`settledMs` 如实反映等待耗时
@@ -103,7 +103,7 @@ cda list
 
 ## _field 过滤
 
-通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/upload_file/paste_rich/scroll/show/hide/get_css/get_page_info/get_js_errors/real_click/open/refresh/close_tab），点路径逐段投影、保留嵌套形状：
+通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/trigger/upload_file/paste_rich/scroll/show/hide/get_css/get_page_info/get_js_errors/real_click/open/refresh/close_tab），点路径逐段投影、保留嵌套形状：
 
 - `--field a` → `{a: 完整值}`
 - `--field a.b` → `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）
@@ -150,7 +150,7 @@ cda --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#titl
 
 ## iframe 定位
 
-元素命令（`click`/`real_click`/`type`/`keyboard`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
 
 如需指定 frame，加 `frame` 参数：
 
@@ -161,14 +161,14 @@ cda --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#titl
 {"selector": "#submit", "frame": {"url": "mp.weixin.qq.com"}}  // URL 含子串的首个 frame（跨域最稳）
 ```
 
-- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`
+- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`
 - **跨域 iframe 同样可读可操作**：元素命令自动搜索所有 frame，跨域 iframe 同样能定位命中
 - `real_click` 在 iframe 内同样可用（含跨域）
 - `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；要读 iframe 文本用 `{"selector":"...","frame":{...}}`
 
 ## shadow DOM 定位
 
-Web Components 站点（小红书创作后台等）把按钮/编辑器包在 shadow root 里，普通选择器、XPath 无法穿透。元素命令（`click`/`real_click`/`type`/`keyboard`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）默认**透明穿透 open shadow root**，三种方式从显式到隐式：
+Web Components 站点（小红书创作后台等）把按钮/编辑器包在 shadow root 里，普通选择器、XPath 无法穿透。元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）默认**透明穿透 open shadow root**，三种方式从显式到隐式：
 
 1. **路径标记 `#shadow-root`**：直接粘贴 DevTools 元素面板「Copy → Copy element path」复制的完整路径（原生 `querySelector` 就是这么写的）：
 
@@ -231,6 +231,19 @@ cda send OfficePC click current '{"text":"登录"}'
 ```bash
 cda send OfficePC click current '{"text":"登录"}' --field "currentTab.url,navigated"
 ```
+
+### 表单校验与下拉选择（trigger）
+
+Element UI / Ant Design 等表单在 `blur` 上触发校验：`type` 输入后字段从未失焦，直接点提交常被校验拦截。输入后主动触发 blur，再点提交：
+
+```bash
+cda send OfficePC type current '{"selector":"#username","text":"admin"}'
+cda send OfficePC trigger current '{"selector":"#username","event":"blur"}'
+cda send OfficePC trigger current '{"selector":"#category","event":"change","value":"2"}'
+cda send OfficePC click current '{"text":"提交"}'
+```
+
+下拉框选中：`value` 设选项值 + `change` 事件一次完成，React 受控组件同样生效。
 
 ### 富文本编辑器输入（公众号/后台系统）
 
@@ -382,6 +395,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | `real_click` | `send <id> real_click <tab> <params>` | 真实点击（对忽略合成事件的站点有效），参数 {selector} 或 {x,y}，可选 {approach} 渐进移动路径；用于合成事件无效的站点（如微信后台）及 hover 工具条 |
 | `type` | `send <id> type <tab> <params>` | 输入文本（{selector,text}），支持 input/textarea 与 contenteditable 富文本，富文本按换行分段 |
 | `keyboard` | `send <id> keyboard <tab> <params>` | 向元素发送按键（{selector,key}，selector 可省略用当前聚焦元素），触发页面 keydown/keypress/keyup 处理器；可加 {ctrl,shift,alt,meta} 组合键 |
+| `trigger` | `send <id> trigger <tab> <params>` | 触发元素事件（{selector,event}，可选 {value}/{options}）：blur 校验、change+value 选下拉选项、自定义事件；focus/blur 触发真实焦点转移；带 settle + waitFor |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入本地图片（{selector,base64,filename,mime}），触发 change 事件完成上传 |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | 向 contenteditable 富文本编辑器粘贴带样式的 HTML（{selector,html}），等价于粘贴排好版的文档 |
 | `show` | `send <id> show <tab> <params>` | 强制显示隐藏元素（{selector}），仅改 CSS 样式不执行代码；让 hover 才显示的菜单/工具条常驻可见，随后可被 click 命中 |
@@ -445,6 +459,29 @@ cda send OfficePC get_text current '{"selector":"table"}'
 - 自动补全 `keyCode`/`which` 与 `code`，兼容只监听旧式键码的页面处理器
 - **合成事件**：能触发页面 JS 的 keydown/keyup 处理器（Enter 提交、Escape 关闭、方向键导航等通常由 JS 实现），但**不会触发浏览器原生默认行为**（如 input 内 Enter 换行/表单默认提交、Tab 切换焦点）；对依赖原生默认行为的场景，先 `click` 聚焦后结合页面自身 JS 处理器使用
 - 自动搜索 iframe，返回 `{ key, selector, tag, modifiers }`
+
+### trigger 参数
+
+```json
+{"selector": "#username", "event": "blur"}                          // 触发失焦（触发 blur 校验）
+{"selector": "#category", "event": "change", "value": "2"}          // 选中下拉选项并触发 change
+{"selector": "#agree", "event": "change", "value": true}            // 勾选 checkbox 并触发 change
+{"selector": "#title", "event": "input", "value": "新标题"}          // 更新输入值并触发 input
+{"selector": ".el-dialog", "event": "xhs:refresh", "options": {"detail": {"id": 1}}}  // 自定义事件
+```
+
+- 向元素派发指定事件（`blur`/`focus`/`change`/`input`/`select`/自定义事件名等），**等影响落地后返回**（settle + 可选 `waitFor`，与 `type`/`keyboard` 同语义）
+- **`value`（可选）**：先设置属性再派发事件，一次调用完成"改值 + 触发"：
+  - `select` → 选中 value 对应的 option；`input`/`textarea` → 设置值
+  - `checkbox`/`radio` → 勾选状态（`true`/`false`）
+  - **React 受控组件同样生效**
+  - `value` 仅适用于 input/textarea/select，对其他元素报错
+- **`options`（可选）**：透传给事件（`bubbles`/`cancelable`/`composed`/`detail` 等，默认 `{bubbles:true, cancelable:true, composed:true}`）；`detail` 传给自定义事件
+- **`focus`/`blur` 触发真实焦点转移**：`:focus` 样式生效、表单校验按真实失焦处理；元素不在焦点上时也保证事件处理器触发
+- 事件名以 `key`/`mouse` 开头时，`options` 支持 `key`/`code`/`clientX` 等对应属性；其他事件支持 `detail` 传自定义数据
+- **合成事件**：能触发页面 JS 的事件处理器，但校验事件是否来自真实操作的站点无效（此类站点请用 `real_click`）
+- 返回 `{ selector, event, tag, settledMs }`；传了 `value` 时返回 `{ value }`；传了 `waitFor` 时返回 `{ waitFor }`
+- 自动搜索 iframe（含跨域），支持 `frame` 参数与 shadow DOM 穿透，`--field` 可裁剪返回
 
 ### upload_file 参数
 

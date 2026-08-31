@@ -465,7 +465,7 @@
         return;
       }
       const frames = await resolveSearchFrames(tabId, params.frame);
-      const slowCommands = /* @__PURE__ */ new Set(["click", "type", "keyboard", "upload_file", "paste_rich", "scroll"]);
+      const slowCommands = /* @__PURE__ */ new Set(["click", "type", "keyboard", "upload_file", "paste_rich", "scroll", "trigger"]);
       for (const f of frames) {
         const r = await sendToFrame(tabId, f.frameId, msg, slowCommands.has(command) ? 1e4 : 1200);
         if (r.missing) {
@@ -565,7 +565,7 @@
       return [];
     }
   }
-  var ELEMENT_SEARCH_COMMANDS = /* @__PURE__ */ new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect"]);
+  var ELEMENT_SEARCH_COMMANDS = /* @__PURE__ */ new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "paste_rich", "get_rect", "trigger"]);
   var frameTreeCache = /* @__PURE__ */ new Map();
   chrome.tabs.onUpdated.addListener((tabId, info) => {
     if (info.status === "complete") frameTreeCache.delete(tabId);

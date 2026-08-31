@@ -49,6 +49,14 @@ Page commands (tab required):
   keyboard <tab> <params>     Send key press to element ({selector,key[,ctrl|shift|alt|meta][,waitFor]});
                               selector optional (defaults to focused element); key e.g.
                               Enter, Escape, Tab, ArrowDown, or a single char
+  trigger <tab> <params>      Dispatch an event on an element
+                              ({selector,event}[,value][,options][,waitFor]);
+                              event e.g. blur/change/input/focus/select/custom name;
+                              {value} sets the property first (select option,
+                              input value, checkbox checked — React controlled
+                              components included); focus/blur move real focus
+                              (form validation works); {options} passes through
+                              to the event (bubbles/detail/etc.)
   upload_file <tab> <params>  Inject base64 image into file input
                               ({selector,base64,filename,mime[,waitFor]}), triggers change
   paste_rich <tab> <params>   Paste styled HTML into contenteditable
@@ -77,8 +85,8 @@ frame param (optional, for element commands that search iframes):
   {frame: {url: "substring"}} first frame whose url contains the substring
                               (most reliable for cross-origin iframes)
 
-Settle — impact-aware returns (click/type/keyboard/upload_file/paste_rich/
-scroll/real_click):
+Settle — impact-aware returns (click/type/keyboard/trigger/upload_file/
+paste_rich/scroll/real_click):
   Commands wait for the action's impact to land before returning. Event-driven
   (DOM mutations + long tasks, no fixed sleep), returns {settledMs} (ms waited):
   no-impact actions return ~0.6s; impacted actions return once the DOM is quiet
@@ -104,6 +112,8 @@ Examples:
   cda send abc paste_rich current '{"selector":".ProseMirror","html":"<section><span>hi</span></section>"}'
   cda send abc upload_file current '{"selector":"input[type=file]","base64":"<b64>","filename":"a.jpg","mime":"image/jpeg"}'
   cda send abc scroll current '{"y":500}'
+  cda send abc trigger current '{"selector":"#username","event":"blur"}'
+  cda send abc trigger current '{"selector":"#category","event":"change","value":"2"}'
   cda send abc get_css current "h1.title"`;
 function parseArgs(argv) {
     const raw = {};
@@ -146,7 +156,7 @@ function buildMessage(action, args) {
             console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
-            console.error("Page commands (tab required): click | real_click | type | keyboard | upload_file | paste_rich | show | hide | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | screenshot | scroll");
+            console.error("Page commands (tab required): click | real_click | type | keyboard | trigger | upload_file | paste_rich | show | hide | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | screenshot | scroll");
             console.error("");
             console.error("Example: cda send abc123 get_page_info current");
             process.exit(1);

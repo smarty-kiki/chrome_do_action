@@ -54,7 +54,8 @@
 | 📸 页面截图 | 对页面「所见即所得」截图，本地自动保存 PNG，排查元素遮挡/浮层/滚动位置 |
 | 🐛 JS 错误收集 | 页面加载即持续监听 `error` 与 `unhandledrejection`，随时查询/清空 |
 | ⚡ 按需采集 `--field` | 所有返回对象的命令都支持点路径投影（`--field "clickDesc.selector,settledMs,currentTab.url"`），只采集/返回需要的字段，命令更快、结果更精简 |
-| ⏳ 等影响落地 | 操作命令返回前事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），`settledMs` 如实反映；影响晚到的场景用 `waitFor` 谓词（50ms 轮询、条件满足瞬间返回，后台 tab 亦可靠） |
+| ⏳ 等影响落地 | 操作命令（click/type/keyboard/trigger/upload_file/paste_rich/scroll/real_click）返回前事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），`settledMs` 如实反映；影响晚到的场景用 `waitFor` 谓词（50ms 轮询、条件满足瞬间返回，后台 tab 亦可靠） |
+| ⚡ 事件触发 `trigger` | 触发任意元素事件（blur 表单校验、change+value 下拉选择、自定义事件），React 受控组件同样生效；`focus`/`blur` 触发真实焦点转移（校验生效） |
 | 🔎 状态感知 | 自动检测页面跳转、新开标签页、iframe 变化，命令返回「操作后的世界」而非裸事件 |
 | 🧩 iframe 支持 | 所有元素命令自动搜索 iframe（含跨域）并可直接读写操作，`iframes` 元数据对跨域也补全 `url`/`html` |
 | 🌘 shadow DOM 支持 | 所有元素命令透明穿透 open shadow root（DevTools 路径 `#shadow-root` / `>>>` / 裸选择器自动兜底），`get_page_info` 的 html 默认包含 shadow 内容 |
@@ -178,6 +179,13 @@ cda send OfficePC click current '{"text":"登录"}' --field "currentTab.url,navi
 # 登录成功后 navigated: true，并返回跳转后的新页面信息
 ```
 
+Element UI / Ant Design 等表单在 `blur` 上触发校验，输入后主动触发 blur 再提交，避免被校验拦截：
+
+```bash
+cda send OfficePC trigger current '{"selector":"#username","event":"blur"}'
+cda send OfficePC trigger current '{"selector":"#category","event":"change","value":"2"}'   # 下拉选中 + change
+```
+
 ### 公众号富文本排版 + 封面图上传
 
 ```bash
@@ -239,6 +247,7 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 | `real_click` | `send <id> real_click <tab> <params>` | 真实点击，支持 `approach` 渐进 hover 路径 |
 | `type` | `send <id> type <tab> <params>` | 输入文本；支持 input/textarea 与 contenteditable 富文本 |
 | `keyboard` | `send <id> keyboard <tab> <params>` | 向元素发送按键（`{selector,key}`，selector 省略用当前聚焦元素），可加 `ctrl`/`shift`/`alt`/`meta` 组合键 |
+| `trigger` | `send <id> trigger <tab> <params>` | 触发元素事件（`{selector,event}`）：`blur` 触发表单校验、`change`+`value` 选下拉选项（React 受控组件同样生效）、自定义事件；`focus`/`blur` 触发真实焦点转移；带 settle + waitFor |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入 base64 图片并触发上传 |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | 向富文本编辑器粘贴带样式的 HTML |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取元素/整页文本 |
@@ -307,7 +316,7 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-**所有返回对象的命令**都支持：`click`/`type`/`keyboard`/`upload_file`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`。字段路径逗号分隔、点号嵌套投影：`--field a.b` 返回 `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）；路径段遇数组逐项投影（`newTabs.url` → `{newTabs: [url, ...]}`）；不存在的路径忽略。`get_text` 返回纯文本，无字段可滤。
+**所有返回对象的命令**都支持：`click`/`type`/`keyboard`/`trigger`/`upload_file`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`。字段路径逗号分隔、点号嵌套投影：`--field a.b` 返回 `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）；路径段遇数组逐项投影（`newTabs.url` → `{newTabs: [url, ...]}`）；不存在的路径忽略。`get_text` 返回纯文本，无字段可滤。
 
 ### 4. 状态感知：操作之后自动「看结果」
 
@@ -331,7 +340,7 @@ cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "sett
 
 ### 7. iframe 读写操作
 
-所有元素命令（`click`/`real_click`/`type`/`keyboard`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）都**自动搜索 iframe**：顶层优先、深度优先遍历每个 frame（含跨域），首个命中即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+所有元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`paste_rich`）都**自动搜索 iframe**：顶层优先、深度优先遍历每个 frame（含跨域），首个命中即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
 
 ```bash
 # 读取 iframe 内元素文本（自动搜索到跨域 iframe）
