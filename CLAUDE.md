@@ -35,9 +35,13 @@
 - commit 前：0.1.3 → 0.2.0
 - 用户说「升级大版本」：0.2.0 → 1.0.0
 
-## 构建流程（改完插件源码必须执行）
+## 构建流程（三模块各自源码改动都必须重建）
 
-1. 修改 `chrome-extension/src/` 下的源码（或 bump 版本号）后，**必须**在 `chrome-extension/` 下执行 `npm run build`
-   - 浏览器加载的是 `chrome-extension/dist/` 构建产物，不重新构建的话，即使 reload 扩展，跑的还是旧代码、旧版本号
-2. `dist/` 是 **git 跟踪**的构建产物（历史 commit 均包含），重新构建后改动要一并 commit
-3. 构建后测试：在 `chrome://extensions` 页面点击 Chrome Do Action 卡片上的 ⟳ 重新加载扩展（unpacked 扩展不会热更新）
+1. **哪个模块改了源码或版本号，就必须在哪个模块目录下执行 `npm run build`**：
+   - `cli/` → `cli/dist/cli.js`（tsc 编译）
+   - `server/` → `server/dist/server.js`（tsc 编译）
+   - `chrome-extension/` → `chrome-extension/dist/`（含 manifest/版本号）
+   - 漏重建的典型后果：CLI `--help` 还是旧命令列表、server 跑旧逻辑、浏览器加载旧代码旧版本号
+2. **三个模块的 `dist/` 都是 git 跟踪的构建产物**（历史 commit 均包含），重新构建后改动要一并 commit
+3. 插件构建后测试：在 `chrome://extensions` 页面点击 Chrome Do Action 卡片上的 ⟳ 重新加载扩展（unpacked 扩展不会热更新）
+4. commit 前检查：`git status` 里若出现 `cli/src` / `server/src` / `chrome-extension/src` 的改动，但对应 `dist/` 产物没变，说明漏了构建
