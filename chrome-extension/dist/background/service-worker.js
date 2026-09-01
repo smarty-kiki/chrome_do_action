@@ -330,12 +330,41 @@
     if (data === null || typeof data !== "object" || Array.isArray(data)) return data;
     const src = data;
     const out = {};
+    const groups = /* @__PURE__ */ new Map();
     for (const f of fields) {
       const keys = f.split(".").filter(Boolean);
-      const root = keys[0];
-      if (!keys.length || !(root in src)) continue;
-      const picked = pickPath(src[root], keys.slice(1));
-      if (picked !== void 0) out[root] = picked;
+      if (!keys.length || !(keys[0] in src)) continue;
+      const list = groups.get(keys[0]) ?? [];
+      list.push(keys.slice(1));
+      groups.set(keys[0], list);
+    }
+    for (const [root, paths] of groups) {
+      if (paths.length === 1) {
+        const picked = pickPath(src[root], paths[0]);
+        if (picked !== void 0) out[root] = picked;
+        continue;
+      }
+      const value = src[root];
+      if (Array.isArray(value)) {
+        const items = [];
+        for (const item of value) {
+          if (item === null || typeof item !== "object") continue;
+          const obj = {};
+          for (const p of paths) {
+            const picked = pickPath(item, p);
+            if (picked !== void 0) Object.assign(obj, picked);
+          }
+          if (Object.keys(obj).length > 0) items.push(obj);
+        }
+        out[root] = items;
+      } else if (value !== null && typeof value === "object") {
+        for (const p of paths) {
+          const picked = pickPath(value, p);
+          if (picked !== void 0) {
+            out[root] = { ...out[root], ...picked };
+          }
+        }
+      }
     }
     return out;
   }
@@ -432,6 +461,38 @@
     if (command === "get_page_info") {
       const info = await getFullPageInfo(tabId, params);
       sendResult({ commandId: cmd.id, success: info != null, data: info ?? void 0, error: info ? void 0 : "get_page_info failed" });
+      onDone?.();
+      return;
+    }
+    if (command === "list_elements") {
+      const max = typeof params.max === "number" && Number.isFinite(params.max) ? Math.min(Math.max(1, Math.floor(params.max)), 200) : 50;
+      const doCollect = async () => {
+        const frames = await resolveSearchFrames(tabId, params.frame);
+        const elements2 = [];
+        let responded2 = false;
+        for (const f of frames) {
+          const { response: response2 } = await sendToFrame(tabId, f.frameId, msg, 5e3);
+          if (response2) responded2 = true;
+          const els = response2?.data?.elements;
+          if (!Array.isArray(els)) continue;
+          for (const e of els) elements2.push({ ...e, ...f.frameId !== 0 ? { frame: f.url } : {} });
+        }
+        return { elements: elements2, responded: responded2 };
+      };
+      let { elements, responded } = await doCollect();
+      if (!responded) {
+        try {
+          await injectContentScript(tabId);
+          ({ elements, responded } = await doCollect());
+        } catch {
+        }
+      }
+      const truncated = elements.length > max;
+      sendResult({
+        commandId: cmd.id,
+        success: true,
+        data: { count: truncated ? max : elements.length, truncated, elements: truncated ? elements.slice(0, max) : elements }
+      });
       onDone?.();
       return;
     }

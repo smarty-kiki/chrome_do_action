@@ -194,12 +194,45 @@ function applyFieldFilter(data: unknown, fields: string[]): unknown {
   if (data === null || typeof data !== "object" || Array.isArray(data)) return data;
   const src = data as Record<string, unknown>;
   const out: Record<string, unknown> = {};
+  // 按根字段分组：同一根的多路径必须合并（数组根逐项合成对象、对象根浅合并），
+  // 否则后写覆盖前写——--field "elements.accept,elements.selector" 会只剩 selector
+  const groups = new Map<string, string[][]>();
   for (const f of fields) {
     const keys = f.split(".").filter(Boolean);
-    const root = keys[0];
-    if (!keys.length || !(root in src)) continue;
-    const picked = pickPath(src[root], keys.slice(1));
-    if (picked !== undefined) out[root] = picked;
+    if (!keys.length || !(keys[0] in src)) continue;
+    const list = groups.get(keys[0]) ?? [];
+    list.push(keys.slice(1));
+    groups.set(keys[0], list);
+  }
+  for (const [root, paths] of groups) {
+    if (paths.length === 1) {
+      const picked = pickPath(src[root], paths[0]);
+      if (picked !== undefined) out[root] = picked;
+      continue;
+    }
+    const value = src[root];
+    if (Array.isArray(value)) {
+      // 数组根：逐项把各路径取值合进同一对象（叶子段取标量、深层段保留嵌套）
+      const items: Record<string, unknown>[] = [];
+      for (const item of value) {
+        if (item === null || typeof item !== "object") continue;
+        const obj: Record<string, unknown> = {};
+        for (const p of paths) {
+          const picked = pickPath(item as Record<string, unknown>, p);
+          if (picked !== undefined) Object.assign(obj, picked);
+        }
+        if (Object.keys(obj).length > 0) items.push(obj);
+      }
+      out[root] = items;
+    } else if (value !== null && typeof value === "object") {
+      // 对象根：不同键浅合并（同键后写覆盖，与单路径行为一致）
+      for (const p of paths) {
+        const picked = pickPath(value, p);
+        if (picked !== undefined) {
+          out[root] = { ...(out[root] as Record<string, unknown> | undefined), ...(picked as Record<string, unknown>) };
+        }
+      }
+    }
   }
   return out;
 }
@@ -322,6 +355,40 @@ async function sendToTab(
   if (command === "get_page_info") {
     const info = await getFullPageInfo(tabId, params as Record<string, string[]> | undefined);
     sendResult({ commandId: cmd.id!, success: info != null, data: info ?? undefined, error: info ? undefined : "get_page_info failed" });
+    onDone?.();
+    return;
+  }
+  if (command === "list_elements") {
+    // 全 frame 聚合（与 broadcastJsErrors 同模式）：resolveSearchFrames 的缺省/auto 即「全部
+    // frame 汇总」；top/数字/{url} 只扫目标 frame。元素带 frame 归属（非顶层标注 url），
+    // 汇总后统一按 max 截断
+    const max = typeof params.max === "number" && Number.isFinite(params.max) ? Math.min(Math.max(1, Math.floor(params.max)), 200) : 50;
+    const doCollect = async (): Promise<{ elements: Record<string, unknown>[]; responded: boolean }> => {
+      const frames = await resolveSearchFrames(tabId, params.frame);
+      const elements: Record<string, unknown>[] = [];
+      let responded = false;
+      for (const f of frames) {
+        const { response } = await sendToFrame(tabId, f.frameId, msg, 5000);
+        if (response) responded = true;
+        const els = (response?.data as { elements?: Record<string, unknown>[] } | undefined)?.elements;
+        if (!Array.isArray(els)) continue;
+        for (const e of els) elements.push({ ...e, ...(f.frameId !== 0 ? { frame: f.url } : {}) });
+      }
+      return { elements, responded };
+    };
+    let { elements, responded } = await doCollect();
+    if (!responded) {
+      // 没有任何 frame 有 content script（动态 frame / 页面加载前）：注入一次后重试
+      try {
+        await injectContentScript(tabId);
+        ({ elements, responded } = await doCollect());
+      } catch { /* 注入失败，按当前结果返回 */ }
+    }
+    const truncated = elements.length > max;
+    sendResult({
+      commandId: cmd.id!, success: true,
+      data: { count: truncated ? max : elements.length, truncated, elements: truncated ? elements.slice(0, max) : elements },
+    });
     onDone?.();
     return;
   }

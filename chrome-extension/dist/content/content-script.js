@@ -335,6 +335,9 @@
           if (!(el instanceof HTMLInputElement) || el.type !== "file") {
             return { success: false, error: `Element is not a file input: ${selector}` };
           }
+          if (el.accept && !acceptMatches(el.accept, mime, filename)) {
+            return { success: false, error: `File type not accepted by input: mime=${mime} filename=${filename}, accept="${el.accept}"` };
+          }
           const clean = base64.replace(/^data:[^;]+;base64,/, "");
           const bin = atob(clean);
           const bytes = new Uint8Array(bin.length);
@@ -560,6 +563,100 @@
           const data = { ...pageInfo };
           if (fields.length === 0 || fields.includes("iframes")) data.iframes = iframes;
           return { success: true, data };
+        }
+        case "list_elements": {
+          const known = ["frame", "filter", "text", "max", "visible"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown list_elements parameter(s): ${unknown.join(", ")} (expected frame, filter, text, max, visible)` };
+          }
+          const filters = typeof params.filter === "string" ? params.filter.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
+          const textFilter = typeof params.text === "string" ? params.text.trim() : "";
+          let max = typeof params.max === "number" && Number.isFinite(params.max) ? Math.max(1, Math.floor(params.max)) : 50;
+          max = Math.min(max, 200);
+          const visibleOnly = params.visible === true;
+          const hiddenOnly = params.visible === false;
+          const INTERACTIVE_SELECTOR = "button, a, select, textarea, input, label, [contenteditable], [tabindex], [role]";
+          const INTERACTIVE_ROLES = /* @__PURE__ */ new Set(["button", "link", "checkbox", "radio", "switch", "tab", "menuitem", "option", "combobox", "textbox", "listbox", "slider", "spinbutton", "searchbox"]);
+          const candidates = [];
+          const seen = /* @__PURE__ */ new Set();
+          const consider = (el) => {
+            if (seen.has(el) || el instanceof HTMLScriptElement || el instanceof HTMLStyleElement || el instanceof HTMLTemplateElement) return;
+            const role = el.getAttribute("role")?.toLowerCase();
+            if (role && !INTERACTIVE_ROLES.has(role)) return;
+            seen.add(el);
+            candidates.push(el);
+          };
+          for (const el of Array.from(document.querySelectorAll(INTERACTIVE_SELECTOR))) consider(el);
+          for (const sr of openShadowRootsDeep(document)) {
+            for (const el of Array.from(sr.querySelectorAll(INTERACTIVE_SELECTOR))) consider(el);
+          }
+          const elements = [];
+          for (const el of candidates) {
+            const html = el;
+            const tag = el.tagName.toLowerCase();
+            const role = el.getAttribute("role")?.toLowerCase() ?? void 0;
+            const type = el instanceof HTMLInputElement ? el.type : void 0;
+            const text = (html.innerText ?? "").trim().replace(/\s+/g, " ").slice(0, 80);
+            const visible = isVisible(html);
+            if (visibleOnly && !visible) continue;
+            if (hiddenOnly && visible) continue;
+            if (textFilter && !text.includes(textFilter)) continue;
+            if (filters.length > 0) {
+              const hit = filters.some((f) => {
+                switch (f) {
+                  case "button":
+                    return tag === "button" || role === "button";
+                  case "link":
+                    return tag === "a" || role === "link";
+                  case "input":
+                    return tag === "input";
+                  case "select":
+                    return tag === "select";
+                  case "textarea":
+                    return tag === "textarea";
+                  case "label":
+                    return tag === "label";
+                  case "editable":
+                    return html.isContentEditable || tag === "textarea" || tag === "input" && type !== void 0 && /text|search|email|url|tel|number|password|date|time|datetime-local|month|week/.test(type);
+                  case "upload":
+                    return tag === "input" && type === "file" || /点击上传|上传|拖入|拖拽|拖到|upload|drop/i.test(text);
+                  default:
+                    return true;
+                }
+              });
+              if (!hit) continue;
+            }
+            const rect = el.getBoundingClientRect();
+            const item = {
+              tag,
+              visible,
+              x: Math.round(rect.left),
+              y: Math.round(rect.top),
+              w: Math.round(rect.width),
+              h: Math.round(rect.height),
+              selector: genSelector(el)
+            };
+            if (el instanceof HTMLInputElement) {
+              if (type) item.type = type;
+              if (el.accept) item.accept = el.accept;
+              if (el.multiple) item.multiple = true;
+              if (el.name) item.name = el.name;
+              if (el.placeholder) item.placeholder = el.placeholder;
+            }
+            if (role) item.role = role;
+            const ariaLabel = el.getAttribute("aria-label");
+            if (ariaLabel) item.ariaLabel = ariaLabel;
+            const title = el.getAttribute("title");
+            if (title) item.title = title;
+            if (text) item.text = text;
+            elements.push(item);
+          }
+          const truncated = elements.length > max;
+          return {
+            success: true,
+            data: { count: truncated ? max : elements.length, truncated, elements: truncated ? elements.slice(0, max) : elements }
+          };
         }
         case "get_js_errors": {
           return { success: true, data: { errors: [...jsErrors], count: jsErrors.length } };
@@ -816,6 +913,16 @@
     if (style.display === "none" || style.visibility === "hidden") return false;
     const rect = el.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
+  }
+  function acceptMatches(accept, mime, filename) {
+    const mimeLower = mime.toLowerCase();
+    const mimeType = mimeLower.split("/")[0] ?? "";
+    const ext = (filename.split(".").pop() ?? "").toLowerCase();
+    return accept.split(",").map((a) => a.trim().toLowerCase()).filter(Boolean).some((a) => {
+      if (a.startsWith(".")) return `.${ext}` === a;
+      if (a.endsWith("/*")) return mimeType === a.slice(0, -2);
+      return a === mimeLower;
+    });
   }
   function xpathStr(s) {
     if (!s.includes("'")) return `'${s}'`;
@@ -1081,6 +1188,51 @@
       return findXPathPierced(selector.slice(6));
     }
     return findCssPierced(selector);
+  }
+  function genSelector(el) {
+    const esc = (s) => CSS.escape(s);
+    const nthOfType = (e) => {
+      let n = 1;
+      for (let sib = e.previousElementSibling; sib; sib = sib.previousElementSibling) {
+        if (sib.tagName === e.tagName) n++;
+      }
+      return n;
+    };
+    const segs = [];
+    let cur = el;
+    let lastCross = false;
+    while (cur && cur !== document.body && cur !== document.documentElement) {
+      let seg;
+      if (cur.id && document.querySelectorAll(`#${esc(cur.id)}`).length === 1) {
+        seg = `#${esc(cur.id)}`;
+        if (segs.length > 0) segs[0].cross = lastCross;
+        segs.unshift({ seg, cross: false });
+        break;
+      } else {
+        const cls = Array.from(cur.classList).filter((c) => /^[a-zA-Z_][\w-]*$/.test(c)).slice(0, 2);
+        if (cls.length > 0) {
+          seg = `${cur.tagName.toLowerCase()}.${cls.join(".")}`;
+        } else {
+          seg = `${cur.tagName.toLowerCase()}:nth-of-type(${nthOfType(cur)})`;
+        }
+      }
+      if (segs.length > 0) segs[0].cross = lastCross;
+      segs.unshift({ seg, cross: false });
+      const root = cur.getRootNode();
+      if (root instanceof ShadowRoot) {
+        cur = root.host;
+        lastCross = true;
+      } else {
+        cur = cur.parentElement;
+        lastCross = false;
+      }
+    }
+    let out = "";
+    for (let i = 0; i < segs.length; i++) {
+      if (i > 0) out += segs[i - 1].cross ? " >>> " : " > ";
+      out += segs[i].seg;
+    }
+    return out || el.tagName.toLowerCase();
   }
   chrome.runtime.sendMessage({ type: "cs_injected" }).catch(() => {
   });

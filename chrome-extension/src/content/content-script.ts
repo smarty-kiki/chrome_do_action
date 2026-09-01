@@ -17,6 +17,26 @@ function onUnhandledRejection(ev: PromiseRejectionEvent) {
 window.addEventListener("error", onPageError);
 window.addEventListener("unhandledrejection", onUnhandledRejection);
 
+// list_elements 返回的单个元素条目（service worker 聚合时给非顶层 frame 补 frame 字段）
+interface ElementInfo {
+  tag: string;
+  visible: boolean;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  selector: string;
+  type?: string;
+  accept?: string;
+  multiple?: boolean;
+  name?: string;
+  placeholder?: string;
+  role?: string;
+  ariaLabel?: string;
+  title?: string;
+  text?: string;
+}
+
 // --- show/hide 还原注册表 ---
 // show 记录被改元素的原始 inline 样式，hide 或 ttl 到期时精确还原（清掉 inline style 回到 CSS 控制）
 const showRegistry = new Map<HTMLElement, { visibility?: string; opacity?: string; display?: string }>();
@@ -415,6 +435,11 @@ async function handleCommand(
         if (!(el instanceof HTMLInputElement) || el.type !== "file") {
           return { success: false, error: `Element is not a file input: ${selector}` };
         }
+        // accept 预检：注入到 accept 不匹配的 input 会被页面静默忽略（注入成功但上传不触发，
+        // 误导调用方以为成功）——客户端先拦下，避免抖音这类多 file input 页面注入错目标
+        if (el.accept && !acceptMatches(el.accept, mime, filename)) {
+          return { success: false, error: `File type not accepted by input: mime=${mime} filename=${filename}, accept="${el.accept}"` };
+        }
         // base64 -> Uint8Array
         const clean = base64.replace(/^data:[^;]+;base64,/, "");
         const bin = atob(clean);
@@ -690,6 +715,100 @@ async function handleCommand(
         const data: Record<string, unknown> = { ...pageInfo };
         if (fields.length === 0 || fields.includes("iframes")) data.iframes = iframes;
         return { success: true, data };
+      }
+
+      case "list_elements": {
+        // 扫描当前 frame 的可交互元素（穿透 open shadow root），生成带 selector 的清单，
+        // 供 agent 先查后操作；service worker 按 frame 汇总各 frame 的结果
+        const known = ["frame", "filter", "text", "max", "visible"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown list_elements parameter(s): ${unknown.join(", ")} (expected frame, filter, text, max, visible)` };
+        }
+        const filters = typeof params.filter === "string"
+          ? params.filter.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+          : [];
+        const textFilter = typeof params.text === "string" ? params.text.trim() : "";
+        let max = typeof params.max === "number" && Number.isFinite(params.max) ? Math.max(1, Math.floor(params.max)) : 50;
+        max = Math.min(max, 200);
+        const visibleOnly = params.visible === true;
+        const hiddenOnly = params.visible === false;
+
+        // 候选范围：light DOM + 所有 open shadow root（按文档序去重）
+        const INTERACTIVE_SELECTOR = "button, a, select, textarea, input, label, [contenteditable], [tabindex], [role]";
+        const INTERACTIVE_ROLES = new Set(["button", "link", "checkbox", "radio", "switch", "tab", "menuitem", "option", "combobox", "textbox", "listbox", "slider", "spinbutton", "searchbox"]);
+        const candidates: Element[] = [];
+        const seen = new Set<Element>();
+        const consider = (el: Element) => {
+          if (seen.has(el) || el instanceof HTMLScriptElement || el instanceof HTMLStyleElement || el instanceof HTMLTemplateElement) return;
+          const role = el.getAttribute("role")?.toLowerCase();
+          if (role && !INTERACTIVE_ROLES.has(role)) return;
+          seen.add(el);
+          candidates.push(el);
+        };
+        for (const el of Array.from(document.querySelectorAll(INTERACTIVE_SELECTOR))) consider(el);
+        for (const sr of openShadowRootsDeep(document)) {
+          for (const el of Array.from(sr.querySelectorAll(INTERACTIVE_SELECTOR))) consider(el);
+        }
+
+        const elements: ElementInfo[] = [];
+        for (const el of candidates) {
+          const html = el as HTMLElement;
+          const tag = el.tagName.toLowerCase();
+          const role = el.getAttribute("role")?.toLowerCase() ?? undefined;
+          const type = el instanceof HTMLInputElement ? el.type : undefined;
+          const text = (html.innerText ?? "").trim().replace(/\s+/g, " ").slice(0, 80);
+          const visible = isVisible(html);
+          if (visibleOnly && !visible) continue;
+          if (hiddenOnly && visible) continue;
+          if (textFilter && !text.includes(textFilter)) continue;
+          if (filters.length > 0) {
+            const hit = filters.some((f) => {
+              switch (f) {
+                case "button": return tag === "button" || role === "button";
+                case "link": return tag === "a" || role === "link";
+                case "input": return tag === "input";
+                case "select": return tag === "select";
+                case "textarea": return tag === "textarea";
+                case "label": return tag === "label";
+                case "editable": return html.isContentEditable || tag === "textarea" || (tag === "input" && type !== undefined && /text|search|email|url|tel|number|password|date|time|datetime-local|month|week/.test(type));
+                case "upload": return (tag === "input" && type === "file") || /点击上传|上传|拖入|拖拽|拖到|upload|drop/i.test(text);
+                default: return true;
+              }
+            });
+            if (!hit) continue;
+          }
+          const rect = el.getBoundingClientRect();
+          const item: ElementInfo = {
+            tag,
+            visible,
+            x: Math.round(rect.left),
+            y: Math.round(rect.top),
+            w: Math.round(rect.width),
+            h: Math.round(rect.height),
+            selector: genSelector(el),
+          };
+          if (el instanceof HTMLInputElement) {
+            if (type) item.type = type;
+            if (el.accept) item.accept = el.accept;
+            if (el.multiple) item.multiple = true;
+            if (el.name) item.name = el.name;
+            if (el.placeholder) item.placeholder = el.placeholder;
+          }
+          if (role) item.role = role;
+          const ariaLabel = el.getAttribute("aria-label");
+          if (ariaLabel) item.ariaLabel = ariaLabel;
+          const title = el.getAttribute("title");
+          if (title) item.title = title;
+          if (text) item.text = text;
+          elements.push(item);
+        }
+
+        const truncated = elements.length > max;
+        return {
+          success: true,
+          data: { count: truncated ? max : elements.length, truncated, elements: truncated ? elements.slice(0, max) : elements },
+        };
       }
 
       case "get_js_errors": {
@@ -1000,6 +1119,23 @@ function isVisible(el: HTMLElement): boolean {
   return rect.width > 0 && rect.height > 0;
 }
 
+// 判断 mime/filename 是否被 file input 的 accept 允许：
+// 逗号分隔，支持 image/* 通配与 .ext 扩展名形式；accept 为空视为不过滤（同浏览器行为）
+function acceptMatches(accept: string, mime: string, filename: string): boolean {
+  const mimeLower = mime.toLowerCase();
+  const mimeType = mimeLower.split("/")[0] ?? "";
+  const ext = (filename.split(".").pop() ?? "").toLowerCase();
+  return accept
+    .split(",")
+    .map((a) => a.trim().toLowerCase())
+    .filter(Boolean)
+    .some((a) => {
+      if (a.startsWith(".")) return `.${ext}` === a;
+      if (a.endsWith("/*")) return mimeType === a.slice(0, -2);
+      return a === mimeLower;
+    });
+}
+
 function xpathStr(s: string): string {
   if (!s.includes("'")) return `'${s}'`;
   if (!s.includes('"')) return `"${s}"`;
@@ -1279,6 +1415,58 @@ function findElement(selector: string): Element | null {
     return findXPathPierced(selector.slice(6));
   }
   return findCssPierced(selector);
+}
+
+// 生成稳定可复用的 CSS 选择器（list_elements 返回，agent 可直接用于 click/type/upload_file 等）：
+// 优先全局唯一 id；否则逐级构建 tag+前 2 个稳定类 / tag:nth-of-type 路径；
+// 元素在 open shadow root 内时跨边界段用 >>> 连接（与 findElement 的穿透语义一致）
+function genSelector(el: Element): string {
+  const esc = (s: string) => CSS.escape(s);
+  const nthOfType = (e: Element): number => {
+    let n = 1;
+    for (let sib = e.previousElementSibling; sib; sib = sib.previousElementSibling) {
+      if (sib.tagName === e.tagName) n++;
+    }
+    return n;
+  };
+  const segs: { seg: string; cross: boolean }[] = [];
+  let cur: Element | null = el;
+  let lastCross = false;
+  while (cur && cur !== document.body && cur !== document.documentElement) {
+    let seg: string;
+    if (cur.id && document.querySelectorAll(`#${esc(cur.id)}`).length === 1) {
+      seg = `#${esc(cur.id)}`;
+      // 唯一 id 已能唯一定位，祖先路径全部冗余——截断，selector 短且不受祖先结构变化影响
+      if (segs.length > 0) segs[0].cross = lastCross;
+      segs.unshift({ seg, cross: false });
+      break;
+    } else {
+      const cls = Array.from(cur.classList)
+        .filter((c) => /^[a-zA-Z_][\w-]*$/.test(c))
+        .slice(0, 2);
+      if (cls.length > 0) {
+        seg = `${cur.tagName.toLowerCase()}.${cls.join(".")}`;
+      } else {
+        seg = `${cur.tagName.toLowerCase()}:nth-of-type(${nthOfType(cur)})`;
+      }
+    }
+    if (segs.length > 0) segs[0].cross = lastCross;
+    segs.unshift({ seg, cross: false });
+    const root = cur.getRootNode();
+    if (root instanceof ShadowRoot) {
+      cur = root.host;
+      lastCross = true;
+    } else {
+      cur = cur.parentElement;
+      lastCross = false;
+    }
+  }
+  let out = "";
+  for (let i = 0; i < segs.length; i++) {
+    if (i > 0) out += segs[i - 1].cross ? " >>> " : " > ";
+    out += segs[i].seg;
+  }
+  return out || el.tagName.toLowerCase();
 }
 
 // 就绪信号：动态注入（chrome.scripting.executeScript）时告知 service worker 已注册完成；

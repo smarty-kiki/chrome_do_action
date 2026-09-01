@@ -103,7 +103,7 @@ cda list
 
 ## _field 过滤
 
-通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/trigger/upload_file/upload_dragdrop/paste_rich/scroll/show/hide/get_css/get_page_info/get_js_errors/real_click/open/refresh/close_tab），点路径逐段投影、保留嵌套形状：
+通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/trigger/upload_file/upload_dragdrop/paste_rich/scroll/show/hide/get_css/get_page_info/list_elements/get_js_errors/real_click/open/refresh/close_tab），点路径逐段投影、保留嵌套形状：
 
 - `--field a` → `{a: 完整值}`
 - `--field a.b` → `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）
@@ -150,7 +150,7 @@ cda --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#titl
 
 ## iframe 定位
 
-元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
 
 如需指定 frame，加 `frame` 参数：
 
@@ -161,14 +161,14 @@ cda --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#titl
 {"selector": "#submit", "frame": {"url": "mp.weixin.qq.com"}}  // URL 含子串的首个 frame（跨域最稳）
 ```
 
-- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`
+- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`
 - **跨域 iframe 同样可读可操作**：元素命令自动搜索所有 frame，跨域 iframe 同样能定位命中
 - `real_click` 在 iframe 内同样可用（含跨域）
 - `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；要读 iframe 文本用 `{"selector":"...","frame":{...}}`
 
 ## shadow DOM 定位
 
-Web Components 站点（小红书创作后台等）把按钮/编辑器包在 shadow root 里，普通选择器、XPath 无法穿透。元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`）默认**透明穿透 open shadow root**，三种方式从显式到隐式：
+Web Components 站点（小红书创作后台等）把按钮/编辑器包在 shadow root 里，普通选择器、XPath 无法穿透。元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`）默认**透明穿透 open shadow root**，三种方式从显式到隐式：
 
 1. **路径标记 `#shadow-root`**：直接粘贴 DevTools 元素面板「Copy → Copy element path」复制的完整路径（原生 `querySelector` 就是这么写的）：
 
@@ -403,6 +403,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本内容 |
 | `get_css` | `send <id> get_css <tab> <selector>` | 获取所有匹配元素的 computed style，返回 `{selector, count, results}` |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息 |
+| `list_elements` | `send <id> list_elements <tab> <params>` | 列出可交互元素（带生成好的 selector、可见性、坐标、关键属性），支持 filter/text/max/visible 过滤；找不到元素时先查它 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取 JS 错误 |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空 JS 错误 |
 | `screenshot` | `send <id> screenshot <tab> <params>` | 截图当前页面（只读，不注入代码）；`{"path":"/tmp/shot.png"}` 保存到本地 |
@@ -491,6 +492,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 ```
 
 - 将 base64 图片注入 file input 并触发 `change` 事件，页面监听到后自动上传
+- **注入前预检 accept**：文件类型与 input 的 accept 不匹配时直接报错（如 PNG 注入 `accept="video/*"` 的 input），不会"注入成功但页面静默忽略"
 - 适用于无法手动操作系统文件对话框的场景（如无辅助功能权限时上传公众号封面）
 - 图片建议先压缩（如 900x383 JPEG、<100KB），避免 base64 过大
 
@@ -517,6 +519,46 @@ cda send OfficePC get_text current '{"selector":"table"}'
 - 会先清空目标编辑器现有内容再插入（等价于"全选删除后粘贴"）
 - 与 `type`（纯文本）互补：type 写字，paste_rich 粘贴排版
 - 不修改页面源代码，仅向编辑器内容区插入富文本
+
+### list_elements 参数
+
+`list_elements` 是「页面元素地图」：一条命令拿到全页可交互元素清单（带生成好的 selector、可见性、坐标、关键属性），agent 从「猜 selector」变成「先查再操作」。**找不到元素时先跑它**。
+
+```json
+{}                                              // 默认：全部元素
+{"filter": "upload"}                            // 只返回上传相关：input[type=file] + 拖拽区（文本含 上传/拖拽/drop 等）
+{"filter": "button,link"}                       // 逗号分隔类型白名单：button/link/input/select/textarea/label/editable/upload
+{"text": "发布"}                                // 只返回文本含子串的元素
+{"visible": true}                               // true 只要可见元素，false 只要隐藏元素（如被 CSS 隐藏的 file input）
+{"max": 10}                                     // 输出上限（1-200，默认 50），超出返回 truncated: true
+{"frame": "top"}                                // 只扫顶层；缺省=聚合所有 frame（跨域 iframe 同样列出，元素带 frame url）
+```
+
+返回：
+
+```json
+{
+  "count": 12,
+  "truncated": false,
+  "elements": [
+    {
+      "tag": "input", "type": "file", "accept": "image/png,image/jpeg,...", "multiple": true,
+      "name": "", "placeholder": "", "ariaLabel": "", "text": "",
+      "visible": false, "x": 0, "y": 0, "w": 1, "h": 1,
+      "selector": "input[accept*=\"image\"]", "frame": "https://.../upload"
+    },
+    { "tag": "button", "text": "上传图文", "visible": true, "x": 480, "y": 320, "w": 96, "h": 32,
+      "selector": "button.container-drag-btn-k6XmB4" }
+  ]
+}
+```
+
+- **元素范围**：可点击/可输入的常见元素（button/a/select/textarea/input/label、contenteditable、tabindex、常见交互 role），**穿透 open shadow DOM**；被 CSS 隐藏的（如 display:none 的 tab 页里的 file input）也会列出（`visible: false`）
+- **`selector` 由 cda 自动生成**，**可直接喂给 click/type/upload_file 等任何命令**；shadow 内的元素会带 `>>>` 连接符
+- **input 附加属性**：`type`/`accept`/`multiple`/`name`/`placeholder`；通用附加 `role`/`ariaLabel`/`title`/`text`（截断 80 字符）
+- **缺省聚合所有 frame**：非顶层 frame 的元素带 `frame` 字段（来源 url）；指定 `frame` 参数则只扫目标 frame（语义同其他元素命令）
+- 典型用法：`list_elements` → 从结果挑目标 → 用返回的 `selector` 直接操作；`filter=upload` 找上传控件、`visible=false` 找隐藏 file input、`text` 找带文字的按钮
+- 多 file input 页面（如抖音上传页的「视频/图文」两个 tab 各一个 input）用 `--field "elements.accept,elements.selector"` 对比 accept 再选目标，避免注入错 input
 
 ### show
 
@@ -576,6 +618,8 @@ send <id> hide <tabId>       // 无参数：还原全部被 show 的元素
 
 ## 注意事项
 
+- **找不到元素先 `list_elements`**：别再猜 selector 或挖整页 HTML——先拿元素地图（含生成好的 selector/可见性/accept 等），再挑目标操作
+- `upload_file` 会预检 `accept`：文件类型与 input 的 accept 不匹配（如 PNG 注入 `accept="video/*"` 的 input）直接报错，不会静默失败
 - `text` 定位会跳过 `<script>`、`<style>`、`<noscript>` 等不可见元素，优先匹配 `<button>`、`<a>`、`<input>`；自动搜索 iframe，返回带命中 frame 的 `url`
 - `--field` 对所有返回对象的命令有效（点路径投影，见「_field 过滤」章节），在浏览器端按需采集、出口统一裁剪
 - `--field html`（如 `--field "currentTab.html"`）返回该 frame 的**完整 HTML 内容**（服务端与 CLI 原样转发，不会剥离），需抓页面源码时直接用它
