@@ -58,7 +58,9 @@ Page commands (tab required):
                               (form validation works); {options} passes through
                               to the event (bubbles/detail/etc.)
   upload_file <tab> <params>  Inject base64 image into file input
-                              ({selector,base64,filename,mime[,waitFor]}), triggers change
+                              ({selector,base64,filename,mime[,waitFor]}), triggers change;
+                              pre-checks input accept (type mismatch fails loudly
+                              instead of silently no-op)
   upload_dragdrop <tab> <params>
                               Drag-drop a file into an upload area that has no
                               file input (e.g. AntD Upload.Dragger): dispatches
@@ -76,6 +78,17 @@ Page commands (tab required):
   get_page_info <tab>         Get page info (url, title, iframes), supports --field.
                               iframes include url/html for same-origin AND
                               cross-origin frames
+  list_elements <tab> [params]
+                              List interactive elements with generated selectors
+                              ({filter,text,max,visible}[,frame]); filter:
+                              button|link|input|select|textarea|label|editable|upload
+                              (comma-separated); text: substring match on element
+                              text; max: output cap 1-200 (default 50, truncation
+                              flagged); visible: true=visible only, false=hidden only.
+                              Defaults to aggregating ALL frames (each element carries
+                              its frame url when not in the top frame); {frame} narrows
+                              to top/one frame. Pierces open shadow DOM. Use this when
+                              you cannot find an element - get a map first.
   get_js_errors <tab>         Get accumulated JS errors (aggregated across frames)
   clear_js_errors <tab>       Clear accumulated JS errors
   screenshot <tab> <params>   Capture a page screenshot
@@ -121,7 +134,9 @@ Examples:
   cda send abc scroll current '{"y":500}'
   cda send abc trigger current '{"selector":"#username","event":"blur"}'
   cda send abc trigger current '{"selector":"#category","event":"change","value":"2"}'
-  cda send abc get_css current "h1.title"`;
+  cda send abc get_css current "h1.title"
+  cda send abc list_elements current '{"filter":"upload","visible":true}'
+  cda send abc list_elements current '{"text":"发布","max":10}'`;
 function parseArgs(argv) {
     const raw = {};
     const positional = [];
@@ -163,7 +178,7 @@ function buildMessage(action, args) {
             console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
-            console.error("Page commands (tab required): click | real_click | type | keyboard | trigger | upload_file | upload_dragdrop | paste_rich | show | hide | get_text | get_css | get_page_info | get_js_errors | clear_js_errors | screenshot | scroll");
+            console.error("Page commands (tab required): click | real_click | type | keyboard | trigger | upload_file | upload_dragdrop | paste_rich | show | hide | get_text | get_css | get_page_info | list_elements | get_js_errors | clear_js_errors | screenshot | scroll");
             console.error("");
             console.error("Example: cda send abc123 get_page_info current");
             process.exit(1);
