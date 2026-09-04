@@ -254,6 +254,10 @@
   wsClient.onStatusChange((status) => {
     updateBadge(status);
     notifyPorts(status);
+    if (status === "connected") {
+      chrome.storage.session.remove("manualDisconnect").catch(() => {
+      });
+    }
   });
   wsClient.onMessage("command", (msg) => {
     if (msg.type !== "command") return;
@@ -307,6 +311,8 @@
         }
       } else if (msg.type === "disconnect") {
         wsClient.disconnect();
+        chrome.storage.session.set({ manualDisconnect: true }).catch(() => {
+        });
         sendResponse({ status: wsClient.getStatus() });
       } else if (msg.type === "get_status") {
         sendResponse({ status: wsClient.getStatus(), retry: wsClient.getRetryState() });
@@ -422,17 +428,24 @@
         payload: { ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data }
       });
     };
+    let tab = null;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      sendResult({ commandId: cmd.id, success: false, error: `Tab ${tabId} not found \u2014 was it closed?` });
+      onDone?.();
+      return;
+    }
     let beforeTabs = [];
     let beforeFullInfo = null;
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (needBeforeInfo || needNewTabs) {
+    if (needBeforeInfo || needNewTabs) {
+      try {
         beforeTabs = await chrome.tabs.query({ windowId: tab.windowId });
+      } catch {
       }
-      if (needBeforeInfo) {
-        beforeFullInfo = await getFullPageInfo(tabId, cmd.payload.params, true);
-      }
-    } catch {
+    }
+    if (needBeforeInfo) {
+      beforeFullInfo = await getFullPageInfo(tabId, cmd.payload.params, true);
     }
     const msg = { type: "execute_command", id: cmd.id, payload: { command, params } };
     if (command === "get_js_errors") {
@@ -480,18 +493,26 @@
         return { elements: elements2, responded: responded2 };
       };
       let { elements, responded } = await doCollect();
+      let injectError2;
       if (!responded) {
         try {
           await injectContentScript(tabId);
           ({ elements, responded } = await doCollect());
-        } catch {
+        } catch (e) {
+          injectError2 = e instanceof Error ? e.message : String(e);
         }
       }
       const truncated = elements.length > max;
       sendResult({
         commandId: cmd.id,
         success: true,
-        data: { count: truncated ? max : elements.length, truncated, elements: truncated ? elements.slice(0, max) : elements }
+        data: {
+          count: truncated ? max : elements.length,
+          truncated,
+          elements: truncated ? elements.slice(0, max) : elements,
+          // 仅注入失败且仍无响应时出现：提示是 CS 不可达而非页面确实无元素
+          ...injectError2 && !responded ? { warning: `content script injection failed: ${injectError2}` } : {}
+        }
       });
       onDone?.();
       return;
@@ -516,58 +537,142 @@
     }
     const isCoordinateClick = isClick && params.x !== void 0 && params.y !== void 0;
     const searchable = ELEMENT_SEARCH_COMMANDS.has(command) && !isCoordinateClick;
+    const destructive = /* @__PURE__ */ new Set(["click", "type", "keyboard", "trigger", "upload_file", "upload_dragdrop", "paste_rich"]);
+    const isSlow = destructive.has(command);
     let response;
     let matchedFrame;
-    let navigatedFallback = false;
+    let lostContact;
+    let hadResponse = false;
+    let injectError;
     async function doSearch() {
       if (!searchable) {
-        const r = await sendToFrame(tabId, 0, msg);
+        const r = await sendToFrame(tabId, 0, msg, isSlow ? 1e4 : 1200);
+        if (r.missing) {
+          if (r.missing.reason !== "noreceiver") {
+            lostContact = { frame: { frameId: 0, parentFrameId: -1, url: "", depth: 0, order: 0 }, reason: r.missing.reason };
+          }
+          return;
+        }
+        hadResponse = true;
         response = r.response;
         return;
       }
       const frames = await resolveSearchFrames(tabId, params.frame);
-      const slowCommands = /* @__PURE__ */ new Set(["click", "type", "keyboard", "upload_file", "upload_dragdrop", "paste_rich", "scroll", "trigger"]);
       for (const f of frames) {
-        const r = await sendToFrame(tabId, f.frameId, msg, slowCommands.has(command) ? 1e4 : 1200);
+        const r = await sendToFrame(tabId, f.frameId, msg, isSlow ? 1e4 : 1200);
         if (r.missing) {
-          if (isClick) {
-            navigatedFallback = true;
+          if (r.missing.reason === "noreceiver") continue;
+          if (destructive.has(command)) {
+            lostContact = { frame: f, reason: r.missing.reason };
             matchedFrame = f;
-            break;
+            return;
           }
           continue;
         }
+        hadResponse = true;
         if (r.response?.notFound) continue;
         response = r.response;
         matchedFrame = f;
-        break;
+        return;
       }
     }
-    let injected = false;
-    while (true) {
-      await doSearch();
-      if (response || navigatedFallback) break;
-      if (injected) break;
+    await doSearch();
+    if (!response && !lostContact && !hadResponse) {
       try {
         await injectContentScript(tabId);
-        injected = true;
-      } catch {
-        break;
+      } catch (e) {
+        injectError = e instanceof Error ? e.message : String(e);
       }
+      await doSearch();
     }
-    if (!response && !navigatedFallback) {
-      response = { success: false, error: "Element not found: no match in any frame" };
+    if (!response && lostContact) {
+      const beforeUrl = tab?.url || "";
+      const verified = await verifyLostContact(tabId, lostContact, beforeUrl);
+      const lostFrame = lostContact.frame;
+      if (verified.state === "gone") {
+        sendResult({ commandId: cmd.id, success: false, error: `Tab ${tabId} was closed while "${command}" was in flight \u2014 outcome unknown` });
+        onDone?.();
+        return;
+      }
+      if (verified.state === "dead") {
+        sendResult({ commandId: cmd.id, success: false, error: `"${command}" was dispatched but its outcome could not be verified (content script unreachable in the tab)` });
+        onDone?.();
+        return;
+      }
+      if (verified.state === "navigated") {
+        const navResult = { navigated: true, settleLost: true };
+        if (needCurrent) {
+          navResult.currentTab = await getFullPageInfo(tabId, cmd.payload.params);
+        }
+        if (needNewTabs) {
+          try {
+            const newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params);
+            if (newTabInfos.length > 0) navResult.newTabs = newTabInfos;
+          } catch {
+          }
+        }
+        sendResult({ commandId: cmd.id, success: true, data: navResult });
+        onDone?.();
+        return;
+      }
+      if (isClick) {
+        const afterInfo = needCurrent || needIframe ? await getFullPageInfo(tabId, cmd.payload.params, true) : null;
+        const afterUrl = afterInfo?.url || "";
+        const result = {
+          navigated: false,
+          settleLost: true,
+          ...lostFrame.url ? { frame: { frameId: lostFrame.frameId, url: lostFrame.url } } : {}
+        };
+        if (afterUrl && beforeUrl && afterUrl !== beforeUrl) result.navigated = true;
+        if (needCurrent) result.currentTab = afterInfo;
+        if (needIframe) {
+          const beforeIframes = beforeFullInfo?.iframes ?? [];
+          const afterIframes = afterInfo?.iframes ?? [];
+          const iframeChanges = beforeIframes.length > 0 || afterIframes.length > 0 ? diffIframes(beforeIframes, afterIframes) : [];
+          if (iframeChanges.length > 0) result.iframeChanges = iframeChanges;
+        }
+        if (needNewTabs) {
+          try {
+            const newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params);
+            if (newTabInfos.length > 0) result.newTabs = newTabInfos;
+          } catch {
+          }
+        }
+        sendResult({ commandId: cmd.id, success: true, data: result });
+        onDone?.();
+        return;
+      }
+      sendResult({
+        commandId: cmd.id,
+        success: true,
+        data: { settleLost: true, ...lostFrame.url ? { frame: { frameId: lostFrame.frameId, url: lostFrame.url } } : {} }
+      });
+      onDone?.();
+      return;
+    }
+    if (!response) {
+      const tabAlive = await chrome.tabs.get(tabId).then(() => true).catch(() => false);
+      const searchParams = params;
+      const targetDesc = typeof searchParams.selector === "string" ? `selector: ${searchParams.selector}` : typeof searchParams.text === "string" ? `text: ${searchParams.text}` : "";
+      const targetSuffix = targetDesc ? ` (${targetDesc})` : "";
+      response = {
+        success: false,
+        error: !tabAlive ? `Tab ${tabId} not found \u2014 was it closed?` : hadResponse ? `Element not found: no match in any frame${targetSuffix}` : !searchable ? "Click could not be delivered: no content script response (page still loading, frame navigated, or the page is restricted)" : injectError ? `No content script response from any frame; content script injection failed: ${injectError}` : "No content script response from any frame (page still loading or restricted)"
+      };
     }
     const frameAttribution = matchedFrame ? { frame: { frameId: matchedFrame.frameId, url: matchedFrame.url } } : {};
     try {
-      const wasNavigated = navigatedFallback || response?.data?.navigated === true;
+      const wasNavigated = response?.data?.navigated === true;
       if (wasNavigated) {
         const currentInfo = needCurrent ? await getFullPageInfo(tabId, cmd.payload.params) : null;
         const navResult = { navigated: true };
         if (needCurrent) navResult.currentTab = currentInfo;
         if (needNewTabs) {
-          const newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params);
-          if (newTabInfos.length > 0) navResult.newTabs = newTabInfos;
+          try {
+            const newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params);
+            if (newTabInfos.length > 0) navResult.newTabs = newTabInfos;
+          } catch {
+          }
         }
         sendResult({ commandId: cmd.id, success: true, data: navResult });
         onDone?.();
@@ -597,11 +702,14 @@
         onDone?.();
         return;
       }
-      const data = typeof response?.data === "object" && response?.data !== null && !Array.isArray(response.data) ? { ...response.data, ...frameAttribution } : response?.data;
+      const dataIsPlainObj = typeof response?.data === "object" && response?.data !== null && !Array.isArray(response.data);
+      const skipFrameMerge = command === "get_prop" && dataIsPlainObj && "frame" in response.data;
+      const data = dataIsPlainObj ? { ...response.data, ...skipFrameMerge ? {} : frameAttribution } : response?.data;
       sendResult({ commandId: cmd.id, success: response?.success ?? false, data, error: response?.error });
       onDone?.();
     } catch (err) {
-      sendResult({ commandId: cmd.id, success: false, error: String(err) });
+      const detail = err instanceof Error ? err.message : String(err);
+      sendResult({ commandId: cmd.id, success: false, error: `Unexpected error while running "${command}": ${detail} (please report this to cda)` });
       onDone?.();
     }
   }
@@ -626,7 +734,7 @@
       return [];
     }
   }
-  var ELEMENT_SEARCH_COMMANDS = /* @__PURE__ */ new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "upload_dragdrop", "paste_rich", "get_rect", "trigger"]);
+  var ELEMENT_SEARCH_COMMANDS = /* @__PURE__ */ new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "upload_dragdrop", "paste_rich", "get_rect", "get_prop", "trigger"]);
   var frameTreeCache = /* @__PURE__ */ new Map();
   chrome.tabs.onUpdated.addListener((tabId, info) => {
     if (info.status === "complete") frameTreeCache.delete(tabId);
@@ -666,12 +774,14 @@
   }
   function sendToFrame(tabId, frameId, msg, timeoutMs = 1200) {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve({ missing: true }), timeoutMs);
+      const timer = setTimeout(() => resolve({ missing: { reason: "timeout" } }), timeoutMs);
       try {
         chrome.tabs.sendMessage(tabId, msg, { frameId }, (r) => {
           clearTimeout(timer);
           if (chrome.runtime.lastError) {
-            resolve({ missing: true });
+            const text = String(chrome.runtime.lastError.message || "");
+            const reason = /Receiving end does not exist|Could not establish connection/i.test(text) ? "noreceiver" : "portclosed";
+            resolve({ missing: { reason } });
             return;
           }
           resolve({
@@ -680,9 +790,37 @@
         });
       } catch {
         clearTimeout(timer);
-        resolve({ missing: true });
+        resolve({ missing: { reason: "portclosed" } });
       }
     });
+  }
+  async function verifyLostContact(tabId, lost, beforeUrl) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) return { state: "gone" };
+    const frames = await getFrameTree(tabId);
+    const now = frames.find((f) => f.frameId === lost.frame.frameId);
+    const topUrl = tab.url || "";
+    const isTop = lost.frame.frameId === 0;
+    const before = isTop ? lost.frame.url || beforeUrl : lost.frame.url;
+    if (before && topUrl && topUrl !== before) return { state: "navigated" };
+    if (!isTop && !now) return { state: "navigated" };
+    if (now && now.url && lost.frame.url && now.url !== lost.frame.url) return { state: "navigated" };
+    let alive = false;
+    for (let i = 0; i < 4 && !alive; i++) {
+      if (i === 1) {
+        try {
+          await injectContentScript(tabId);
+        } catch {
+        }
+      }
+      const probe = await sendToFrame(tabId, lost.frame.frameId, {
+        type: "execute_command",
+        payload: { command: "get_js_errors", params: {} }
+      }, 1500);
+      alive = !!probe.response;
+      if (!alive) await new Promise((r) => setTimeout(r, 300));
+    }
+    return alive ? { state: "alive" } : { state: "dead" };
   }
   async function getTopIframes(tabId) {
     const { response } = await sendToFrame(tabId, 0, {
@@ -806,6 +944,10 @@
         }
         if (needHtml && html !== void 0) result.html = html;
       }
+      if (!forDiff && (fields.length === 0 || mappedFields.some((f) => f === "jsErrors"))) {
+        const { errors } = await broadcastJsErrors(tabId);
+        result.jsErrors = errors;
+      }
       return result;
     } catch {
       return null;
@@ -857,6 +999,11 @@
         chrome.tabs.onUpdated.addListener(listener);
       });
     });
+  }
+  function resolveTabId(raw) {
+    if (typeof raw === "number") return Number.isInteger(raw) ? raw : void 0;
+    if (typeof raw === "string" && /^\d+$/.test(raw)) return Number(raw);
+    return void 0;
   }
   async function injectContentScript(tabId) {
     const INJECT_TIMEOUT = 5e3;
@@ -927,7 +1074,11 @@
     try {
       switch (command) {
         case "open": {
-          const url = params.url || "about:blank";
+          const url = params.url;
+          if (typeof url !== "string" || !url) {
+            sendResult({ commandId: cmd.id, success: false, error: 'open needs a "url" parameter' });
+            return;
+          }
           const tab = await chrome.tabs.create({ url });
           const gid = await getOrCreateGroup(tab.windowId);
           if (gid == null) {
@@ -958,13 +1109,13 @@
           let tabId;
           if (params.tabId === "current") {
             const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-            if (!tabs[0]?.id) {
+            tabId = tabs[0]?.id;
+            if (tabId == null) {
               sendResult({ commandId: cmd.id, success: false, error: "No active tab" });
               return;
             }
-            tabId = tabs[0].id;
           } else {
-            tabId = params.tabId;
+            tabId = resolveTabId(params.tabId);
           }
           if (tabId == null) {
             sendResult({ commandId: cmd.id, success: false, error: "Missing tabId parameter" });
@@ -979,19 +1130,28 @@
           let tabId;
           if (params.tabId === "current") {
             const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-            if (!tabs[0]?.id) {
+            tabId = tabs[0]?.id;
+            if (tabId == null) {
               sendResult({ commandId: cmd.id, success: false, error: "No active tab" });
               return;
             }
-            tabId = tabs[0].id;
           } else {
-            tabId = params.tabId;
+            tabId = resolveTabId(params.tabId);
           }
           if (tabId == null) {
             sendResult({ commandId: cmd.id, success: false, error: "Missing tabId parameter" });
             return;
           }
-          tabQueues.delete(tabId);
+          const queue = tabQueues.get(tabId);
+          if (queue) {
+            for (const queued of queue.slice(1)) {
+              wsClient.send({
+                type: "command_result",
+                payload: { commandId: queued.cmd.id, success: false, error: `Tab ${tabId} was closed before this command ran (queued command cancelled)` }
+              });
+            }
+            tabQueues.delete(tabId);
+          }
           await chrome.tabs.remove(tabId);
           cleanupGroupIfEmpty();
           sendResult({ commandId: cmd.id, success: true, data: { tabId } });
@@ -1001,9 +1161,10 @@
           sendResult({ commandId: cmd.id, success: false, error: `Unknown browser command: ${command}` });
       }
     } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
       wsClient.send({
         type: "command_result",
-        payload: { commandId: cmd.id, success: false, error: String(err) }
+        payload: { commandId: cmd.id, success: false, error: `Unexpected error while running "${cmd.payload.command}": ${detail} (please report this to cda)` }
       });
     }
   }
@@ -1011,6 +1172,8 @@
     if (wsClient.getStatus() === "connected" || wsClient.getStatus() === "connecting") {
       return;
     }
+    const manual = await chrome.storage.session.get("manualDisconnect").catch(() => ({}));
+    if (manual.manualDisconnect) return;
     const retry = wsClient.getRetryState();
     if (retry.nextRetryAt && retry.nextRetryAt > Date.now()) {
       return;
@@ -1069,7 +1232,7 @@
         for (const f of frames) {
           const r = await sendToFrame(tabId, f.frameId, {
             type: "execute_command",
-            payload: { command: "get_rect", params: { selector, text: params.text } }
+            payload: { command: "get_rect", params: { selector, text: params.text, scroll: true } }
           }, 8e3);
           if (r.missing || r.response?.notFound) continue;
           const d = r.response?.data;
@@ -1128,17 +1291,55 @@
         await chrome.debugger.detach({ tabId }).catch(() => {
         });
       }
-      let settleInfo;
-      if (hitFrame) {
-        const { response } = await sendToFrame(tabId, hitFrame.frameId, {
-          type: "execute_command",
-          payload: { command: "wait_for_settle", params: { timeout: 3e3, wait_for: params.waitFor } }
-        }, 8e3);
-        settleInfo = response?.data;
+      const settleFrameId = hitFrame ? hitFrame.frameId : 0;
+      const tabBefore = await chrome.tabs.get(tabId).catch(() => null);
+      const beforeUrl = tabBefore?.url || "";
+      const { response: settleResp, missing } = await sendToFrame(tabId, settleFrameId, {
+        type: "execute_command",
+        payload: { command: "wait_for_settle", params: { timeout: 3e3, wait_for: params.waitFor } }
+      }, 8e3);
+      const settleInfo = settleResp?.data;
+      if (missing) {
+        const tabNow = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tabNow) {
+          sendResult({ success: false, error: "Tab was closed during the real click \u2014 outcome unknown" });
+          return;
+        }
+        const frames = await getFrameTree(tabId);
+        const now = frames.find((f) => f.frameId === settleFrameId);
+        const navigatedNow = !!beforeUrl && !!tabNow.url && tabNow.url !== beforeUrl || settleFrameId !== 0 && !now || !!now && !!hitFrame?.url && !!now.url && now.url !== hitFrame.url;
+        if (navigatedNow) {
+          sendResult({
+            success: true,
+            data: {
+              x,
+              y,
+              trusted: true,
+              settleLost: true,
+              ...params.waitFor ? { waitFor: { settled: false, skipped: "page navigated after the click \u2014 condition not evaluated" } } : {}
+            }
+          });
+          return;
+        }
+        if (params.waitFor) {
+          sendResult({ success: false, error: "waitFor could not be verified: content script unresponsive after the real click (the click itself was dispatched)" });
+          return;
+        }
+        sendResult({ success: true, data: { x, y, trusted: true, settleLost: true } });
+        return;
       }
-      sendResult({ success: true, data: { x, y, trusted: true, ...settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {} } : {} } });
+      sendResult({
+        success: true,
+        data: {
+          x,
+          y,
+          trusted: true,
+          ...settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {} } : {}
+        }
+      });
     } catch (err) {
-      sendResult({ success: false, error: String(err) });
+      const detail = err instanceof Error ? err.message : String(err);
+      sendResult({ success: false, error: `Unexpected error while running "${cmd.payload.command}": ${detail} (please report this to cda)` });
     }
   }
   async function getElementCenterViaCdp(tabId, frameId, params) {
@@ -1323,6 +1524,8 @@
         chrome.storage.local.get(["nodeName", "serverUrl"], (result) => {
           const c = result;
           if (c.nodeName && c.serverUrl) {
+            chrome.storage.session.remove("manualDisconnect").catch(() => {
+            });
             wsClient.disconnect();
             wsClient.connect(c.serverUrl, c.nodeName);
           }

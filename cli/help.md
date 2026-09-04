@@ -47,7 +47,7 @@ cda list
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `navigated` | boolean | 当前标签页是否发生了跳转 |
-| `clickDesc` | object | 点击描述（`selector`/`text`/`x,y` + `tag`） |
+| `clickDesc` | object | 点击描述（`selector`/`text`/`x,y` + `tag` + 可点性报告，见下） |
 | `settledMs` | number | 等影响落地的耗时（毫秒），见「等影响落地」 |
 | `currentTab` | object | 当前标签页信息（`url`、`title`、`iframes`） |
 | `newTabs` | array | 新打开的标签页列表（每个包含 `tabId`、`url`、`title`、`iframes`） |
@@ -55,6 +55,17 @@ cda list
 | `waitFor` | object | 传入 `waitFor` 参数时的等待结果（`settled` + `waited`） |
 
 `currentTab` 和 `newTabs` 中的 `iframes` 是该页面当前的 iframe 列表，结构同 `open` 的 `iframes`。
+
+`clickDesc`（仅 `selector`/`text` 定位时）附带**可点性报告**——回答"这次点击用户是否真的点得到"：
+
+| 字段 | 含义 |
+|------|------|
+| `visible: true` | 元素可见，目标点未被遮挡——点击正常命中 |
+| `visible: false` | 元素本身隐藏或无尺寸（CSS 隐藏、尚未渲染），真实点击点不到它 |
+| `coveredBy: {tag, class, text}` | 元素可见但**有别的元素盖在目标点上**（浮层/弹窗/遮罩），真实点击会点到覆盖层 |
+| `offscreen: true` | 目标点不在可点击区域（元素滚动到视口外等） |
+
+点击本身照常执行（报告只读、不拦截），但出现 `visible: false` / `coveredBy` / `offscreen` 时说明**这次点击大概率没有被页面真正接收**。先 `screenshot` 看真实状态再处理：隐藏元素确认是否加载完（或先 `show`）；被覆盖的先关掉浮层/等它消失（可配 `waitFor` 等条件出现再点）；仍不行改用 `real_click` 坐标点击。坐标定位（`x,y`）不做此报告——坐标点就是最终的命中点。
 
 ### 等影响落地（settle）
 
@@ -72,6 +83,8 @@ cda list
 `waitFor` 以 50ms 间隔轮询条件（元素存在且可见 / 可见文本），**条件满足的瞬间返回**（不是等满超时）：`{"settled": true, "waited": 615}`；3s 超时未满足返回 `{"settled": false}`（动作本身已成功，仅影响未确认）。
 
 **后台标签页**：Chrome 对不可见 tab 会节流——settle 可能偏慢（无影响动作约 1.6s 返回），深度后台下影响可能等不到，此时用 `waitFor` 谓词（轮询不受节流）或把 tab 切到前台。
+
+**60 秒天花板**：命令最慢 60 秒必须返回结果。单条命令吃满时间（页面加载极慢、长 `waitFor` + 后台 tab 节流叠加等）会撞到上限直接报超时——大任务拆成多条命令、避免对深度后台的 tab 做长时间等待。
 
 ### iframeChanges
 
@@ -103,19 +116,20 @@ cda list
 
 ## _field 过滤
 
-通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/trigger/upload_file/upload_dragdrop/paste_rich/scroll/show/hide/get_css/get_page_info/list_elements/get_js_errors/real_click/open/refresh/close_tab），点路径逐段投影、保留嵌套形状：
+通过 `--field` 指定需要的字段，精确裁剪返回结果。**所有返回对象的命令**都支持（click/type/keyboard/trigger/upload_file/upload_dragdrop/paste_rich/scroll/show/hide/get_css/get_prop/get_page_info/list_elements/get_js_errors/real_click/open/refresh/close_tab——get_prop 仅在拿到普通对象值时有效），点路径逐段投影、保留嵌套形状：
 
 - `--field a` → `{a: 完整值}`
 - `--field a.b` → `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）
 - `--field arr.k`（arr 为数组）→ `{arr: [k1, k2, ...]}`
 - 不存在的路径忽略，不报错；无 `--field` 时返回全量
-- `get_text` 返回纯文本字符串（单一结果，无字段可滤）
+- `get_text` 返回纯文本字符串；`get_prop` 的值是标量（字符串/数字/布尔）时原样返回——均无字段可滤（`get_prop` 拿到普通对象值时同样支持 `--field` 裁剪）
 
 ### 常用字段路径
 
 | 字段 | 说明 |
 |------|------|
 | `clickDesc.selector` / `clickDesc.text` / `clickDesc.tag` | 点击命中的元素 |
+| `clickDesc.visible` / `clickDesc.coveredBy` | 可点性报告：目标是否可点、被谁遮挡（`coveredBy.tag` 可取具体字段） |
 | `settledMs` | 等影响落地耗时 |
 | `navigated` | 是否发生导航 |
 | `currentTab` | 当前标签页完整信息（url、title、iframes） |
@@ -150,25 +164,25 @@ cda --server ws://127.0.0.1:12345 send OfficePC type current '{"selector":"#titl
 
 ## iframe 定位
 
-元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`get_prop`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`）**默认自动搜索 iframe**：先顶层 frame，再按深度优先逐个查找所有 iframe（含跨域），首个命中的 frame 即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
 
 如需指定 frame，加 `frame` 参数：
 
 ```json
-{"selector": ".ProseMirror"}                     // 缺省 = 顶层优先全 frame 自动搜索
+{"selector": ".rich-editor"}                     // 缺省 = 顶层优先全 frame 自动搜索
 {"selector": "#submit", "frame": "top"}          // 仅顶层 frame
 {"selector": "#submit", "frame": 0}              // 第 0 个顶层 iframe（按序号）
 {"selector": "#submit", "frame": {"url": "mp.weixin.qq.com"}}  // URL 含子串的首个 frame（跨域最稳）
 ```
 
-- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`
+- `frame` 支持 `click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`get_prop`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`
 - **跨域 iframe 同样可读可操作**：元素命令自动搜索所有 frame，跨域 iframe 同样能定位命中
 - `real_click` 在 iframe 内同样可用（含跨域）
 - `get_text` 不带 selector 时仍取顶层整页文本（向后兼容）；要读 iframe 文本用 `{"selector":"...","frame":{...}}`
 
 ## shadow DOM 定位
 
-Web Components 站点（小红书创作后台等）把按钮/编辑器包在 shadow root 里，普通选择器、XPath 无法穿透。元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`）默认**透明穿透 open shadow root**，三种方式从显式到隐式：
+Web Components 站点（小红书创作后台等）把按钮/编辑器包在 shadow root 里，普通选择器、XPath 无法穿透。元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`get_prop`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`）默认**透明穿透 open shadow root**，三种方式从显式到隐式：
 
 1. **路径标记 `#shadow-root`**：直接粘贴 DevTools 元素面板「Copy → Copy element path」复制的完整路径（原生 `querySelector` 就是这么写的）：
 
@@ -245,20 +259,17 @@ cda send OfficePC click current '{"text":"提交"}'
 
 下拉框选中：`value` 设选项值 + `change` 事件一次完成，React 受控组件同样生效。
 
-### 富文本编辑器输入（公众号/后台系统）
+### 富文本编辑器输入
 
-富文本编辑器（ProseMirror、UEditor 等 contenteditable）直接用 type 输入，按换行自动分段：
-
-```bash
-cda send OfficePC click current '{"selector":".ProseMirror"}'
-cda send OfficePC type current '{"selector":".ProseMirror","text":"第一段内容。\n\n第二段内容。"}'
-```
-
-`mode` 可选（默认 `replace` 清空原内容后写入）：`append` 追加到末尾、`insert` 在光标处插入（有选中则替换选区），可用于分多次追加：
+富文本编辑器直接用 type 输入——文字**整段原样插入**，不按换行自动分段（文字进去后如何呈现，由编辑器自己的行为决定，cda 不做编辑器适配）。段落结构要精确可控时，一段发一次：
 
 ```bash
-cda send OfficePC type current '{"selector":".ProseMirror","mode":"append","text":"追加的段落。"}'
+cda send OfficePC click current '{"selector":".rich-editor"}'
+cda send OfficePC type current '{"selector":".rich-editor","text":"第一段内容。"}'
+cda send OfficePC type current '{"selector":".rich-editor","mode":"append","text":"第二段内容。"}'
 ```
+
+`mode` 可选（默认 `replace` 清空原内容后写入）：`append` 追加到末尾、`insert` 在光标处插入（有选中则替换选区），多次调用配合即可拼出完整内容。
 
 ### 图片上传（file input）
 
@@ -272,7 +283,7 @@ B64=$(base64 -i cover.jpg | tr -d '\n')
 cda send OfficePC upload_file current "{\"selector\":\"input[type=file]\",\"base64\":\"$B64\",\"filename\":\"cover.jpg\",\"mime\":\"image/jpeg\"}"
 ```
 
-适用于无法操作系统文件对话框的场景（如无辅助功能权限时上传公众号封面）。
+适用于无法操作系统文件对话框的场景（如无辅助功能权限时上传文章封面图）。
 
 ### 提取页面内容
 
@@ -294,6 +305,29 @@ cda send OfficePC get_text current '{"selector":".result"}'
 ```bash
 cda send OfficePC get_text current '{"selector":"#price"}' | xargs echo "价格："
 ```
+
+### 读取元素属性原值（get_prop）
+
+`get_text` 读文本、`get_prop` 读属性——拿到的是页面上的**真实原值**，cda 不做任何加工，适合做只读校验与内容比对：
+
+```bash
+# type 后确认输入是否真的写入（读 input/textarea 的 value）
+cda send OfficePC get_prop current '{"selector":"#title","prop":"value"}'
+
+# 读取勾选/禁用等状态（checkbox 的 checked、按钮的 disabled）
+cda send OfficePC get_prop current '{"selector":"#agree","prop":"checked"}'
+
+# 读取原始内容（innerHTML/src/href/dataset/className 等任意元素属性名）
+cda send OfficePC get_prop current '{"selector":".rich-text","prop":"innerHTML"}'
+```
+
+- 定位方式同 click：`{selector}` 或 `{text}`，自动搜索 iframe、穿透 shadow DOM；返回命中 frame
+- `prop` 是元素**属性名**（不是 CSS 属性——查样式用 `get_css`）；值域是元素上的真实属性，如 `value`/`checked`/`disabled`/`innerHTML`/`textContent`/`className`/`id`/`src`/`href`/`dataset`/`title`/`placeholder` 等
+- **只读**：从不调用方法——`prop` 指向函数/方法时直接报错，不会替你执行
+- 标量原样返回；对象值（如 `dataset`）仅在能无损转成 JSON 时返回，否则明确报错而不是静默变成 `{}`——需要这类内容时改读字符串属性（`innerHTML`/`className`）或用 `get_text`
+- 属性不存在时同样明确报错（附常见属性示例），不会静默返回空值
+
+### 滚动加载长页面
 
 ### 滚动加载长页面
 
@@ -392,16 +426,17 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | 命令 | 用法 | 说明 |
 |------|------|------|
 | `click` | `send <id> click <tab> <params>` | 点击元素（合成事件） |
-| `real_click` | `send <id> real_click <tab> <params>` | 真实点击（对忽略合成事件的站点有效），参数 {selector} 或 {x,y}，可选 {approach} 渐进移动路径；用于合成事件无效的站点（如微信后台）及 hover 工具条 |
-| `type` | `send <id> type <tab> <params>` | 输入文本（{selector,text}），支持 input/textarea 与 contenteditable 富文本，富文本按换行分段 |
+| `real_click` | `send <id> real_click <tab> <params>` | 真实点击（对忽略合成事件的站点有效），参数 {selector} 或 {x,y}，可选 {approach} 渐进移动路径；用于合成事件无效的站点及 hover 工具条 |
+| `type` | `send <id> type <tab> <params>` | 输入文本（{selector,text[,mode]}）：文字原样插入、不拆分加工；input/textarea 直接写入，富文本编辑区整段原样插入（怎么呈现由编辑器决定，cda 不做适配）；mode：replace 清空后写入（默认）/append 追加/insert 光标处插入 |
 | `keyboard` | `send <id> keyboard <tab> <params>` | 向元素发送按键（{selector,key}，selector 可省略用当前聚焦元素），触发页面 keydown/keypress/keyup 处理器；可加 {ctrl,shift,alt,meta} 组合键 |
 | `trigger` | `send <id> trigger <tab> <params>` | 触发元素事件（{selector,event}，可选 {value}/{options}）：blur 校验、change+value 选下拉选项、自定义事件；focus/blur 触发真实焦点转移；带 settle + waitFor |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入本地图片（{selector,base64,filename,mime}），触发 change 事件完成上传 |
-| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | 向拖拽上传区（无 file input、只认 drop 的组件，如 AntD Dragger）拖入文件（{selector,data}，data 为 {base64,filename,mime} 或 {url}），派发 dragenter/dragover/drop |
-| `paste_rich` | `send <id> paste_rich <tab> <params>` | 向 contenteditable 富文本编辑器粘贴带样式的 HTML（{selector,html}），等价于粘贴排好版的文档 |
+| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | 向拖拽上传区（无 file input、只认 drop）拖入文件（{selector,data}，data 为 {base64,filename,mime} 或 {url}），派发 dragenter/dragover/drop |
+| `paste_rich` | `send <id> paste_rich <tab> <params>` | 向富文本编辑器粘贴带样式的 HTML（{selector,html[,mode]}，mode 同 type：replace 先清空再粘贴/append 追加/insert 光标处插入） |
 | `show` | `send <id> show <tab> <params>` | 强制显示隐藏元素（{selector}），仅改 CSS 样式不执行代码；让 hover 才显示的菜单/工具条常驻可见，随后可被 click 命中 |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本内容 |
 | `get_css` | `send <id> get_css <tab> <selector>` | 获取所有匹配元素的 computed style，返回 `{selector, count, results}` |
+| `get_prop` | `send <id> get_prop <tab> <params>` | 读取元素属性的真实原值（`{selector\|text, prop}`），只读、从不调用方法；字符串/数字/布尔等标量原样返回；值无法无损转 JSON 时明确报错（不静默变空） |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息 |
 | `list_elements` | `send <id> list_elements <tab> <params>` | 列出可交互元素（带生成好的 selector、可见性、坐标、关键属性），支持 filter/text/max/visible 过滤；找不到元素时先查它 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取 JS 错误 |
@@ -425,13 +460,13 @@ cda send OfficePC get_text current '{"selector":"table"}'
 
 - 与 `click` 参数基本相同（selector 或 x/y），但发送**完整真实鼠标事件链**，对忽略合成事件的站点有效
 - 点击后鼠标**停留在目标上**，保持 hover 状态供连续操作
-- **approach 参数**：模拟"先移到触发点、再移到目标"的多级 hover 场景（如微信封面 hover 工具条：先移向封面按钮，再点击工具条里的菜单项）
+- **approach 参数**：模拟"先移到触发点、再移到目标"的多级 hover 场景（如悬停才展开的工具条：先移向触发点，再点击其中的菜单项）
   ```json
-  // 先渐进经过封面按钮（触发 hover 菜单），最后点击"从图片库选择"菜单项
+  // 先渐进经过触发点（打开 hover 菜单），最后点击其中的菜单项
   {"x": 500, "y": 343, "approach": [[360, 360], [420, 330], [470, 325]]}
   ```
 - **iframe 支持**：自动搜索所有 iframe（含跨域），也可用 `frame` 参数指定目标
-- 适用：对合成事件免疫的站点（如微信公众平台后台 Vue 组件）、hover 才显示的工具条元素
+- 适用：对合成事件免疫的站点（合成 click 提示成功却不触发）、hover 才显示的工具条元素
 - 注意：**坐标必须是元素真实位置**——先 `screenshot` 看真实页面，再取坐标定位。
 - 副作用：attach 瞬间 Chrome 顶部会出现"正在调试此浏览器"横幅，随即消失
 - 使用：`send <id> real_click <tab> '{"selector":"#submit"}'` 或 `'{"x":100,"y":200}'`，iframe 内加 `frame` 参数
@@ -439,18 +474,20 @@ cda send OfficePC get_text current '{"selector":"table"}'
 ### type 参数
 
 ```json
-{"selector": "#username", "text": "admin"}     // input/textarea：直接设置 value
-{"selector": ".ProseMirror", "text": "第一段\n\n第二段"}  // contenteditable：按换行分段插入
+{"selector": "#username", "text": "admin"}     // input/textarea：直接写入 value
+{"selector": ".rich-editor", "text": "第一段"}  // 富文本编辑区：整段原样插入（分段由编辑器自己决定）
 ```
 
-- input/textarea：设置 `value` 并触发 `input` + `change` 事件
-- contenteditable（如 ProseMirror 富文本）：聚焦后按 `\n` 分段插入，保留段落结构；一次调用传入完整内容，不要多次追加（会覆盖）
+- input/textarea：`replace` 直接写入 value；`append` 在末尾追加；`insert` 在光标处插入（有选中则替换选区）——写入后触发 `input` + `change` 事件
+- 富文本编辑区：聚焦后整段**原样插入，零加工**——不 trim、不按 `\n` 拆分、不改写文本；文字进去后怎么呈现由编辑器自己决定，cda 不做编辑器适配。段落结构要精确可控就一段发一次：先 `replace`（默认，清空原内容后写入），之后用 `append` 逐段追加
+- `mode`：`replace`（默认，清空原内容后写入）/ `append`（追加到末尾）/ `insert`（光标处插入，有选中替换选区）
+- 返回 `{selector, mode, tag, settledMs}`，带 settle + `waitFor`（语义见「等影响落地」）
 
 ### keyboard 参数
 
 ```json
 {"selector": "#title", "key": "Enter"}                       // 在标题输入框按回车
-{"selector": ".ProseMirror", "key": "ArrowDown"}             // 富文本里按方向键
+{"selector": ".rich-editor", "key": "ArrowDown"}             // 富文本里按方向键
 {"key": "Escape"}                                            // 省略 selector：向当前聚焦元素按键
 {"selector": "#input", "key": "Enter", "ctrl": true}         // Ctrl+Enter 组合键
 ```
@@ -493,18 +530,18 @@ cda send OfficePC get_text current '{"selector":"table"}'
 
 - 将 base64 图片注入 file input 并触发 `change` 事件，页面监听到后自动上传
 - **注入前预检 accept**：文件类型与 input 的 accept 不匹配时直接报错（如 PNG 注入 `accept="video/*"` 的 input），不会"注入成功但页面静默忽略"
-- 适用于无法手动操作系统文件对话框的场景（如无辅助功能权限时上传公众号封面）
+- 适用于无法手动操作系统文件对话框的场景（如无辅助功能权限时上传文章封面图）
 - 图片建议先压缩（如 900x383 JPEG、<100KB），避免 base64 过大
 
 ### upload_dragdrop 参数
 
 ```json
-{"selector": ".js_upload_area", "data": {"base64": "<base64内容>", "filename": "cover.jpg", "mime": "image/jpeg"}}
-{"selector": ".js_upload_area", "data": {"url": "https://example.com/a.jpg"}}
+{"selector": ".upload-area", "data": {"base64": "<base64内容>", "filename": "cover.jpg", "mime": "image/jpeg"}}
+{"selector": ".upload-area", "data": {"url": "https://example.com/a.jpg"}}
 ```
 
 - 向**没有文件输入框、只认拖拽（drop）事件**的上传区域拖入文件：派发 `dragenter` → `dragover` → `drop` 携带文件，页面 drop 处理器收到后自动上传
-- 适用于 `upload_file` 打不进去的组件：AntD `Upload.Dragger`、自定义拖拽区、富文本编辑器拖图上传等
+- 适用于 `upload_file` 打不进去的组件：自定义拖拽区、富文本编辑器拖图上传等
 - `data` 二选一：`{base64, filename, mime}`（本地文件，推荐，与 upload_file 同源）或 `{url}`（命令内部拉取后拖入，受 CORS 限制）
 - 与 `upload_file` 互补：能找到 `input[type=file]` 用 `upload_file`，找不到（拖拽区）用 `upload_dragdrop`
 - 拖拽区域在 iframe/shadow DOM 内同样生效；带 settle + waitFor，返回 `{selector, tag, filename, size, mime, settledMs}`
@@ -512,11 +549,12 @@ cda send OfficePC get_text current '{"selector":"table"}'
 ### paste_rich 参数
 
 ```json
-{"selector": ".ProseMirror", "html": "<section style=\"text-align:center\"><span style=\"font-weight:bold;font-size:17px\">小标题</span></section>"}
+{"selector": ".rich-editor", "html": "<section style=\"text-align:center\"><span style=\"font-weight:bold;font-size:17px\">小标题</span></section>"}
 ```
 
-- 向 contenteditable 富文本编辑器（ProseMirror、UEditor 等）粘贴带内联样式的 HTML，保留字号/颜色/加粗/间距等格式
-- 会先清空目标编辑器现有内容再插入（等价于"全选删除后粘贴"）
+- 向富文本编辑器粘贴带内联样式的 HTML（字号/颜色/加粗/间距写在 HTML 里一并落地，怎么呈现由编辑器决定）
+- `mode`：`replace`（默认，先清空目标编辑器现有内容再插入，等价于"全选删除后粘贴"）/ `append`（追加到末尾）/ `insert`（光标处插入，有选中替换选区）
+- HTML 交给浏览器原生粘贴管线原样落地——怎么解析、样式如何生效，是编辑器自己的行为；cda 不做任何编辑器嗅探/适配/清洗
 - 与 `type`（纯文本）互补：type 写字，paste_rich 粘贴排版
 - 不修改页面源代码，仅向编辑器内容区插入富文本
 
@@ -553,7 +591,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 }
 ```
 
-- **元素范围**：可点击/可输入的常见元素（button/a/select/textarea/input/label、contenteditable、tabindex、常见交互 role），**穿透 open shadow DOM**；被 CSS 隐藏的（如 display:none 的 tab 页里的 file input）也会列出（`visible: false`）
+- **元素范围**：可点击/可输入的常见元素（button/a/select/textarea/input/label、富文本编辑区、tabindex、常见交互 role），**穿透 open shadow DOM**；被 CSS 隐藏的（如 display:none 的 tab 页里的 file input）也会列出（`visible: false`）
 - **`selector` 由 cda 自动生成**，**可直接喂给 click/type/upload_file 等任何命令**；shadow 内的元素会带 `>>>` 连接符
 - **input 附加属性**：`type`/`accept`/`multiple`/`name`/`placeholder`；通用附加 `role`/`ariaLabel`/`title`/`text`（截断 80 字符）
 - **缺省聚合所有 frame**：非顶层 frame 的元素带 `frame` 字段（来源 url）；指定 `frame` 参数则只扫目标 frame（语义同其他元素命令）
@@ -563,10 +601,10 @@ cda send OfficePC get_text current '{"selector":"table"}'
 ### show
 
 ```
-send <id> show <tabId> '.js_imagedialog'      // selector 直接位置参数
+send <id> show <tabId> '.toolbar-menu'        // selector 直接位置参数
 ```
 
-**适用场景**：hover 才显示的工具条/菜单（如微信后台封面菜单「从图片库选择」）。用 `show` 直接把元素强制显示，随后普通命令即可命中，无需模拟 hover 或精确坐标。
+**适用场景**：hover 才显示的工具条/菜单（悬停才展开的后台菜单等）。用 `show` 直接把元素强制显示，随后普通命令即可命中，无需模拟 hover 或精确坐标。
 
 `show` 不模拟 hover，而是把元素**直接变为常驻可见**：
 
@@ -595,15 +633,15 @@ send <id> hide <tabId>       // 无参数：还原全部被 show 的元素
 {"x": 300, "y": 500}              // 水平 + 垂直
 {"y": 300, "frame": 0}            // 滚第 1 个顶层 iframe 内部
 {"y": 300, "frame": {"url": "editor"}}  // 滚 url 含 "editor" 的 iframe
-{"selector": ".js_list"}          // 滚动到元素：可滚动容器→容器内滚动到顶部，
+{"selector": ".scroll-list"}      // 滚动到元素：可滚动容器→容器内滚动到顶部，
                                   // 普通元素→scrollIntoView 进入可视区（含 shadow 内元素）
-{"selector": ".js_list", "y": 200}    // 可滚动容器内滚动到 200px
+{"selector": ".scroll-list", "y": 200}    // 可滚动容器内滚动到 200px
 {"selector": "#bottom", "block": "end"}  // scrollIntoView 对齐方式：start/center/end/nearest（默认 center）
 ```
 
 - 无 `selector`：滚窗口（缺省顶层 / `frame` 指定的 iframe）
 - 有 `selector`：目标元素经 shadow 穿透查找；元素自身可滚动（scrollHeight > clientHeight）时容器内滚动，否则 scrollIntoView
-- 滚动后等 DOM 稳定（无变动 500ms，最长 3s）才返回
+- 滚动后等 DOM 稳定才返回（事件驱动：DOM 安静 250ms 即放行，无影响约 0.6s，最长 3s 超时兜底，语义同「等影响落地」）
 
 ### screenshot
 

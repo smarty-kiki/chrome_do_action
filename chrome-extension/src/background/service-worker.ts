@@ -96,6 +96,10 @@ chrome.runtime.onInstalled.addListener(async () => {
 wsClient.onStatusChange((status) => {
   updateBadge(status);
   notifyPorts(status);
+  // 连上即清除手动断开标记：一次成功的显式重连代表用户要的是「已连接」状态
+  if (status === "connected") {
+    chrome.storage.session.remove("manualDisconnect").catch(() => {});
+  }
 });
 
 wsClient.onMessage("command", (msg: Message) => {
@@ -158,6 +162,9 @@ chrome.runtime.onMessage.addListener(
       }
     } else if (msg.type === "disconnect") {
       wsClient.disconnect();
+      // 标记手动断开：断开是显式操作，之后的 15s keepalive autoConnect / 网络抖动重连
+      // 不该把它悄悄撤销——status 变 connected（用户显式重连）时清除该标记
+      chrome.storage.session.set({ manualDisconnect: true }).catch(() => {});
       sendResponse({ status: wsClient.getStatus() });
     } else if (msg.type === "get_status") {
       sendResponse({ status: wsClient.getStatus(), retry: wsClient.getRetryState() });
@@ -310,19 +317,25 @@ async function sendToTab(
     });
   };
 
+  // 死 tab 预检：tab 已被关闭时任何后续动作都是假成功——直接报错（原实现把预读异常吞掉，
+  // 对已关闭的 tab 继续"成功"返回）。tab 快照同时用于 lostContact 核实时的 URL 对比
+  let tab: chrome.tabs.Tab | null = null;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    sendResult({ commandId: cmd.id!, success: false, error: `Tab ${tabId} not found — was it closed?` });
+    onDone?.();
+    return;
+  }
+
   // before 信息（新标签检测需要 beforeTabs；click+iframeChanges 需要 beforeFullInfo）
   let beforeTabs: chrome.tabs.Tab[] = [];
   let beforeFullInfo: FullPageInfo | null = null;
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    if (needBeforeInfo || needNewTabs) {
-      beforeTabs = await chrome.tabs.query({ windowId: tab.windowId! });
-    }
-    if (needBeforeInfo) {
-      beforeFullInfo = await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined, true);
-    }
-  } catch {
-    // 预读失败不阻断命令
+  if (needBeforeInfo || needNewTabs) {
+    try { beforeTabs = await chrome.tabs.query({ windowId: tab.windowId }); } catch { /* 窗口已关则跳过预取 */ }
+  }
+  if (needBeforeInfo) {
+    beforeFullInfo = await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined, true);
   }
 
   const msg = { type: "execute_command", id: cmd.id, payload: { command, params } };
@@ -377,17 +390,26 @@ async function sendToTab(
       return { elements, responded };
     };
     let { elements, responded } = await doCollect();
+    let injectError: string | undefined;
     if (!responded) {
       // 没有任何 frame 有 content script（动态 frame / 页面加载前）：注入一次后重试
       try {
         await injectContentScript(tabId);
         ({ elements, responded } = await doCollect());
-      } catch { /* 注入失败，按当前结果返回 */ }
+      } catch (e) {
+        // 注入失败：CS 不可达的原因如实带出，不静默返回空列表让人误以为页面没有元素
+        injectError = e instanceof Error ? e.message : String(e);
+      }
     }
     const truncated = elements.length > max;
     sendResult({
       commandId: cmd.id!, success: true,
-      data: { count: truncated ? max : elements.length, truncated, elements: truncated ? elements.slice(0, max) : elements },
+      data: {
+        count: truncated ? max : elements.length, truncated,
+        elements: truncated ? elements.slice(0, max) : elements,
+        // 仅注入失败且仍无响应时出现：提示是 CS 不可达而非页面确实无元素
+        ...(injectError && !responded ? { warning: `content script injection failed: ${injectError}` } : {}),
+      },
     });
     onDone?.();
     return;
@@ -419,52 +441,173 @@ async function sendToTab(
   const isCoordinateClick = isClick && params.x !== undefined && params.y !== undefined;
   const searchable = ELEMENT_SEARCH_COMMANDS.has(command) && !isCoordinateClick;
 
+  // 写命令（会产生副作用）与 CS 失联后绝不重发、不换帧继续扫：timeout 可能是 CS 还在跑
+  // settle，portclosed 可能是执行中导航走——重发 = 双执行。读命令无副作用，missing 可安全
+  // 换下一个 frame / 注入重试。写命令 CS 侧最坏 ≈ settle 3s + wait_for 3s（后台 tab 节流更久），
+  // 超时放宽到 10s：1200ms 会把慢响应误判为 missing → 导航误报 / 重复执行
+  const destructive = new Set(["click", "type", "keyboard", "trigger", "upload_file", "upload_dragdrop", "paste_rich"]);
+  const isSlow = destructive.has(command);
+
   let response: { success: boolean; data?: unknown; error?: string; notFound?: boolean; navigated?: boolean } | undefined;
   let matchedFrame: SearchFrame | undefined;
-  let navigatedFallback = false;
+  // 写命令执行中失联：动作可能已执行、结果未知 → 事后核实，绝不猜测
+  let lostContact: { frame: SearchFrame; reason: "timeout" | "portclosed" } | undefined;
+  // 是否有任意 frame 给过响应：区分「页面里确实没有这个元素」和「页面从头到尾没响应」
+  let hadResponse = false;
+  // 注入 content script 失败的原因（executeScript 权限拒绝 / 页面受限等），用于可读报错
+  let injectError: string | undefined;
 
   async function doSearch(): Promise<void> {
     if (!searchable) {
-      const r = await sendToFrame(tabId, 0, msg);
+      // 顶层直发（坐标 click）。noreceiver = 该 frame 没有 content script → 命令确定没执行
+      // → 交给外层注入重试；timeout/portclosed → 可能已执行 → 记 lostContact 事后核实
+      const r = await sendToFrame(tabId, 0, msg, isSlow ? 10000 : 1200);
+      if (r.missing) {
+        if (r.missing.reason !== "noreceiver") {
+          lostContact = { frame: { frameId: 0, parentFrameId: -1, url: "", depth: 0, order: 0 }, reason: r.missing.reason };
+        }
+        return;
+      }
+      hadResponse = true;
       response = r.response;
       return;
     }
     const frames = await resolveSearchFrames(tabId, params.frame);
-    // 会跑稳定检测 + wait_for 谓词的动作命令（CS 侧最坏 ≈ 6s）超时放宽到 10s：
-    // 1200ms 默认超时会把慢响应误判为 missing → frame 导航误报 / 元素未找到误报。
-    // （导航时端口立即关闭，不受超时影响；get_text 等快命令仍用 1200ms）
-    const slowCommands = new Set(["click", "type", "keyboard", "upload_file", "upload_dragdrop", "paste_rich", "scroll", "trigger"]);
     for (const f of frames) {
-      const r = await sendToFrame(tabId, f.frameId, msg, slowCommands.has(command) ? 10000 : 1200);
+      const r = await sendToFrame(tabId, f.frameId, msg, isSlow ? 10000 : 1200);
       if (r.missing) {
-        // 点击导致该 frame 导航：端口关闭、无响应 → 按「已点击 + 导航」处理
-        if (isClick) { navigatedFallback = true; matchedFrame = f; break; }
+        // noreceiver：该 frame 没有 content script → 命令确定没执行，安全换下一个 frame
+        if (r.missing.reason === "noreceiver") continue;
+        if (destructive.has(command)) {
+          // 写命令失联：动作可能已执行——停在当前 frame 事后核实，绝不重发
+          lostContact = { frame: f, reason: r.missing.reason };
+          matchedFrame = f;
+          return;
+        }
+        // 读命令（get_text/get_css/get_rect/show）：无副作用，换下一个 frame
         continue;
       }
+      hadResponse = true;
       if (r.response?.notFound) continue;
       response = r.response;
       matchedFrame = f;
-      break;
+      return;
     }
   }
 
-  // 若没有任何 frame 有 content script（动态 frame / 页面加载前）：注入一次后重试
-  let injected = false;
-  while (true) {
-    await doSearch();
-    if (response || navigatedFallback) break;
-    if (injected) break;
+  // 先搜索：页面已有 content script（manifest 注入）就直接应答，绝不重复注入
+  await doSearch();
+
+  // 没有任何 frame 响应且命令确定未执行（全是 noreceiver：动态 frame / 页面加载早期）：
+  // 注入一次后重试；一旦 lostContact（可能已执行）绝不再发第二次命令
+  if (!response && !lostContact && !hadResponse) {
     try {
       await injectContentScript(tabId);
-      injected = true;
-    } catch {
-      break;
+    } catch (e) {
+      // 注入失败原因如实保留（如扩展缺 host 权限 / 页面受限），最终错误信息里带出
+      injectError = e instanceof Error ? e.message : String(e);
     }
+    await doSearch();
   }
 
-  // 所有 frame 都 notFound（或无 frame 响应）时给出明确错误，避免 CLI 显示 "unknown"
-  if (!response && !navigatedFallback) {
-    response = { success: false, error: "Element not found: no match in any frame" };
+  // —— 结果整合 ——
+  if (!response && lostContact) {
+    // 写命令执行结果未知（timeout/portclosed）：核实失联后 frame/tab 的真实状态，
+    // 只对证实过的情况给结论；无法证实就明说「结果未知」，不再编造导航或成功
+    const beforeUrl = tab?.url || "";
+    const verified = await verifyLostContact(tabId, lostContact, beforeUrl);
+    const lostFrame = lostContact.frame;
+    if (verified.state === "gone") {
+      sendResult({ commandId: cmd.id!, success: false, error: `Tab ${tabId} was closed while "${command}" was in flight — outcome unknown` });
+      onDone?.();
+      return;
+    }
+    if (verified.state === "dead") {
+      sendResult({ commandId: cmd.id!, success: false, error: `"${command}" was dispatched but its outcome could not be verified (content script unreachable in the tab)` });
+      onDone?.();
+      return;
+    }
+    if (verified.state === "navigated") {
+      // 端口关闭 + frame 确实已离开（URL 变/子 frame 消失）：动作执行且页面导航走——
+      // 与 CS 自行确认的导航同构的结果（settleLost 明示 settle/waitFor 确认丢失）
+      const navResult: Record<string, unknown> = { navigated: true, settleLost: true };
+      if (needCurrent) {
+        navResult.currentTab = await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined);
+      }
+      if (needNewTabs) {
+        try {
+          const newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params as Record<string, string[]> | undefined);
+          if (newTabInfos.length > 0) navResult.newTabs = newTabInfos;
+        } catch { /* ignore */ }
+      }
+      sendResult({ commandId: cmd.id!, success: true, data: navResult });
+      onDone?.();
+      return;
+    }
+    // alive：CS 还在同一 frame（原命令响应丢失——慢 settle / 后台节流超时）→ 动作已执行，
+    // 但 settle/waitFor 确认丢失：settleLost 明示，绝不编造一个 settle 结果
+    if (isClick) {
+      const afterInfo = (needCurrent || needIframe)
+        ? await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined, true)
+        : null;
+      const afterUrl = afterInfo?.url || "";
+      const result: Record<string, unknown> = {
+        navigated: false,
+        settleLost: true,
+        ...(lostFrame.url ? { frame: { frameId: lostFrame.frameId, url: lostFrame.url } } : {}),
+      };
+      // 顶层兜底导航判断：失联期间顶层 URL 变了（核实探针漏网的整页重载）就如实报导航
+      if (afterUrl && beforeUrl && afterUrl !== beforeUrl) result.navigated = true;
+      if (needCurrent) result.currentTab = afterInfo;
+      if (needIframe) {
+        const beforeIframes = beforeFullInfo?.iframes ?? [];
+        const afterIframes = afterInfo?.iframes ?? [];
+        const iframeChanges = beforeIframes.length > 0 || afterIframes.length > 0 ? diffIframes(beforeIframes, afterIframes) : [];
+        if (iframeChanges.length > 0) result.iframeChanges = iframeChanges;
+      }
+      if (needNewTabs) {
+        try {
+          const newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params as Record<string, string[]> | undefined);
+          if (newTabInfos.length > 0) result.newTabs = newTabInfos;
+        } catch { /* ignore */ }
+      }
+      sendResult({ commandId: cmd.id!, success: true, data: result });
+      onDone?.();
+      return;
+    }
+    // 非 click 写命令：动作已执行，同样只有 settleLost 可报
+    sendResult({
+      commandId: cmd.id!,
+      success: true,
+      data: { settleLost: true, ...(lostFrame.url ? { frame: { frameId: lostFrame.frameId, url: lostFrame.url } } : {}) },
+    });
+    onDone?.();
+    return;
+  }
+
+  // 没有任何 frame 命中：区分「页面里确实没有」与「页面从头到尾没响应」，各有明确错误
+  if (!response) {
+    const tabAlive = await chrome.tabs.get(tabId).then(() => true).catch(() => false);
+    // 把「在找什么」带进错误（selector/text），通用文案没法定位问题（可读报错原则）
+    const searchParams = params as { selector?: unknown; text?: unknown };
+    const targetDesc = typeof searchParams.selector === "string"
+      ? `selector: ${searchParams.selector}`
+      : typeof searchParams.text === "string"
+        ? `text: ${searchParams.text}`
+        : "";
+    const targetSuffix = targetDesc ? ` (${targetDesc})` : "";
+    response = {
+      success: false,
+      error: !tabAlive
+        ? `Tab ${tabId} not found — was it closed?`
+        : hadResponse
+          ? `Element not found: no match in any frame${targetSuffix}`
+          : !searchable
+            ? "Click could not be delivered: no content script response (page still loading, frame navigated, or the page is restricted)"
+            : injectError
+              ? `No content script response from any frame; content script injection failed: ${injectError}`
+              : "No content script response from any frame (page still loading or restricted)",
+    };
   }
 
   const frameAttribution = matchedFrame
@@ -472,17 +615,19 @@ async function sendToTab(
     : {};
 
   try {
-    const wasNavigated = navigatedFallback || (response?.data as { navigated?: boolean } | undefined)?.navigated === true;
+    const wasNavigated = (response?.data as { navigated?: boolean } | undefined)?.navigated === true;
     if (wasNavigated) {
-      // 页面/iframe 跳转：取新页面信息
+      // CS 确认的导航（beforeunload/URL 复核）：取新页面信息，与 lostContact 核实分支同构
       const currentInfo = needCurrent
         ? await getFullPageInfo(tabId, cmd.payload.params as Record<string, string[]> | undefined)
         : null;
       const navResult: Record<string, unknown> = { navigated: true };
       if (needCurrent) navResult.currentTab = currentInfo;
       if (needNewTabs) {
-        const newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params as Record<string, string[]> | undefined);
-        if (newTabInfos.length > 0) navResult.newTabs = newTabInfos;
+        try {
+          const newTabInfos = await collectNewTabs(tabId, beforeTabs, cmd.payload.params as Record<string, string[]> | undefined);
+          if (newTabInfos.length > 0) navResult.newTabs = newTabInfos;
+        } catch { /* ignore */ }
       }
       sendResult({ commandId: cmd.id!, success: true, data: navResult });
       onDone?.();
@@ -516,14 +661,22 @@ async function sendToTab(
       return;
     }
 
-    // 常规命令：透传数据 + 命中 frame 归属
-    const data = (typeof response?.data === "object" && response?.data !== null && !Array.isArray(response.data))
-      ? { ...(response.data as Record<string, unknown>), ...frameAttribution }
+    // 常规命令：透传数据 + 命中 frame 归属。
+    // get_prop 返回的是用户指定的元素属性值——值对象自带 "frame" 键时以数据为准
+    // （那是属性内容，不能被归属信息覆盖）；否则与其它对象结果一致附加 frame 归属
+    const dataIsPlainObj = typeof response?.data === "object" && response?.data !== null && !Array.isArray(response.data);
+    const skipFrameMerge =
+      command === "get_prop" &&
+      dataIsPlainObj &&
+      "frame" in (response.data as Record<string, unknown>);
+    const data = dataIsPlainObj
+      ? { ...(response.data as Record<string, unknown>), ...(skipFrameMerge ? {} : frameAttribution) }
       : response?.data;
     sendResult({ commandId: cmd.id!, success: response?.success ?? false, data, error: response?.error });
     onDone?.();
   } catch (err) {
-    sendResult({ commandId: cmd.id!, success: false, error: String(err) });
+    const detail = err instanceof Error ? err.message : String(err);
+    sendResult({ commandId: cmd.id!, success: false, error: `Unexpected error while running "${command}": ${detail} (please report this to cda)` });
     onDone?.();
   }
 }
@@ -566,7 +719,7 @@ interface FullPageInfo {
 }
 
 // 需要在每个 frame 中查找元素的命令（首个命中即返回；坐标 click 只在顶层——elementFromPoint 语义）
-const ELEMENT_SEARCH_COMMANDS = new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "upload_dragdrop", "paste_rich", "get_rect", "trigger"]);
+const ELEMENT_SEARCH_COMMANDS = new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "upload_dragdrop", "paste_rich", "get_rect", "get_prop", "trigger"]);
 
 interface SearchFrame {
   frameId: number;
@@ -624,7 +777,12 @@ async function getFrameTree(tabId: number): Promise<SearchFrame[]> {
   return frames;
 }
 
-// 向指定 frame 发消息的 Promise 封装：无 listener / 端口关闭（如 frame 刚导航走）视为 missing
+// 向指定 frame 发消息的 Promise 封装。无响应分三类（原实现全归为 missing，导致
+// click 对任意失败都编造"导航成功"）：
+//   noreceiver —— 该 frame 没有 listener（content script 未注入/刚被导航走）：
+//                 命令确定未执行，可安全重试/换帧
+//   portclosed —— 通道建立后中途关闭（CS 执行中导航走 / 崩溃）：命令可能已执行
+//   timeout    —— CS 在 timeoutMs 内没回话（慢 settle / 卡死）：命令可能已执行
 function sendToFrame(
   tabId: number,
   frameId: number,
@@ -632,15 +790,20 @@ function sendToFrame(
   timeoutMs = 1200,
 ): Promise<{
   response?: { success: boolean; data?: unknown; error?: string; notFound?: boolean; navigated?: boolean };
-  missing?: boolean;
+  missing?: { reason: "noreceiver" | "portclosed" | "timeout" };
 }> {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve({ missing: true }), timeoutMs);
+    const timer = setTimeout(() => resolve({ missing: { reason: "timeout" } }), timeoutMs);
     try {
       chrome.tabs.sendMessage(tabId, msg, { frameId }, (r) => {
         clearTimeout(timer);
         if (chrome.runtime.lastError) {
-          resolve({ missing: true });
+          const text = String(chrome.runtime.lastError.message || "");
+          const reason: "noreceiver" | "portclosed" =
+            /Receiving end does not exist|Could not establish connection/i.test(text)
+              ? "noreceiver"
+              : "portclosed";
+          resolve({ missing: { reason } });
           return;
         }
         resolve({
@@ -649,9 +812,48 @@ function sendToFrame(
       });
     } catch {
       clearTimeout(timer);
-      resolve({ missing: true });
+      resolve({ missing: { reason: "portclosed" } });
     }
   });
+}
+
+// 写命令执行中失联（timeout/portclosed）后的事后核实——只对证实过的情况下结论：
+//   gone       —— tab 已关闭：动作结果永久未知（报错，不编造）
+//   navigated  —— 目标 frame 消失 / URL 已变：动作执行且页面导航走
+//   alive      —— frame 还在、URL 未变，且 CS 探活成功：动作已执行，仅 settle/waitFor 确认丢失
+//   dead       —— frame 还在但 CS 探不到（同 URL 重载后未注入 / 页面受限）：结果无法核实
+async function verifyLostContact(
+  tabId: number,
+  lost: { frame: SearchFrame; reason: "timeout" | "portclosed" },
+  beforeUrl: string,
+): Promise<{ state: "gone" } | { state: "navigated" } | { state: "alive" } | { state: "dead" }> {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return { state: "gone" };
+  const frames = await getFrameTree(tabId);
+  const now = frames.find((f) => f.frameId === lost.frame.frameId);
+  const topUrl = tab.url || "";
+  const isTop = lost.frame.frameId === 0;
+  // frame 级导航判断：双方 URL 都非空且不同 → 已导航；子 frame 整个消失 → 已导航。
+  // about:blank 等空 URL 时跳过比较，避免空串假阳性
+  const before = isTop ? (lost.frame.url || beforeUrl) : lost.frame.url;
+  if (before && topUrl && topUrl !== before) return { state: "navigated" };
+  if (!isTop && !now) return { state: "navigated" };
+  if (now && now.url && lost.frame.url && now.url !== lost.frame.url) return { state: "navigated" };
+  // frame 还在、URL 没变：CS 探活。响应可能只是丢失；portclosed 场景 CS 也可能已随
+  // 同 URL 重载死掉——注入一次后短轮询。探活失败 = 无法核实 → dead
+  let alive = false;
+  for (let i = 0; i < 4 && !alive; i++) {
+    if (i === 1) {
+      try { await injectContentScript(tabId); } catch { /* 注入失败继续轮询 */ }
+    }
+    const probe = await sendToFrame(tabId, lost.frame.frameId, {
+      type: "execute_command",
+      payload: { command: "get_js_errors", params: {} },
+    }, 1500);
+    alive = !!probe.response;
+    if (!alive) await new Promise((r) => setTimeout(r, 300));
+  }
+  return alive ? { state: "alive" } : { state: "dead" };
 }
 
 // 顶层 frame 的 iframes 元数据（index↔src，跨域条目也带 src）
@@ -802,6 +1004,14 @@ async function getFullPageInfo(tabId: number, cmdParams?: Record<string, unknown
       if (needHtml && html !== undefined) result.html = html;
     }
 
+    // jsErrors：跨 frame 广播聚合（get_page_info 只查顶层，JS 错误可能出现在任何 frame）。
+    // 默认与显式请求都采——FullPageInfo 类型本就声明了 jsErrors，之前从不设置是死字段。
+    // forDiff（click 的 before/after 快照）跳过：错误聚合不属于前后对比
+    if (!forDiff && (fields.length === 0 || mappedFields.some(f => f === "jsErrors"))) {
+      const { errors } = await broadcastJsErrors(tabId);
+      result.jsErrors = errors;
+    }
+
     // 输出不在此处按 _field 裁剪——采集控制（needContentScript/needIframes/needHtml）
     // 在上方完成，输出过滤统一由 sendResult 出口的 applyFieldFilter 做点路径投影。
     return result;
@@ -862,6 +1072,14 @@ function waitForTabLoad(tabId: number, timeoutMs = 30000): Promise<void> {
       chrome.tabs.onUpdated.addListener(listener);
     });
   });
+}
+
+// WS 参数里的 tabId 是字符串（"current" 或数字串），chrome.tabs API 只收 number——
+// 数字串必须显式转换，否则 tabs.remove/reload 报 "No matching signature"
+function resolveTabId(raw: unknown): number | undefined {
+  if (typeof raw === "number") return Number.isInteger(raw) ? raw : undefined;
+  if (typeof raw === "string" && /^\d+$/.test(raw)) return Number(raw);
+  return undefined;
 }
 
 /**
@@ -956,7 +1174,13 @@ async function handleBrowserCommand(cmd: CommandMessage): Promise<void> {
   try {
     switch (command) {
       case "open": {
-        const url = (params.url as string) || "about:blank";
+        // url 缺省回退 about:blank 是隐藏默认值：URL 拼错/漏传时打开的空白页 agent 无从察觉。
+        // 收不到 url 就明确报错（CLI 层已要求参数，这里兜底防绕过）
+        const url = params.url as string | undefined;
+        if (typeof url !== "string" || !url) {
+          sendResult({ commandId: cmd.id!, success: false, error: 'open needs a "url" parameter' });
+          return;
+        }
         const tab = await chrome.tabs.create({ url });
         const gid = await getOrCreateGroup(tab.windowId!);
         if (gid == null) {
@@ -986,16 +1210,16 @@ async function handleBrowserCommand(cmd: CommandMessage): Promise<void> {
       }
 
       case "refresh": {
-        let tabId: number;
+        let tabId: number | undefined;
         if (params.tabId === "current") {
           const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-          if (!tabs[0]?.id) {
+          tabId = tabs[0]?.id;
+          if (tabId == null) {
             sendResult({ commandId: cmd.id!, success: false, error: "No active tab" });
             return;
           }
-          tabId = tabs[0].id;
         } else {
-          tabId = params.tabId as number;
+          tabId = resolveTabId(params.tabId);
         }
         if (tabId == null) {
           sendResult({ commandId: cmd.id!, success: false, error: "Missing tabId parameter" });
@@ -1008,22 +1232,34 @@ async function handleBrowserCommand(cmd: CommandMessage): Promise<void> {
       }
 
       case "close_tab": {
-        let tabId: number;
+        let tabId: number | undefined;
         if (params.tabId === "current") {
           const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-          if (!tabs[0]?.id) {
+          tabId = tabs[0]?.id;
+          if (tabId == null) {
             sendResult({ commandId: cmd.id!, success: false, error: "No active tab" });
             return;
           }
-          tabId = tabs[0].id;
         } else {
-          tabId = params.tabId as number;
+          tabId = resolveTabId(params.tabId);
         }
         if (tabId == null) {
           sendResult({ commandId: cmd.id!, success: false, error: "Missing tabId parameter" });
           return;
         }
-        tabQueues.delete(tabId);
+        // 队列里还没执行的命令随 tab 一起取消：逐个明确报错（原实现 delete 后排队命令的
+        // command_result 永远不来，CLI 干等到 server 60s 超时才知失败；正在执行的头命令
+        // 不在此列——tab 关闭后它的 sendToFrame 会失联并走 gone/失联报错路径）
+        const queue = tabQueues.get(tabId);
+        if (queue) {
+          for (const queued of queue.slice(1)) {
+            wsClient.send({
+              type: "command_result",
+              payload: { commandId: queued.cmd.id!, success: false, error: `Tab ${tabId} was closed before this command ran (queued command cancelled)` },
+            });
+          }
+          tabQueues.delete(tabId);
+        }
         await chrome.tabs.remove(tabId);
         cleanupGroupIfEmpty();
         sendResult({ commandId: cmd.id!, success: true, data: { tabId } });
@@ -1034,9 +1270,10 @@ async function handleBrowserCommand(cmd: CommandMessage): Promise<void> {
         sendResult({ commandId: cmd.id!, success: false, error: `Unknown browser command: ${command}` });
     }
   } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
     wsClient.send({
       type: "command_result",
-      payload: { commandId: cmd.id!, success: false, error: String(err) },
+      payload: { commandId: cmd.id!, success: false, error: `Unexpected error while running "${cmd.payload.command}": ${detail} (please report this to cda)` },
     });
   }
 }
@@ -1045,6 +1282,10 @@ async function autoConnect(): Promise<void> {
   if (wsClient.getStatus() === "connected" || wsClient.getStatus() === "connecting") {
     return;
   }
+  // 手动断开后 15s keepalive 曾自动重连（隐藏行为）；manualDisconnect 标记期间不再 auto
+  // 重连，等用户下一次显式 connect / 配置变更触发重连时清除
+  const manual = await chrome.storage.session.get("manualDisconnect").catch(() => ({} as { manualDisconnect?: boolean }));
+  if (manual.manualDisconnect) return;
   const retry = wsClient.getRetryState();
   if (retry.nextRetryAt && retry.nextRetryAt > Date.now()) {
     return;
@@ -1124,7 +1365,7 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       for (const f of frames) {
         const r = await sendToFrame(tabId, f.frameId, {
           type: "execute_command",
-          payload: { command: "get_rect", params: { selector, text: params.text } },
+          payload: { command: "get_rect", params: { selector, text: params.text, scroll: true } },
         }, 8000);
         if (r.missing || r.response?.notFound) continue;
         const d = r.response?.data as { x?: number; y?: number; crossOrigin?: boolean } | undefined;
@@ -1196,18 +1437,66 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       await chrome.debugger.detach({ tabId }).catch(() => {});
     }
 
-    // 等影响落地：向命中 frame 发事件驱动的稳定检测（DOM/长任务静默），可选 wait_for 谓词
-    let settleInfo: { settled: boolean; settledMs: number; waitFor?: { settled: boolean; waited: number } } | undefined;
-    if (hitFrame) {
-      const { response } = await sendToFrame(tabId, hitFrame.frameId, {
-        type: "execute_command",
-        payload: { command: "wait_for_settle", params: { timeout: 3000, wait_for: params.waitFor } },
-      }, 8000);
-      settleInfo = response?.data as typeof settleInfo | undefined;
+    // 等影响落地：向命中 frame 发事件驱动的稳定检测（DOM/长任务静默），可选 wait_for 谓词。
+    // 原实现只对元素命中时 settle——x/y 坐标点击完全跳过 settle，waitFor 被静默忽略。
+    // 坐标点击同样有影响：settle 目标 = 命中 frame ?? 顶层 frame
+    const settleFrameId = hitFrame ? hitFrame.frameId : 0;
+    const tabBefore = await chrome.tabs.get(tabId).catch(() => null);
+    const beforeUrl = tabBefore?.url || "";
+    const { response: settleResp, missing } = await sendToFrame(tabId, settleFrameId, {
+      type: "execute_command",
+      payload: { command: "wait_for_settle", params: { timeout: 3000, wait_for: params.waitFor } },
+    }, 8000);
+    const settleInfo = settleResp?.data as
+      | { settled: boolean; settledMs: number; waitFor?: { settled: boolean; waited: number } }
+      | undefined;
+
+    if (missing) {
+      // settle 阶段与 CS 失联：点击本身（CDP trusted）已确定执行，失联只影响 settle/waitFor
+      // 确认——核实 tab/frame 状态，按证实过的给结论，不编造 settle 结果
+      const tabNow = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tabNow) {
+        sendResult({ success: false, error: "Tab was closed during the real click — outcome unknown" });
+        return;
+      }
+      const frames = await getFrameTree(tabId);
+      const now = frames.find((f) => f.frameId === settleFrameId);
+      // frame 级导航判断（空 URL 不比较，避免 about:blank 假阳性）
+      const navigatedNow =
+        (!!beforeUrl && !!tabNow.url && tabNow.url !== beforeUrl) ||
+        (settleFrameId !== 0 && !now) ||
+        (!!now && !!hitFrame?.url && !!now.url && now.url !== hitFrame.url);
+      if (navigatedNow) {
+        // 点击触发了导航：settle 无法继续，waitFor 条件不评估——如实放行（点击已生效）
+        sendResult({
+          success: true,
+          data: {
+            x, y, trusted: true, settleLost: true,
+            ...(params.waitFor ? { waitFor: { settled: false, skipped: "page navigated after the click — condition not evaluated" } } : {}),
+          },
+        });
+        return;
+      }
+      if (params.waitFor) {
+        // 页面没导航但 CS 无响应：waitFor 确认确实丢失——点击已执行，但「条件满足」无法声称
+        sendResult({ success: false, error: "waitFor could not be verified: content script unresponsive after the real click (the click itself was dispatched)" });
+        return;
+      }
+      sendResult({ success: true, data: { x, y, trusted: true, settleLost: true } });
+      return;
     }
-    sendResult({ success: true, data: { x, y, trusted: true, ...(settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...(settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {}) } : {}) } });
+
+    // CS 正常响应：settle 结果（含 waitFor 谓词结果）如实透传
+    sendResult({
+      success: true,
+      data: {
+        x, y, trusted: true,
+        ...(settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...(settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {}) } : {}),
+      },
+    });
   } catch (err) {
-    sendResult({ success: false, error: String(err) });
+    const detail = err instanceof Error ? err.message : String(err);
+    sendResult({ success: false, error: `Unexpected error while running "${cmd.payload.command}": ${detail} (please report this to cda)` });
   }
 }
 
@@ -1415,6 +1704,8 @@ chrome.storage.onChanged.addListener(
       chrome.storage.local.get(["nodeName", "serverUrl"], (result) => {
         const c = result as unknown as StoredConfig;
         if (c.nodeName && c.serverUrl) {
+          // 配置变更（popup 保存）是显式操作：与手动断开标记互斥，清除后重连
+          chrome.storage.session.remove("manualDisconnect").catch(() => {});
           wsClient.disconnect();
           wsClient.connect(c.serverUrl, c.nodeName);
         }

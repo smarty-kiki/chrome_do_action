@@ -1,21 +1,58 @@
 // --- Persistent JS error collection ---
 // Starts on page load, accumulates errors until explicitly cleared.
-// Errors from window.onerror and unhandledrejection are captured.
+// 隔离世界自身错误（window.onerror / unhandledrejection）与主世界错误中继
+// （见下方 MAIN_ERROR_EVT 监听）都收进 jsErrors；上限 MAX_JS_ERRORS 防长跑泄漏。
 
 const jsErrors: JsError[] = [];
+const MAX_JS_ERRORS = 200;
+
+function pushJsError(e: JsError): void {
+  jsErrors.push(e);
+  if (jsErrors.length > MAX_JS_ERRORS) jsErrors.splice(0, jsErrors.length - MAX_JS_ERRORS);
+}
 
 function onPageError(ev: ErrorEvent) {
-  jsErrors.push({ message: ev.message, source: ev.filename, lineno: ev.lineno });
+  pushJsError({ message: ev.message, source: ev.filename, lineno: ev.lineno, colno: ev.colno });
 }
 
 function onUnhandledRejection(ev: PromiseRejectionEvent) {
   const reason = ev.reason;
   const msg = typeof reason === "string" ? reason : reason?.message ?? String(reason);
-  jsErrors.push({ message: `Unhandled rejection: ${msg}`, source: "unhandledrejection" });
+  pushJsError({ message: `Unhandled rejection: ${msg}`, source: "unhandledrejection" });
 }
 
 window.addEventListener("error", onPageError);
 window.addEventListener("unhandledrejection", onUnhandledRejection);
+
+// 主世界错误中继（捕获器见 main-world.ts）：页面主世界脚本的运行时错误由注入主世界的
+// document_start 脚本以 __cda_js_error__ CustomEvent 派发到 document——DOM 事件是
+// 跨世界唯一可靠通道（曾试过把主世界队列暂存到 documentElement 上的 expando 数组，
+// 实测 expando 属性每个世界各自持有一份，主世界写入、隔离世界读不到）。
+// 时序：本脚本 document_idle 才注入；早于它的页面错误由主世界本地缓冲，注入完成后
+// 派发 __cda_js_error_sync__ 请求，主世界收到即同步补发缓冲（监听先挂、后请求）。
+const MAIN_ERROR_EVT = "__cda_js_error__";
+const MAIN_ERROR_SYNC_EVT = "__cda_js_error_sync__";
+
+function onMainWorldError(ev: Event): void {
+  if (!(ev instanceof CustomEvent)) return;
+  const d = ev.detail as { message?: unknown; source?: unknown; lineno?: unknown; colno?: unknown } | null;
+  // 形状校验：页面理论上可冒用同名事件，只收结构完整、能无损透传的条目
+  if (!d || typeof d.message !== "string" || typeof d.source !== "string") return;
+  pushJsError({
+    message: d.message,
+    source: d.source,
+    ...(typeof d.lineno === "number" ? { lineno: d.lineno } : {}),
+    ...(typeof d.colno === "number" ? { colno: d.colno } : {}),
+  });
+}
+
+document.addEventListener(MAIN_ERROR_EVT, onMainWorldError);
+// 同步请求：主世界同步派发重放，回调栈内即收到早前缓冲的主世界错误
+try {
+  document.dispatchEvent(new CustomEvent(MAIN_ERROR_SYNC_EVT));
+} catch {
+  // 页面劫持 dispatchEvent 的极端情况：早于注入的错误拿不到，静默放弃
+}
 
 // list_elements 返回的单个元素条目（service worker 聚合时给非顶层 frame 补 frame 字段）
 interface ElementInfo {
@@ -70,13 +107,16 @@ chrome.runtime.onMessage.addListener(
     const includeJsErrors = fields.includes("jsErrors");
     const exec = () => handleCommand(msg.payload);
     const promise = exec().then((result) => {
-      if (includeJsErrors && jsErrors.length > 0) {
-        const withErrors = { ...result, jsErrors: [...jsErrors] };
-        if (command === "click") {
-          const { jsErrors: _, ...rest } = withErrors;
-          return rest;
+      if (includeJsErrors) {
+        const all = [...jsErrors];
+        if (all.length > 0) {
+          const withErrors = { ...result, jsErrors: all };
+          if (command === "click") {
+            const { jsErrors: _, ...rest } = withErrors;
+            return rest;
+          }
+          return withErrors;
         }
-        return withErrors;
       }
       return result;
     });
@@ -91,6 +131,7 @@ interface JsError {
   message: string;
   source: string;
   lineno?: number;
+  colno?: number;
 }
 
 function getFieldFilter(params: Record<string, unknown>): string[] {
@@ -156,18 +197,72 @@ async function handleCommand(
   try {
     switch (command) {
       case "click": {
+        const known = ["text", "selector", "x", "y", "frame", "waitFor"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown click parameter(s): ${unknown.join(", ")} (expected text, selector, x, y, waitFor)` };
+        }
+        if (params.x !== undefined && typeof params.x !== "number") {
+          return { success: false, error: `"x" must be a number (got ${JSON.stringify(params.x)})` };
+        }
+        if (params.y !== undefined && typeof params.y !== "number") {
+          return { success: false, error: `"y" must be a number (got ${JSON.stringify(params.y)})` };
+        }
         let el: Element;
         let clickDesc: Record<string, unknown> = {};
 
-        // 派发完整鼠标事件序列（mousedown/mouseup/click），对 Vue/React 事件委托更可靠
-        const dispatchFullClick = (target: Element, x?: number, y?: number) => {
+        // 真实用户点击的事件顺序是 pointerdown → mousedown → pointerup → mouseup → click：
+        // 按完整序列派发（此前只有 3 个 MouseEvent——监听 pointer 事件的站点收不到点击；
+        // 合成事件 isTrusted=false 无法伪装，需要 trusted 点击请用 real_click）。
+        // composed:true 让事件穿透 shadow 边界——否则 shadow 内元素的 click 到不了外层
+        // 事件代理（「穿透返回 ok 但不触发」的来源之一）。
+        // text/selector 定位时先 scrollIntoView（真实点击前也会先滚动到目标）。
+        // 返回派发坐标（rect 中心），供可点性探测使用。
+        const dispatchFullClick = (target: Element, x?: number, y?: number): { cx: number; cy: number } => {
+          if (x === undefined || y === undefined) {
+            (target as HTMLElement).scrollIntoView({ block: "center" });
+          }
           const rect = (target as HTMLElement).getBoundingClientRect();
           const cx = x ?? rect.left + rect.width / 2;
           const cy = y ?? rect.top + rect.height / 2;
-          const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
-          target.dispatchEvent(new MouseEvent("mousedown", opts));
-          target.dispatchEvent(new MouseEvent("mouseup", opts));
-          target.dispatchEvent(new MouseEvent("click", opts));
+          const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0 };
+          target.dispatchEvent(new PointerEvent("pointerdown", { ...base, buttons: 1, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+          target.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
+          target.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+          target.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
+          target.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0 }));
+          return { cx, cy };
+        };
+
+        // 可点性报告：合成事件直接派发给目标、不经 hit-test；真实点击命中的是坐标处
+        // 最上层元素。目标被盖住 / 在视口外时站点可能收不到点击——不静默，如实报告
+        // （visible 恒有值；coveredBy / offscreen 只在有问题时出现）。
+        // 只报告不拦截：照常派发（不因新规则破坏被覆盖元素的合法流程），
+        // 由调用方根据报告决定是否改用 real_click。
+        const coverageReport = (target: Element, cx: number, cy: number): Record<string, unknown> => {
+          const htmlEl = target as HTMLElement;
+          const rect = htmlEl.getBoundingClientRect();
+          if (!isVisible(htmlEl) || rect.width === 0 || rect.height === 0) {
+            return { visible: false };
+          }
+          const top = document.elementFromPoint(cx, cy);
+          if (!top) return { visible: true, offscreen: true };
+          if (top !== target && !target.contains(top)) {
+            return { visible: true, coveredBy: describeLayer(top) };
+          }
+          return { visible: true };
+        };
+
+        // 报告覆盖层 / 顶部命中元素的可读描述（tag + 类 + 前 200 字符文本，够定位即可）
+        const describeLayer = (top: Element): Record<string, unknown> => {
+          const htmlTop = top as HTMLElement;
+          const desc: Record<string, unknown> = { tag: top.tagName.toLowerCase() };
+          const cls = Array.from(htmlTop.classList).slice(0, 3).join(".");
+          if (cls) desc.class = cls;
+          // 覆盖层文字原样带出（不 trim 不截断）：报告也是文字——调用方拿去跟页面比对必须一致
+          const txt = htmlTop.textContent || "";
+          if (txt) desc.text = txt;
+          return desc;
         };
 
         if (params.text) {
@@ -175,24 +270,24 @@ async function handleCommand(
           const found = findByText(text);
           if (!found) return { success: false, notFound: true, error: `No element found with text: ${text}` };
           el = found;
-          clickDesc = { text, tag: (el as HTMLElement).tagName.toLowerCase() };
-          dispatchFullClick(el);
+          const { cx, cy } = dispatchFullClick(el);
+          clickDesc = { text, tag: (el as HTMLElement).tagName.toLowerCase(), ...coverageReport(el, cx, cy) };
         } else if (params.x !== undefined && params.y !== undefined) {
           const x = params.x as number;
           const y = params.y as number;
           const found = document.elementFromPoint(x, y);
           if (!found) return { success: false, notFound: true, error: `No element at (${x}, ${y})` };
           el = found;
-          clickDesc = { x, y, tag: (el as HTMLElement).tagName.toLowerCase() };
           dispatchFullClick(el, x, y);
+          clickDesc = { x, y, tag: (el as HTMLElement).tagName.toLowerCase() };
         } else {
           const selector = params.selector as string;
           if (!selector) return { success: false, error: "Need text, selector, or {x,y}" };
           const found = findElement(selector);
           if (!found) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           el = found;
-          clickDesc = { selector, tag: (el as HTMLElement).tagName.toLowerCase() };
-          dispatchFullClick(el);
+          const { cx, cy } = dispatchFullClick(el);
+          clickDesc = { selector, tag: (el as HTMLElement).tagName.toLowerCase(), ...coverageReport(el, cx, cy) };
         }
 
         let navigated = false;
@@ -217,6 +312,54 @@ async function handleCommand(
         return { success: true, data };
       }
 
+      case "get_prop": {
+        // 只读查询元素属性（innerHTML/value/checked/…）。返回的是元素的真实属性值：
+        // 字符串/数字/布尔直接透传，对象只收 JSON 无损的普通数据（保真性由
+        // nonJsonableReason 保证——不能把丢数据的东西悄悄发回去）
+        const known = ["selector", "text", "prop", "frame"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown get_prop parameter(s): ${unknown.join(", ")} (expected selector, text, prop, frame)` };
+        }
+        const prop = params.prop;
+        if (typeof prop !== "string" || !prop) {
+          return { success: false, error: 'Need "prop" parameter (e.g. "innerHTML", "value", "checked")' };
+        }
+        for (const k of ["selector", "text"] as const) {
+          const v = params[k];
+          if (v !== undefined && typeof v !== "string") {
+            return { success: false, error: `"${k}" must be a string (got ${JSON.stringify(v)})` };
+          }
+        }
+        if (params.selector === undefined && params.text === undefined) {
+          return { success: false, error: 'Need "selector" or "text" parameter' };
+        }
+        // text 优先（与 get_rect 一致）：两者都给时按文本定位
+        const el = (params.text ? findByText(params.text as string) : findElement(params.selector as string)) as Element | null;
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${(params.text ?? params.selector) as string}` };
+        const tag = el.tagName.toLowerCase();
+        if (!(prop in el)) {
+          return {
+            success: false,
+            error: `No property "${prop}" on <${tag}> — examples: "innerHTML", "textContent", "value", "className", "checked", "id", "src", "href", "dataset"`,
+          };
+        }
+        const val = (el as unknown as Record<string, unknown>)[prop];
+        if (typeof val === "function") {
+          return { success: false, error: `"${prop}" is a method on <${tag}> — get_prop only reads properties, it never calls methods` };
+        }
+        if (val === undefined) {
+          return { success: false, error: `Property "${prop}" on <${tag}> is undefined (element found, but the property has no value)` };
+        }
+        if (val !== null && typeof val === "object") {
+          const problem = nonJsonableReason(val);
+          if (problem) {
+            return { success: false, error: `Property "${prop}" on <${tag}> ${problem}` };
+          }
+        }
+        return { success: true, data: val };
+      }
+
       case "get_rect": {
         // 获取元素在视口中的坐标（供 real_click 真实点击使用）。
         // iframe 内元素的 getBoundingClientRect 相对 iframe 自身视口，
@@ -227,6 +370,13 @@ async function handleCommand(
         if (!selector && !params.text) return { success: false, error: 'Need "selector" or "text" parameter' };
         const el = (params.text ? findByText(params.text) : findElement(selector)) as HTMLElement | null;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text || selector}` };
+        // scroll:true（real_click 专用）：先滚进视口再测坐标——real_click 按坐标派发
+        // CDP 真实鼠标事件，目标在视口外时坐标落在页面外，点击会静默落空。
+        // 强制 behavior:"instant"：页面 CSS scroll-behavior:smooth 会让滚动异步进行，
+        // 立即测量仍拿到动画前的旧坐标。
+        if (params.scroll === true) {
+          el.scrollIntoView({ block: "center", behavior: "instant" });
+        }
         const rect = el.getBoundingClientRect();
         const lx = rect.left + rect.width / 2;
         const ly = rect.top + rect.height / 2;
@@ -263,7 +413,13 @@ async function handleCommand(
         // 作用于所有匹配元素：把 hover 才显示的工具条/菜单常驻可见，
         // inline style 优先级最高，不会被 hover CSS 覆盖，随后可被 click 命中。
         // 记录原样式值，hide 可精确还原。查找穿透 open shadow root（与 findElement 同语义）。
+        const known = ["selector", "frame"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown show parameter(s): ${unknown.join(", ")} (expected selector)` };
+        }
         const selector = params.selector as string;
+        if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
         const els = findAllPierced(selector) as HTMLElement[];
         if (els.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         for (const el of els) {
@@ -285,6 +441,11 @@ async function handleCommand(
 
       case "hide": {
         // 还原所有被 show 的元素：清掉 inline style，回到 CSS 控制
+        const known: string[] = [];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown hide parameter(s): ${unknown.join(", ")} (hide takes no parameters)` };
+        }
         const els = Array.from(showRegistry.keys());
         let count = 0;
         for (const el of els) {
@@ -297,11 +458,16 @@ async function handleCommand(
       }
 
       case "type": {
+        const known = ["selector", "text", "mode", "frame", "waitFor"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown type parameter(s): ${unknown.join(", ")} (expected selector, text, mode, waitFor)` };
+        }
         const selector = params.selector as string;
         const text = params.text as string;
         const mode = (params.mode as string) || "replace";
-        if (!selector) return { success: false, error: 'Need "selector" parameter' };
-        if (text == null) return { success: false, error: 'Need "text" parameter' };
+        if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
+        if (typeof text !== "string") return { success: false, error: 'Need "text" parameter (a string)' };
         if (mode !== "replace" && mode !== "append" && mode !== "insert") {
           return { success: false, error: `Invalid mode: ${mode} (expected replace|append|insert)` };
         }
@@ -361,12 +527,9 @@ async function handleCommand(
               }
             }
           }
-          // 按换行分段输入，保留段落结构（insertText 天然替换当前选区）
-          const paragraphs = text.split(/\n+/).filter((s) => s.length > 0);
-          paragraphs.forEach((para, i) => {
-            document.execCommand("insertText", false, para);
-            if (i < paragraphs.length - 1) document.execCommand("insertParagraph", false);
-          });
+          // 整段原样插入，零加工：insertText 是浏览器原生编辑命令（与真实输入/粘贴同一编辑管线），
+          // 文本含 \n 时如何分行/分段由页面自己的原生行为决定，cda 不做任何拆分、裁剪或归一
+          document.execCommand("insertText", false, text);
           el.dispatchEvent(new Event("input", { bubbles: true }));
         }
         // 等影响落地：事件驱动的稳定检测（编辑器 debounce 重排等）+ 可选 wait_for 谓词
@@ -384,8 +547,19 @@ async function handleCommand(
         // selector 可省略：缺省用当前聚焦元素（document.activeElement）。
         // 参考 chrome_agent 的 keypress 实现：合成事件能触发页面 JS 的 keydown/keyup 处理器，
         // 但不会触发浏览器原生默认行为（如 input 内 Enter 换行/表单提交、Tab 切换焦点）。
+        const known = ["selector", "key", "ctrl", "shift", "alt", "meta", "frame", "waitFor"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown keyboard parameter(s): ${unknown.join(", ")} (expected selector, key, ctrl, shift, alt, meta, waitFor)` };
+        }
+        for (const mod of ["ctrl", "shift", "alt", "meta"] as const) {
+          const v = params[mod];
+          if (v !== undefined && typeof v !== "boolean") {
+            return { success: false, error: `"${mod}" must be true or false (got ${JSON.stringify(v)})` };
+          }
+        }
         const key = params.key as string | undefined;
-        if (!key) return { success: false, error: 'Need "key" parameter (e.g. Enter, Escape, Tab, ArrowDown, "a")' };
+        if (typeof key !== "string" || !key) return { success: false, error: 'Need "key" parameter (a string, e.g. Enter, Escape, Tab, ArrowDown, "a")' };
         const selector = params.selector as string | undefined;
         let el: Element | null = null;
         if (selector) {
@@ -424,12 +598,21 @@ async function handleCommand(
       }
 
       case "upload_file": {
+        const known = ["selector", "base64", "filename", "mime", "frame", "waitFor"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown upload_file parameter(s): ${unknown.join(", ")} (expected selector, base64, filename, mime, waitFor)` };
+        }
         const selector = params.selector as string;
         const base64 = params.base64 as string;
-        const filename = (params.filename as string) || "upload.png";
-        const mime = (params.mime as string) || "image/png";
-        if (!selector) return { success: false, error: 'Need "selector" parameter' };
-        if (!base64) return { success: false, error: 'Need "base64" parameter' };
+        // filename/mime 必填：静默默认 "upload.png"/"image/png" 会把非图片内容贴错类型，
+        // 被服务端静默拒收时调用方无从得知
+        const filename = params.filename as string | undefined;
+        const mime = params.mime as string | undefined;
+        if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
+        if (typeof base64 !== "string" || !base64) return { success: false, error: 'Need "base64" parameter (a string)' };
+        if (typeof filename !== "string" || !filename) return { success: false, error: 'Need "filename" parameter (e.g. "a.jpg")' };
+        if (typeof mime !== "string" || !mime) return { success: false, error: 'Need "mime" parameter (e.g. "image/jpeg")' };
         const el = findElement(selector) as HTMLInputElement | null;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         if (!(el instanceof HTMLInputElement) || el.type !== "file") {
@@ -476,7 +659,7 @@ async function handleCommand(
         // 但无法模拟从系统文件管理器拖入的真实拖拽（浏览器原生 DnD），校验 isTrusted 的站点无效。
         const selector = params.selector as string;
         const data = params.data as Record<string, unknown> | undefined;
-        if (!selector) return { success: false, error: 'Need "selector" parameter' };
+        if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
         if (!data || typeof data !== "object" || Array.isArray(data)) {
           return { success: false, error: '"data" must be an object: {"base64":"...","filename":"a.jpg","mime":"image/jpeg"} or {"url":"https://..."}' };
         }
@@ -498,8 +681,14 @@ async function handleCommand(
 
         let file: File;
         if (data.base64 !== undefined) {
-          const filename = (data.filename as string) || "upload.png";
-          const mime = (data.mime as string) || "image/png";
+          const filename = data.filename as string | undefined;
+          const mime = data.mime as string | undefined;
+          if (typeof filename !== "string" || !filename) {
+            return { success: false, error: '"data" needs "filename" (e.g. "a.jpg") when using base64 — no silent default file name' };
+          }
+          if (typeof mime !== "string" || !mime) {
+            return { success: false, error: '"data" needs "mime" (e.g. "image/jpeg") when using base64 — no silent default type' };
+          }
           try {
             file = base64ToFile(data.base64 as string, filename, mime);
           } catch {
@@ -513,7 +702,12 @@ async function handleCommand(
               return { success: false, error: `Failed to fetch url: ${url} (HTTP ${resp.status})` };
             }
             const blob = await resp.blob();
-            const name = (data.filename as string) || url.split("/").pop() || "download";
+            // 文件名派生自 URL 时去掉 query/hash（"a.jpg?token=1" 的尾巴会混进文件名）
+            const derived = url.split(/[?#]/)[0].split("/").pop() || "";
+            const name = (data.filename as string) || derived;
+            if (!name) {
+              return { success: false, error: 'Could not derive a file name from the URL path (e.g. redirect targets) — pass "data.filename" explicitly' };
+            }
             file = new File([blob], name, { type: blob.type || "application/octet-stream" });
           } catch (e) {
             return { success: false, error: `Failed to fetch url: ${url} (${(e as Error).message})` };
@@ -543,11 +737,24 @@ async function handleCommand(
       }
 
       case "paste_rich": {
-        // 向富文本编辑器(contenteditable)粘贴带样式的 HTML 内容，等价于粘贴一份排好版的文档
+        // 向 contenteditable 粘贴带样式的 HTML（{selector,html[,mode][,waitFor]}）：
+        //   mode replace（默认，先清空原内容）/ append（追加到末尾）/ insert（光标处插入）
+        // 只操作浏览器原生编辑命令（置光标 + execCommand insertHTML/delete）——与真实粘贴走同一
+        // 编辑管线。HTML 怎么解析、分段、清空语义怎么落地，是页面编辑器自己的原生行为；
+        // cda 不做任何编辑器嗅探/适配/清洗，怎么适应是调用方 agent 的事。
+        const known = ["selector", "html", "mode", "frame", "waitFor"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown paste_rich parameter(s): ${unknown.join(", ")} (expected selector, html, mode, waitFor)` };
+        }
         const selector = params.selector as string;
         const html = params.html as string;
-        if (!selector) return { success: false, error: 'Need "selector" parameter' };
-        if (html == null) return { success: false, error: 'Need "html" parameter' };
+        const mode = (params.mode as string) || "replace";
+        if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
+        if (typeof html !== "string" || !html) return { success: false, error: 'Need "html" parameter (a string)' };
+        if (mode !== "replace" && mode !== "append" && mode !== "insert") {
+          return { success: false, error: `Invalid mode: ${mode} (expected replace|append|insert)` };
+        }
         const el = findElement(selector) as HTMLElement | null;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
         if (!el.isContentEditable) {
@@ -557,12 +764,28 @@ async function handleCommand(
         const sel = window.getSelection();
         if (sel) {
           const range = document.createRange();
-          range.selectNodeContents(el);
-          sel.removeAllRanges();
-          sel.addRange(range);
-          document.execCommand("delete", false);
+          if (mode === "replace") {
+            range.selectNodeContents(el);
+            sel.removeAllRanges();
+            sel.addRange(range);
+            document.execCommand("delete", false);
+          } else if (mode === "append") {
+            range.selectNodeContents(el);
+            range.collapse(false);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          } else {
+            // insert：保留现有选区；光标不在元素内则移到末尾
+            const anchor = sel.anchorNode;
+            if (!(anchor instanceof Node) || !el.contains(anchor)) {
+              range.selectNodeContents(el);
+              range.collapse(false);
+              sel.removeAllRanges();
+              sel.addRange(range);
+            }
+          }
         }
-        // 直接操作 clipboardData 不可行，用 execCommand insertHTML 保留样式
+        // 整段原样插入：insertHTML 是浏览器原生编辑命令，样式如何落地由编辑器自己的原生行为决定
         document.execCommand("insertHTML", false, html);
         el.dispatchEvent(new Event("input", { bubbles: true }));
         // 等影响落地：编辑器收到内容后的重排/防抖渲染完成再返回
@@ -572,6 +795,7 @@ async function handleCommand(
           : null;
         const pasteData: Record<string, unknown> = {
           selector,
+          mode,
           tag: el.tagName.toLowerCase(),
           inserted: true,
           settledMs: stable.waited,
@@ -595,9 +819,9 @@ async function handleCommand(
         // （此类站点对任意事件都无效，需 real_click 级别的真实事件）。
         const selector = params.selector as string;
         const event = params.event as string;
-        if (!selector) return { success: false, error: 'Need "selector" parameter' };
-        if (!event) {
-          return { success: false, error: 'Need "event" parameter (e.g. "change", "blur", "focus", "input", "select", or a custom event name)' };
+        if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
+        if (typeof event !== "string" || !event) {
+          return { success: false, error: 'Need "event" parameter (a string, e.g. "change", "blur", "focus", "input", "select", or a custom event name)' };
         }
         const known = ["selector", "event", "value", "options", "frame", "waitFor"];
         const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
@@ -669,15 +893,29 @@ async function handleCommand(
       }
 
       case "get_text": {
+        const known = ["selector", "frame"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown get_text parameter(s): ${unknown.join(", ")} (expected selector)` };
+        }
         const selector = params.selector as string;
+        if (selector !== undefined && typeof selector !== "string") {
+          return { success: false, error: `"selector" must be a string (got ${JSON.stringify(selector)})` };
+        }
         const el = selector ? findElement(selector) : document.body;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
-        return { success: true, data: el.textContent?.trim() };
+        // 原样返回 textContent：不 trim、不折叠空白——读取与写入同样零加工
+        return { success: true, data: el.textContent ?? "" };
       }
 
       case "get_css": {
+        const known = ["selector", "frame"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown get_css parameter(s): ${unknown.join(", ")} (expected selector)` };
+        }
         const selector = params.selector as string;
-        if (!selector) return { success: false, error: "selector is required" };
+        if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
         const isCss = selector.startsWith("css:");
         const query = isCss ? selector.slice(4) : selector;
         // css: 前缀命中全部匹配；其余走 findElement（两者都穿透 open shadow root）
@@ -725,10 +963,30 @@ async function handleCommand(
         if (unknown.length) {
           return { success: false, error: `Unknown list_elements parameter(s): ${unknown.join(", ")} (expected frame, filter, text, max, visible)` };
         }
-        const filters = typeof params.filter === "string"
+        if (params.filter !== undefined && typeof params.filter !== "string") {
+          return { success: false, error: '"filter" must be a comma-separated string (button|link|input|select|textarea|label|editable|upload)' };
+        }
+        if (params.text !== undefined && typeof params.text !== "string") {
+          return { success: false, error: '"text" must be a string (substring match on element text)' };
+        }
+        if (params.visible !== undefined && typeof params.visible !== "boolean") {
+          return { success: false, error: '"visible" must be true (visible only) or false (hidden only)' };
+        }
+        if (params.max !== undefined && (typeof params.max !== "number" || !Number.isFinite(params.max))) {
+          return { success: false, error: '"max" must be a number (1-200)' };
+        }
+        const VALID_FILTERS = new Set(["button", "link", "input", "select", "textarea", "label", "editable", "upload"]);
+        const filters = params.filter
           ? params.filter.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
           : [];
-        const textFilter = typeof params.text === "string" ? params.text.trim() : "";
+        // 未知 filter token（拼错/不支持）直接报错：静默当"全不过滤"会返回一堆无关元素
+        for (const f of filters) {
+          if (!VALID_FILTERS.has(f)) {
+            return { success: false, error: `Unknown list_elements filter: "${f}" (expected button|link|input|select|textarea|label|editable|upload)` };
+          }
+        }
+        // text 参数零加工：按原样做子串匹配（不做 trim——给什么匹配什么）
+        const textFilter = typeof params.text === "string" ? params.text : "";
         let max = typeof params.max === "number" && Number.isFinite(params.max) ? Math.max(1, Math.floor(params.max)) : 50;
         max = Math.min(max, 200);
         const visibleOnly = params.visible === true;
@@ -757,7 +1015,9 @@ async function handleCommand(
           const tag = el.tagName.toLowerCase();
           const role = el.getAttribute("role")?.toLowerCase() ?? undefined;
           const type = el instanceof HTMLInputElement ? el.type : undefined;
-          const text = (html.innerText ?? "").trim().replace(/\s+/g, " ").slice(0, 80);
+          // 空白折叠与 click {text} 的按文本查找一致（XPath normalize-space 同样折叠）——
+          // 但绝不截断：截到 80 字符会让"按 list_elements 的 text 回点"匹配不上真实文本
+          const text = (html.innerText ?? "").trim().replace(/\s+/g, " ");
           const visible = isVisible(html);
           if (visibleOnly && !visible) continue;
           if (hiddenOnly && visible) continue;
@@ -812,7 +1072,8 @@ async function handleCommand(
       }
 
       case "get_js_errors": {
-        return { success: true, data: { errors: [...jsErrors], count: jsErrors.length } };
+        const all = [...jsErrors];
+        return { success: true, data: { errors: all, count: all.length } };
       }
 
       case "clear_js_errors": {
@@ -867,6 +1128,18 @@ async function handleCommand(
         if (unknown.length) {
           return { success: false, error: `Unknown scroll parameter(s): ${unknown.join(", ")} (expected x, y, selector, block)` };
         }
+        for (const c of ["x", "y"] as const) {
+          const v = params[c];
+          if (v !== undefined && typeof v !== "number") {
+            return { success: false, error: `"${c}" must be a number (got ${JSON.stringify(v)})` };
+          }
+        }
+        // block 非法值直接报错：拼错（如 "centr"）会静默回落 "center"，滚动位置与预期不符
+        if (params.block !== undefined) {
+          if (typeof params.block !== "string" || !["start", "center", "end", "nearest"].includes(params.block as string)) {
+            return { success: false, error: `Invalid block: ${JSON.stringify(params.block)} (expected start|center|end|nearest)` };
+          }
+        }
         const x = (params.x as number) ?? 0;
         const y = (params.y as number) ?? 0;
         const selector = params.selector as string | undefined;
@@ -911,7 +1184,10 @@ async function handleCommand(
         return { success: false, error: `Unknown command: ${command}` };
     }
   } catch (err) {
-    return { success: false, error: String(err) };
+    // 兜底：任何命令内部意外异常都以可读形式带出（命令名 + 意外错误），
+    // 原始细节留末尾供排查——不让调用方拿到孤零零的技术报错
+    const detail = err instanceof Error ? err.message : String(err);
+    return { success: false, error: `Unexpected error while running "${command}": ${detail} (please report this to cda)` };
   }
 }
 
@@ -1051,14 +1327,27 @@ async function waitForCondition(
   waitFor: { selector?: string; text?: string },
   timeoutMs: number,
 ): Promise<{ settled: boolean; waited: number }> {
+  // 谓词显式二选一且类型严格：两者都给 / 未知键 / 空对象都抛错——
+  // 不再静默偏袒 text、不再忽略未知键（被忽略的条件永远不会被等待，静默假等待）
+  const extra = Object.keys(waitFor).filter((k) => k !== "selector" && k !== "text");
+  if (extra.length > 0) throw new Error(`Invalid waitFor key(s): ${extra.join(", ")} (expected "selector" or "text")`);
+  if (waitFor.selector === undefined && waitFor.text === undefined) {
+    throw new Error('waitFor: provide "selector" or "text"');
+  }
+  if (waitFor.selector !== undefined && waitFor.text !== undefined) {
+    throw new Error('waitFor: provide "selector" or "text", not both');
+  }
+  if (waitFor.selector !== undefined && typeof waitFor.selector !== "string") {
+    throw new Error("waitFor.selector must be a string");
+  }
+  if (waitFor.text !== undefined && typeof waitFor.text !== "string") {
+    throw new Error("waitFor.text must be a string");
+  }
   const start = Date.now();
   const check = () => {
     if (waitFor.text) return !!findByText(waitFor.text);
-    if (waitFor.selector) {
-      const el = findElement(waitFor.selector) as HTMLElement | null;
-      return !!el && isVisible(el);
-    }
-    return false;
+    const el = findElement(waitFor.selector as string) as HTMLElement | null;
+    return !!el && isVisible(el);
   };
   if (check()) return { settled: true, waited: 0 };
   while (Date.now() - start < timeoutMs) {
@@ -1109,6 +1398,41 @@ function findByText(text: string): Element | null {
     const h = evalTextXPath(shadowXpath, sr);
     if (h) return h;
   }
+  return null;
+}
+
+// get_prop 对象值保真检查：返回值要穿过 CS→SW→server→CLI 的 JSON 链路，途中丢数据
+// （函数/undefined/循环引用/DOM node/CSSStyleDeclaration/DOMRect 之类非普通对象）就是
+// 静默假结果。检查不通过返回可读的原因（null 表示无损）；只放行 JSON 无损的普通对象
+function nonJsonableReason(val: unknown, seen = new Set<object>()): string | null {
+  if (typeof val === "function") return "is a function — JSON cannot carry it";
+  if (val === null || typeof val !== "object") return null;
+  if (seen.has(val)) return "contains a circular reference — JSON cannot carry it";
+  seen.add(val);
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      if (item === undefined) return "contains an undefined element — JSON cannot carry it";
+      const reason = nonJsonableReason(item, seen);
+      if (reason) return reason;
+    }
+    seen.delete(val);
+    return null;
+  }
+  const proto = Object.getPrototypeOf(val);
+  if (proto !== Object.prototype && proto !== null) {
+    return `holds a ${(val as { constructor?: { name?: string } }).constructor?.name || "non-plain"} object — only plain data can be returned; read a string/number property like "innerHTML" or "value" instead`;
+  }
+  // 不可枚举自有属性（DOMRect 的 x/y 等访问器值）在 JSON 序列化中静默丢失 → 拒绝，不返回空对象
+  if (Object.getOwnPropertyNames(val).length !== Object.keys(val).length) {
+    return `holds a ${(val as { constructor?: { name?: string } }).constructor?.name || "non-plain"} object — only plain data can be returned; read a string/number property like "innerHTML" or "value" instead`;
+  }
+  for (const key of Object.keys(val as Record<string, unknown>)) {
+    const item = (val as Record<string, unknown>)[key];
+    if (item === undefined) return `contains an undefined value under "${key}" — JSON cannot carry it`;
+    const reason = nonJsonableReason(item, seen);
+    if (reason) return reason;
+  }
+  seen.delete(val);
   return null;
 }
 
@@ -1463,7 +1787,10 @@ function genSelector(el: Element): string {
   }
   let out = "";
   for (let i = 0; i < segs.length; i++) {
-    if (i > 0) out += segs[i - 1].cross ? " >>> " : " > ";
+    // cross 标记在"子段"上（入栈时 segs[0].cross = lastCross 记录的是该段与
+    // 上一级父段之间的边界），连接符要读 segs[i].cross——读 segs[i-1].cross
+    // 会把 shadow 边界错位成普通子级，产出 `#shHost > button`（不可复用）
+    if (i > 0) out += segs[i].cross ? " >>> " : " > ";
     out += segs[i].seg;
   }
   return out || el.tagName.toLowerCase();

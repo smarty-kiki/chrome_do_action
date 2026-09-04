@@ -36,16 +36,21 @@ Page commands (tab required):
                               Optional {waitFor: {selector|text}} waits until the
                               condition appears before returning (see Settle below)
   real_click <tab> <params>   Genuine real click (works on sites that ignore
-                              synthetic events, e.g. WeChat MP).
+                              synthetic events — use it when click reports
+                              success but nothing actually happens).
                               Params: {selector} or {x,y}; optional {approach} =
                               [[x,y],...] path to move through progressively,
                               triggering hover chains before clicking.
                               Works in iframes, including cross-origin.
                               Same settle + waitFor semantics as click
-  type <tab> <params>         Type text ({selector,text[,mode][,waitFor]}); mode:
+  type <tab> <params>         Insert text into input/textarea/contenteditable
+                              ({selector,text[,mode][,waitFor]}); mode:
                               replace(default)/append/insert;
-                              supports input/textarea and contenteditable (rich
-                              text, splits by newline)
+                              text is inserted exactly as given — no trimming,
+                              no line splitting, no reformatting;
+                              contenteditable receives the text through the
+                              browser's native editing pipeline (same behavior
+                              as pasting — the editor decides how it lands)
   keyboard <tab> <params>     Send key press to element ({selector,key[,ctrl|shift|alt|meta][,waitFor]});
                               selector optional (defaults to focused element); key e.g.
                               Enter, Escape, Tab, ArrowDown, or a single char
@@ -63,18 +68,28 @@ Page commands (tab required):
                               instead of silently no-op)
   upload_dragdrop <tab> <params>
                               Drag-drop a file into an upload area that has no
-                              file input (e.g. AntD Upload.Dragger): dispatches
+                              file input and only accepts drops: dispatches
                               dragenter/dragover/drop carrying the file
                               ({selector,data}[,waitFor]);
                               data = {base64,filename,mime} or {url} (fetched)
   paste_rich <tab> <params>   Paste styled HTML into contenteditable
-                              ({selector,html[,waitFor]}); clears existing content first
+                              ({selector,html[,mode][,waitFor]}); mode:
+                              replace(default)/append/insert;
+                              uses only the browser's native editing commands —
+                              the editor decides how the HTML lands;
+                              no editor sniffing/adaptation
   show <tab> <selector>       Force-show all matching hidden elements
                               (inline style; makes hover-only menus clickable)
   hide <tab>                  Restore all elements shown by show
                               (clears inline style back to CSS control)
   get_text <tab> [params]     Get text of element ({selector}) or entire page
   get_css <tab> <selector>    Get computed CSS of element ({selector})
+  get_prop <tab> <params>     Read a property of an element and return its exact
+                              value ({selector|text, prop}); prop e.g. "innerHTML",
+                              "value", "checked", "src". Read-only: reads the real
+                              property, never calls methods. Object values return
+                              only when they survive JSON untouched — anything that
+                              would come back silently empty errors instead.
   get_page_info <tab>         Get page info (url, title, iframes), supports --field.
                               iframes include url/html for same-origin AND
                               cross-origin frames
@@ -113,10 +128,12 @@ upload_dragdrop/paste_rich/scroll/real_click):
   trip, long debounce) is beyond settle — pass {waitFor: {selector|text}} to
   poll (50ms, throttle-proof) until the condition holds; returns
   {waitFor: {settled, waited}}.
-  Background tabs: Chrome throttles timers/MutationObserver while hidden (1s
-  alignment, minutes-level after 5min hidden) — settle then waits an extra 1s
-  confirmation window (~1.6s for no-impact actions); deep-background tabs may
-  need waitFor or a focused tab.
+  Background tabs: Chrome throttles page activity while the tab is hidden
+  (1s alignment, minutes-level after 5min hidden) — settle then waits an
+  extra 1s confirmation window (~1.6s for no-impact actions);
+  deep-background tabs may need waitFor or a focused tab.
+  The server cuts any command at its 60s pending timeout — commands that chain
+  long waits (slow pages, long waitFor) can hit this ceiling.
 
 Examples:
   cda list
@@ -128,13 +145,14 @@ Examples:
   cda send abc click current '{"text":"登录"}'
   cda send abc click current --field "currentTab.url,newTabs"
   cda send abc type current '{"selector":"#title","text":"hello"}'
-  cda send abc paste_rich current '{"selector":".ProseMirror","html":"<section><span>hi</span></section>"}'
+  cda send abc paste_rich current '{"selector":".rich-editor","html":"<section><span>hi</span></section>"}'
   cda send abc upload_file current '{"selector":"input[type=file]","base64":"<b64>","filename":"a.jpg","mime":"image/jpeg"}'
-  cda send abc upload_dragdrop current '{"selector":".js_upload_area","data":{"base64":"<b64>","filename":"a.jpg","mime":"image/jpeg"}}'
+  cda send abc upload_dragdrop current '{"selector":".upload-area","data":{"base64":"<b64>","filename":"a.jpg","mime":"image/jpeg"}}'
   cda send abc scroll current '{"y":500}'
   cda send abc trigger current '{"selector":"#username","event":"blur"}'
   cda send abc trigger current '{"selector":"#category","event":"change","value":"2"}'
   cda send abc get_css current "h1.title"
+  cda send abc get_prop current '{"selector":"#title","prop":"innerHTML"}'
   cda send abc list_elements current '{"filter":"upload","visible":true}'
   cda send abc list_elements current '{"text":"发布","max":10}'`;
 function parseArgs(argv) {
@@ -144,6 +162,12 @@ function parseArgs(argv) {
     while (i < argv.length) {
         const m = argv[i].match(/^--(\w[\w-]*)(?:=(.+))?$/);
         if (m) {
+            // 未知 --flag 静默收进 raw 是隐藏行为：拼错的 --filed 不会报错，--field 静默失效
+            if (!["server", "field", "help"].includes(m[1])) {
+                console.error(`Unknown option: --${m[1]}`);
+                console.error("Use --help for full usage.");
+                process.exit(1);
+            }
             raw[m[1]] = m[2] ?? argv[++i] ?? "";
         }
         else {
@@ -178,7 +202,7 @@ function buildMessage(action, args) {
             console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
-            console.error("Page commands (tab required): click | real_click | type | keyboard | trigger | upload_file | upload_dragdrop | paste_rich | show | hide | get_text | get_css | get_page_info | list_elements | get_js_errors | clear_js_errors | screenshot | scroll");
+            console.error("Page commands (tab required): click | real_click | type | keyboard | trigger | upload_file | upload_dragdrop | paste_rich | show | hide | get_text | get_css | get_prop | get_page_info | list_elements | get_js_errors | clear_js_errors | screenshot | scroll");
             console.error("");
             console.error("Example: cda send abc123 get_page_info current");
             process.exit(1);
@@ -186,18 +210,26 @@ function buildMessage(action, args) {
         if (BROWSER_CMDS.has(command)) {
             let params = {};
             const raw = args[2] || "";
-            if (raw) {
-                switch (command) {
-                    case "open":
-                        params = { url: raw };
-                        break;
-                    case "close_tab":
-                        params = { tabId: parseInt(raw, 10) || raw };
-                        break;
-                    case "refresh":
-                        params = { tabId: parseInt(raw, 10) || raw };
-                        break;
-                }
+            switch (command) {
+                case "open":
+                    // open 缺 url 不再静默开 about:blank——报 usage 错误
+                    if (!raw) {
+                        console.error("Error: open requires a URL argument.");
+                        console.error(`Usage: cda --server <url> send <nodeId> open <url>`);
+                        process.exit(1);
+                    }
+                    params = { url: raw };
+                    break;
+                case "close_tab":
+                case "refresh":
+                    if (raw !== "current" && !/^\d+$/.test(raw)) {
+                        console.error(`${command} tabId must be "current" or a number, got: ${raw}`);
+                        console.error(`Usage: cda --server <url> send <nodeId> ${command} current|<tabId>`);
+                        process.exit(1);
+                    }
+                    // 数字字符串原样传递（不 parseInt）：server 端统一转数字，"current" 保留字面
+                    params = { tabId: raw };
+                    break;
             }
             return {
                 type: "cli", id: genId(),
@@ -266,8 +298,18 @@ if (fields.length > 0 && msg.type === "cli" && msg.payload?.action === "send") {
     sendPayload.params._field = fields;
 }
 const ws = new ws_1.default(server);
+// done：是否已收到最终结果（close 时据此区分「正常结束」与「意外断开」）
+let done = false;
+let hangTimer;
 ws.on("open", () => {
     ws.send(JSON.stringify(msg));
+    // server 端 60s PENDING_TIMEOUT 会给结果；65s 仍无结果（server 崩溃/消息丢失）
+    // 主动报错退出，不再无限等待
+    hangTimer = setTimeout(() => {
+        console.error("Error: no response within 65s — is the server running and the browser connected?");
+        process.exit(1);
+    }, 65000);
+    hangTimer.unref?.();
 });
 ws.on("message", (raw) => {
     let res;
@@ -278,43 +320,51 @@ ws.on("message", (raw) => {
         console.error("Invalid response from server");
         process.exit(1);
     }
-    if (res.type === "cli_result" && res.payload) {
-        if (res.payload.success) {
-            const data = res.payload.data;
-            // screenshot 命令：data 是 base64 PNG，解码写文件
-            if (cmdName === "screenshot" && typeof data === "string" && data.length > 0) {
-                const outPath = cmdParams.path || "screenshot.png";
-                const fs = require("fs");
-                const buf = Buffer.from(data, "base64");
-                fs.writeFileSync(outPath, buf);
-                console.log(`Screenshot saved: ${outPath} (${buf.length} bytes)`);
-            }
-            else if (data !== undefined && data !== null) {
-                if (Array.isArray(data)) {
-                    if (data.length === 0) {
-                        console.log("(empty)");
-                    }
-                    else if (typeof data[0] === "object" && "nodeId" in data[0]) {
-                        for (const c of data) {
-                            console.log(`${c.nodeId}  ${c.nodeName}  ${c.remoteAddr}  online ${c.uptime}s`);
-                        }
-                    }
-                    else {
-                        console.log(JSON.stringify(data, null, 2));
-                    }
+    // server 主动 error（未知 action / 非法消息）：明确报错退出（原来静默忽略、挂到超时）
+    if (res.type === "error") {
+        console.error(`Error: ${res.payload?.message || "unknown"}`);
+        process.exit(1);
+    }
+    if (!(res.type === "cli_result" && res.payload))
+        return; // 无关消息忽略，继续等结果
+    done = true;
+    if (hangTimer)
+        clearTimeout(hangTimer);
+    if (res.payload.success) {
+        const data = res.payload.data;
+        // screenshot 命令：data 是 base64 PNG，解码写文件
+        if (cmdName === "screenshot" && typeof data === "string" && data.length > 0) {
+            const outPath = cmdParams.path || "screenshot.png";
+            const fs = require("fs");
+            const buf = Buffer.from(data, "base64");
+            fs.writeFileSync(outPath, buf);
+            console.log(`Screenshot saved: ${outPath} (${buf.length} bytes)`);
+        }
+        else if (data !== undefined && data !== null) {
+            if (Array.isArray(data)) {
+                if (data.length === 0) {
+                    console.log("(empty)");
                 }
-                else if (typeof data === "string") {
-                    console.log(data);
+                else if (typeof data[0] === "object" && "nodeId" in data[0]) {
+                    for (const c of data) {
+                        console.log(`${c.nodeId}  ${c.nodeName}  ${c.remoteAddr}  online ${c.uptime}s`);
+                    }
                 }
                 else {
                     console.log(JSON.stringify(data, null, 2));
                 }
             }
+            else if (typeof data === "string") {
+                console.log(data);
+            }
+            else {
+                console.log(JSON.stringify(data, null, 2));
+            }
         }
-        else {
-            console.error(`Error: ${res.payload.error || "unknown"}`);
-            process.exit(1);
-        }
+    }
+    else {
+        console.error(`Error: ${res.payload.error || "unknown"}`);
+        process.exit(1);
     }
     ws.close();
 });
@@ -323,7 +373,14 @@ ws.on("error", (err) => {
     process.exit(1);
 });
 ws.on("close", () => {
-    // normal exit after receiving result
+    // 已收到结果：上面正常退出。未收到结果就断开（server 崩溃/网络）——明确报错退出，
+    // 不再让空 handler 静默挂着（65s hang timer 也会兜底，但这里能立刻告知）
+    if (!done) {
+        if (hangTimer)
+            clearTimeout(hangTimer);
+        console.error("Error: connection closed before a response was received");
+        process.exit(1);
+    }
 });
 function genId() {
     return Math.random().toString(36).slice(2, 10);

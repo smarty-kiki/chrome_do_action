@@ -26,7 +26,7 @@
 遇到这些场景，写 Playwright / Selenium 脚本往往很重，而这个项目只需要**一条命令**：
 
 - 帮别人/别处的电脑操作浏览器 —— 打开页面、填表单、点按钮、截图回传
-- 登录公众号后台、富文本编辑器里**粘贴带格式的内容**、**上传封面图**（合成事件无效、文件对话框无法弹出的站点）
+- 各类后台系统：富文本编辑器里**粘贴带格式的内容**、**上传封面图**（合成事件无效、文件对话框无法弹出的站点）
 - 抓取页面内容、滚动加载的列表、监听页面上的 **JS 报错**
 - 把浏览器操作的结果以**结构化 JSON** 吐出来，直接喂给脚本或 AI Agent
 
@@ -48,15 +48,17 @@
 | 能力 | 说明 |
 |---|---|
 | 🖱️ 页面操作 | 打开/刷新/关闭标签页、点击、输入、滚动、截图，覆盖浏览器绝大多数交互 |
-| 🔥 真实点击 `real_click` | 发送完整真实鼠标事件链，突破对合成事件免疫的站点（如微信公众平台后台），支持多级 hover 路径 |
-| 📝 富文本编辑 | `type` 向 contenteditable 输入纯文本；`paste_rich` 直接粘贴带样式的 HTML，保留字号/颜色/加粗/排版 |
+| 🔥 真实点击 `real_click` | 发送完整真实鼠标事件链，突破对合成事件免疫的站点（合成 click 提示成功却不触发时用它），支持多级 hover 路径 |
+| 📝 富文本编辑 | `type` 输入纯文本（原样插入、不自动分段）；`paste_rich` 粘贴带样式的 HTML（样式写在 HTML 里一并交给页面） |
 | 🖼️ 图片上传 | `upload_file` 将 base64 图片注入文件输入框并触发上传，绕过系统文件对话框 |
-| 🎯 拖拽上传 `upload_dragdrop` | 向无文件输入框、只认 drop 事件的上传组件（AntD Dragger 等）拖入文件，派发 dragenter/dragover/drop |
+| 🎯 拖拽上传 `upload_dragdrop` | 向无文件输入框、只认拖拽的上传区拖入文件，派发 dragenter/dragover/drop |
 | 📸 页面截图 | 对页面「所见即所得」截图，本地自动保存 PNG，排查元素遮挡/浮层/滚动位置 |
 | 🐛 JS 错误收集 | 页面加载即持续监听 `error` 与 `unhandledrejection`，随时查询/清空 |
 | ⚡ 按需采集 `--field` | 所有返回对象的命令都支持点路径投影（`--field "clickDesc.selector,settledMs,currentTab.url"`），只采集/返回需要的字段，命令更快、结果更精简 |
 | ⏳ 等影响落地 | 操作命令（click/type/keyboard/trigger/upload_file/upload_dragdrop/paste_rich/scroll/real_click）返回前事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），`settledMs` 如实反映；影响晚到的场景用 `waitFor` 谓词（50ms 轮询、条件满足瞬间返回，后台 tab 亦可靠） |
 | ⚡ 事件触发 `trigger` | 触发任意元素事件（blur 表单校验、change+value 下拉选择、自定义事件），React 受控组件同样生效；`focus`/`blur` 触发真实焦点转移（校验生效） |
+| 🗺️ 元素地图 `list_elements` | 一条命令列出全页可交互元素——自动生成可直接复用的 selector、可见性、坐标、accept 等关键属性；找不到元素时先拿地图再操作 |
+| 🔍 只读属性 `get_prop` | 读取元素属性的真实原值（value/checked/innerHTML/…），只读从不执行；校验输入是否写入、勾选态，比对原始内容 |
 | 🔎 状态感知 | 自动检测页面跳转、新开标签页、iframe 变化，命令返回「操作后的世界」而非裸事件 |
 | 🧩 iframe 支持 | 所有元素命令自动搜索 iframe（含跨域）并可直接读写操作，`iframes` 元数据对跨域也补全 `url`/`html` |
 | 🌘 shadow DOM 支持 | 所有元素命令透明穿透 open shadow root（DevTools 路径 `#shadow-root` / `>>>` / 裸选择器自动兜底），`get_page_info` 的 html 默认包含 shadow 内容 |
@@ -151,7 +153,7 @@ cda send OfficePC open https://example.com
 
 仓库里有两份与 README 互补的深度文档：
 
-- **`SKILL.md`** — 面向 AI 助手（Claude Code / WorkBuddy 等）的 **Skill 定义**。接入 AI 工具后，AI 可直接调用 `cda` 操控本机 Chrome：复用你的登录态，帮你打开网页、填表单、给公众号排版、上传封面、截图确认。安装与自检流程见文件内「安装」章节。
+- **`SKILL.md`** — 面向 AI 助手（Claude Code / WorkBuddy 等）的 **Skill 定义**。接入 AI 工具后，AI 可直接调用 `cda` 操控本机 Chrome：复用你的登录态，帮你打开网页、填表单、编辑发布网页内容、上传文件、截图确认。安装与自检流程见文件内「安装」章节。
 - **`cli/help.md`** — CLI 的**完整命令手册**：每个命令的参数格式、返回结构、`--field` 字段路径，以及 `show`/`hide`、`real_click` 等命令的**设计动机**与适用场景。
 
 > ⚠️ **打算把本项目装成你 Agent 的 skill？请务必通读这两个文件**——`SKILL.md` 定义 skill 的触发场景与标准流程（服务自检、拿节点 ID、命令写法），`cli/help.md` 沉淀了实战踩坑经验（坐标要截图确认、hover 菜单用 `show`、富文本与上传的边界行为等）。只读 README 就上手，Agent 大概率会踩同样的坑。日常手动用 CLI 则看下面「命令速查」即可。
@@ -187,11 +189,11 @@ cda send OfficePC trigger current '{"selector":"#username","event":"blur"}'
 cda send OfficePC trigger current '{"selector":"#category","event":"change","value":"2"}'   # 下拉选中 + change
 ```
 
-### 公众号富文本排版 + 封面图上传
+### 富文本排版 + 图片上传
 
 ```bash
-# 向 ProseMirror 编辑器粘贴带样式的排版
-cda send OfficePC paste_rich current '{"selector":".ProseMirror","html":"<section style=\"text-align:center\"><span style=\"font-weight:bold\">小标题</span></section>"}'
+# 向富文本编辑区粘贴带样式的排版
+cda send OfficePC paste_rich current '{"selector":".rich-editor","html":"<section style=\"text-align:center\"><span style=\"font-weight:bold\">小标题</span></section>"}'
 
 # 把本地图片（先转 base64）注入 file input 触发上传
 B64=$(base64 -i cover.jpg | tr -d '\n')
@@ -201,11 +203,11 @@ cda send OfficePC upload_file current "{\"selector\":\"input[type=file]\",\"base
 ### 真实点击（对合成事件免疫的站点）
 
 ```bash
-# 微信后台：真实点击
+# 后台系统：真实点击（普通 click 点了没反应时）
 cda send OfficePC real_click current '{"selector":"#submit"}'
 
-# 多级 hover：先渐进经过封面预览、换一张图标（触发 hover 链），最后点击菜单项
-cda send OfficePC real_click current '{"selector":".js_imagedialog","approach":[[720,224],[767,201],[811,200],[830,240]]}'
+# 多级 hover：先渐进经过触发点（打开 hover 菜单），最后点击菜单项
+cda send OfficePC real_click current '{"selector":".toolbar-menu","approach":[[720,224],[767,201],[811,200],[830,240]]}'
 ```
 
 ### 截图确认页面状态
@@ -246,15 +248,17 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 |---|---|---|
 | `click` | `send <id> click <tab> <params>` | 点击元素（selector / 文字 / 坐标） |
 | `real_click` | `send <id> real_click <tab> <params>` | 真实点击，支持 `approach` 渐进 hover 路径 |
-| `type` | `send <id> type <tab> <params>` | 输入文本；支持 input/textarea 与 contenteditable 富文本 |
+| `type` | `send <id> type <tab> <params>` | 输入文本；支持 input/textarea 与富文本编辑区 |
 | `keyboard` | `send <id> keyboard <tab> <params>` | 向元素发送按键（`{selector,key}`，selector 省略用当前聚焦元素），可加 `ctrl`/`shift`/`alt`/`meta` 组合键 |
 | `trigger` | `send <id> trigger <tab> <params>` | 触发元素事件（`{selector,event}`）：`blur` 触发表单校验、`change`+`value` 选下拉选项（React 受控组件同样生效）、自定义事件；`focus`/`blur` 触发真实焦点转移；带 settle + waitFor |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入 base64 图片并触发上传 |
-| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | 向拖拽上传区（无 file input、只认 drop 的组件，如 AntD Dragger）拖入文件（`{selector,data}`，data 为 `{base64,filename,mime}` 或 `{url}`） |
+| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | 向拖拽上传区（无 file input、只认 drop）拖入文件（`{selector,data}`，data 为 `{base64,filename,mime}` 或 `{url}`） |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | 向富文本编辑器粘贴带样式的 HTML |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取元素/整页文本 |
 | `get_css` | `send <id> get_css <tab> <selector>` | 获取所有匹配元素的 computed style |
+| `get_prop` | `send <id> get_prop <tab> <params>` | 读取元素属性真实原值（`{selector\|text, prop}`），只读不调用方法；标量原样返回，无法无损转 JSON 的对象明确报错 |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息（url / title / iframes） |
+| `list_elements` | `send <id> list_elements <tab> <params>` | 页面元素地图：列出可交互元素（自动生成 selector/可见性/坐标/accept），支持 filter/text/max/visible 过滤，穿透 shadow、缺省聚合所有 frame；找不到元素先跑它 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取累积的 JS 错误 |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空累积的 JS 错误 |
 | `screenshot` | `send <id> screenshot <tab> <params>` | 截图，`{"path":"/tmp/s.png"}` 本地保存 |
@@ -274,14 +278,14 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 ### 其他命令参数
 
 ```json
-// type —— 富文本按换行分段
-{"selector": ".ProseMirror", "text": "第一段\n\n第二段"}
+// type —— 文字原样插入、不按换行分段（要分段就分多次 type，后续用 mode:"append"）
+{"selector": ".rich-editor", "text": "第一段"}
 
 // upload_file —— base64 注入文件框
 {"selector": "input[type=file]", "base64": "<base64>", "filename": "a.jpg", "mime": "image/jpeg"}
 
-// paste_rich —— 粘贴带样式的 HTML（会先清空编辑器内容）
-{"selector": ".ProseMirror", "html": "<section><span>hi</span></section>"}
+// paste_rich —— 粘贴带样式的 HTML（mode 同 type：默认 replace 先清空再粘贴）
+{"selector": ".rich-editor", "html": "<section><span>hi</span></section>"}
 
 // scroll —— 垂直/水平滚动
 {"y": 500}                       // 或 {"x": 300, "y": 500}
@@ -293,20 +297,20 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 
 ### 1. `real_click`：突破合成事件免疫的站点
 
-许多后台（如微信公众平台的 Vue 组件）会忽略合成的 click。`real_click` 发送**完整真实鼠标事件链**：
+许多后台系统会忽略合成的 click（点了看似成功、实际没触发）。`real_click` 发送**完整真实鼠标事件链**：
 
 - 鼠标渐进移动而非瞬移，能真实触发途经元素的 hover 链
 - 点击后鼠标**停留在目标上**，保留 hover 状态供连续操作
-- `approach` 参数模拟「先移到触发点、再移到目标」的多级 hover 场景（如封面 hover 工具条）
+- `approach` 参数模拟「先移到触发点、再移到目标」的多级 hover 场景（悬停才展开的嵌套菜单/工具条）
 - **iframe 支持**：自动搜索 iframe（含跨域），`frame` 参数可指定目标
 - 副作用：执行时 Chrome 顶部短暂出现「正在调试此浏览器」横幅，随即消失
 
 ### 2. 富文本与文件上传：绕开最难的两个交互
 
-- **`type`**：普通输入框直接设 value 并触发 `input`/`change`；contenteditable（ProseMirror、UEditor 等）聚焦后按换行分段插入，保留段落结构
-- **`paste_rich`**：向富文本编辑器粘贴带内联样式的 HTML，保留字号/颜色/加粗/间距，等价于「全选删除后粘贴排好版的文档」
-- **`upload_file`**：把 base64 图片注入 `input[type=file]` 并触发 `change`，页面监听后自动上传——无需操作系统文件对话框（比如没有辅助功能权限时也能传公众号封面）
-- **`upload_dragdrop`**：找不到文件输入框、只有拖拽上传区（AntD `Upload.Dragger` 等）时，向目标区域派发带文件的 dragenter/dragover/drop，页面 drop 处理器自动上传——与 `upload_file` 互补
+- **`type`**：普通输入框直接写 value 并触发 `input`/`change`；富文本编辑区聚焦后文字**整段原样插入——不 trim、不按换行拆分、不改写**，怎么分段由编辑器自己决定（cda 不做编辑器适配；段落要精确可控就一段发一次，后续 `mode:"append"` 追加）
+- **`paste_rich`**：向富文本编辑器粘贴带内联样式的 HTML，保留字号/颜色/加粗/间距；`mode` 同 type（默认 `replace` 等价于「全选删除后粘贴排好版的文档」，`append`/`insert` 可选），HTML 交给浏览器原生粘贴管线落地、不做编辑器适配
+- **`upload_file`**：把 base64 图片注入 `input[type=file]` 并触发 `change`，页面监听后自动上传——无需操作系统文件对话框（比如没有辅助功能权限时也能上传封面图）
+- **`upload_dragdrop`**：找不到文件输入框、只有拖拽上传区时，向目标区域派发带文件的 dragenter/dragover/drop，页面 drop 处理器自动上传——与 `upload_file` 互补
 
 ### 3. `--field` 按需采集
 
@@ -319,7 +323,7 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-**所有返回对象的命令**都支持：`click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`。字段路径逗号分隔、点号嵌套投影：`--field a.b` 返回 `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）；路径段遇数组逐项投影（`newTabs.url` → `{newTabs: [url, ...]}`）；不存在的路径忽略。`get_text` 返回纯文本，无字段可滤。
+**所有返回对象的命令**都支持：`click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_prop`/`get_page_info`/`list_elements`/`get_js_errors`/`real_click`/`open`（`get_prop` 仅在值为普通对象时）。字段路径逗号分隔、点号嵌套投影：`--field a.b` 返回 `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）；路径段遇数组逐项投影（`newTabs.url` → `{newTabs: [url, ...]}`）；不存在的路径忽略。`get_text` 返回纯文本、`get_prop` 标量值原样返回——均无字段可滤。
 
 ### 4. 状态感知：操作之后自动「看结果」
 
@@ -343,7 +347,7 @@ cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "sett
 
 ### 7. iframe 读写操作
 
-所有元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`）都**自动搜索 iframe**：顶层优先、深度优先遍历每个 frame（含跨域），首个命中即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+所有元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`get_prop`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`）都**自动搜索 iframe**：顶层优先、深度优先遍历每个 frame（含跨域），首个命中即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
 
 ```bash
 # 读取 iframe 内元素文本（自动搜索到跨域 iframe）
@@ -367,7 +371,7 @@ cda send OfficePC get_text current '{"selector":"#editor","frame":0}'
 
 ### 8. shadow DOM 读写操作
 
-Web Components 站点（小红书创作后台、部分中后台系统）把发布按钮、编辑器包在 shadow root 里——浏览器原生 `querySelector` 不认 `>>>`、XPath 不穿透 shadow 边界，普通选择器全都找不到。cda 让所有元素命令**透明穿透 open shadow root**，三种方式从显式到隐式：
+Web Components 站点（小红书创作后台、部分中后台系统）把发布按钮、编辑器包在 shadow root 里——浏览器原生 `querySelector` 不认 `>>>`、XPath 不穿透 shadow 边界，普通选择器全都找不到。cda 让所有元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`get_prop`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`）**透明穿透 open shadow root**，三种方式从显式到隐式：
 
 ```bash
 # 1. DevTools 路径：直接粘贴元素面板「Copy → Copy element path」的完整路径（含 #shadow-root）
@@ -412,14 +416,14 @@ cda send OfficePC click current '{"text":"发布"}'
 ```json
 {
   "navigated": false,
-  "clickDesc": { "text": "登录", "tag": "button" },
+  "clickDesc": { "text": "登录", "tag": "button", "visible": true },
   "currentTab": { "url": "...", "title": "...", "iframes": [...] },
   "iframeChanges": [],
   "newTabs": []
 }
 ```
 
-- `clickDesc`：本次点击的描述（`text`/`selector`/`x,y` + `tag`）
+- `clickDesc`：本次点击的描述（`text`/`selector`/`x,y` + `tag`）。`selector`/`text` 定位时附带**可点性报告**：`visible: true|false`（元素是否可见可点）；被遮挡时附 `coveredBy: {tag, class, text}`（浮层/遮罩盖住了目标点）、视口外时附 `offscreen: true`——出现 `visible: false`/`coveredBy`/`offscreen` 说明**这次点击大概率没被页面真正收到**（命令仍成功），先 `screenshot` 查真实状态：关浮层 / `show` / 等条件出现（`waitFor`），仍不行用 `real_click` 坐标
 - `navigated`：是否发生页面跳转；若为 `true`，返回新页面信息（含跳转后 `currentTab`）
 - `newTabs`：`target="_blank"` 打开的新标签页（含 tabId、url、title、iframes）
 - `iframeChanges`：`[{index, srcChanged, beforeSrc, afterSrc}]`，仅在检测到变化时出现
@@ -430,6 +434,8 @@ cda send OfficePC click current '{"text":"发布"}'
 |---|---|
 | `get_text` | 字符串，如 `"登录"` |
 | `get_css` | `{ selector, count, results: [{index, css: {display, …}}] }` |
+| `get_prop` | 属性真实原值（字符串/数字/布尔原样返回；普通对象返回并带命中 frame；无法无损转 JSON 的报错） |
+| `list_elements` | `{ count, truncated, elements: [{tag, text, visible, x, y, w, h, selector, …}] }` |
 | `type` / `clear_js_errors` | `{ success: true }` |
 | `upload_file` / `upload_dragdrop` | `{ success: true, data: { filename, size, mime } }` |
 | `scroll` | `{ success: true, data: { scrollX, scrollY } }` |

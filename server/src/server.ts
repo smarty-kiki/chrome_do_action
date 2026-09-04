@@ -187,8 +187,10 @@ wss.on("connection", (ws: WebSocket, req) => {
           sendWs(ws, { type: "error", id: msg.id, payload: { message: "Already registered" } });
           return;
         }
+        // payload 缺失时不崩 server——nodeName 只是显示名，回落 nodeId
+        const regPayload = (msg as RegisterMessage).payload;
         const nodeId = genId();
-        const nodeName = (msg as RegisterMessage).payload.nodeName || nodeId;
+        const nodeName = typeof regPayload?.nodeName === "string" && regPayload.nodeName ? regPayload.nodeName : nodeId;
         registered = true;
 
         client = { ws, nodeId, nodeName, connectedAt: Date.now(), remoteAddr };
@@ -240,7 +242,15 @@ wss.on("connection", (ws: WebSocket, req) => {
       // --- CLI command ---
       case "cli": {
         const cliMsg = msg as CliMessage;
-        const { action, target, command, tabId: cliTabId, params: cliParams } = cliMsg.payload;
+        // 外部连接可能缺 payload：解构前挡掉，不能崩 server
+        const cliPayload = cliMsg.payload as
+          | { action?: string; target?: string; command?: string; tabId?: string; params?: Record<string, unknown> }
+          | undefined;
+        if (!cliPayload || typeof cliPayload !== "object") {
+          sendWs(ws, { type: "cli_result", id: cliMsg.id, payload: { success: false, error: "Malformed cli message: missing payload" } });
+          return;
+        }
+        const { action, target, command, tabId: cliTabId, params: cliParams } = cliPayload;
 
         if (action === "list") {
           const entries = listClients();
@@ -263,7 +273,13 @@ wss.on("connection", (ws: WebSocket, req) => {
           // Build params: merge explicit params with tabId
           let params: Record<string, unknown> = { ...cliParams };
           if (cliTabId && cliTabId !== "current") {
-            params.tabId = parseInt(cliTabId, 10);
+            const n = parseInt(cliTabId, 10);
+            // 非法 tabId 报可读错误，而不是把 NaN 静默传给浏览器
+            if (!Number.isFinite(n)) {
+              sendWs(ws, { type: "cli_result", id: cliMsg.id, payload: { success: false, error: `Invalid tabId: "${cliTabId}" (expected "current" or a tab number)` } });
+              return;
+            }
+            params.tabId = n;
           }
 
           const cmdId = genId();
@@ -292,7 +308,11 @@ wss.on("connection", (ws: WebSocket, req) => {
           break;
         }
 
-        sendWs(ws, { type: "cli_result", id: cliMsg.id, payload: { success: false, error: `Unknown action: ${action}` } });
+        sendWs(ws, {
+          type: "cli_result",
+          id: cliMsg.id,
+          payload: { success: false, error: `Unknown action: ${action ?? "(none)"} (valid actions: list, send)` },
+        });
         break;
       }
 

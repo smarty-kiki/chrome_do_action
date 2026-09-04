@@ -2,16 +2,39 @@
 (() => {
   // src/content/content-script.ts
   var jsErrors = [];
+  var MAX_JS_ERRORS = 200;
+  function pushJsError(e) {
+    jsErrors.push(e);
+    if (jsErrors.length > MAX_JS_ERRORS) jsErrors.splice(0, jsErrors.length - MAX_JS_ERRORS);
+  }
   function onPageError(ev) {
-    jsErrors.push({ message: ev.message, source: ev.filename, lineno: ev.lineno });
+    pushJsError({ message: ev.message, source: ev.filename, lineno: ev.lineno, colno: ev.colno });
   }
   function onUnhandledRejection(ev) {
     const reason = ev.reason;
     const msg = typeof reason === "string" ? reason : reason?.message ?? String(reason);
-    jsErrors.push({ message: `Unhandled rejection: ${msg}`, source: "unhandledrejection" });
+    pushJsError({ message: `Unhandled rejection: ${msg}`, source: "unhandledrejection" });
   }
   window.addEventListener("error", onPageError);
   window.addEventListener("unhandledrejection", onUnhandledRejection);
+  var MAIN_ERROR_EVT = "__cda_js_error__";
+  var MAIN_ERROR_SYNC_EVT = "__cda_js_error_sync__";
+  function onMainWorldError(ev) {
+    if (!(ev instanceof CustomEvent)) return;
+    const d = ev.detail;
+    if (!d || typeof d.message !== "string" || typeof d.source !== "string") return;
+    pushJsError({
+      message: d.message,
+      source: d.source,
+      ...typeof d.lineno === "number" ? { lineno: d.lineno } : {},
+      ...typeof d.colno === "number" ? { colno: d.colno } : {}
+    });
+  }
+  document.addEventListener(MAIN_ERROR_EVT, onMainWorldError);
+  try {
+    document.dispatchEvent(new CustomEvent(MAIN_ERROR_SYNC_EVT));
+  } catch {
+  }
   var showRegistry = /* @__PURE__ */ new Map();
   function restoreShownElement(el) {
     const orig = showRegistry.get(el);
@@ -36,13 +59,16 @@
       const includeJsErrors = fields.includes("jsErrors");
       const exec = () => handleCommand(msg.payload);
       const promise = exec().then((result) => {
-        if (includeJsErrors && jsErrors.length > 0) {
-          const withErrors = { ...result, jsErrors: [...jsErrors] };
-          if (command === "click") {
-            const { jsErrors: _, ...rest } = withErrors;
-            return rest;
+        if (includeJsErrors) {
+          const all = [...jsErrors];
+          if (all.length > 0) {
+            const withErrors = { ...result, jsErrors: all };
+            if (command === "click") {
+              const { jsErrors: _, ...rest } = withErrors;
+              return rest;
+            }
+            return withErrors;
           }
-          return withErrors;
         }
         return result;
       });
@@ -96,40 +122,79 @@
     try {
       switch (command) {
         case "click": {
+          const known = ["text", "selector", "x", "y", "frame", "waitFor"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown click parameter(s): ${unknown.join(", ")} (expected text, selector, x, y, waitFor)` };
+          }
+          if (params.x !== void 0 && typeof params.x !== "number") {
+            return { success: false, error: `"x" must be a number (got ${JSON.stringify(params.x)})` };
+          }
+          if (params.y !== void 0 && typeof params.y !== "number") {
+            return { success: false, error: `"y" must be a number (got ${JSON.stringify(params.y)})` };
+          }
           let el;
           let clickDesc = {};
           const dispatchFullClick = (target, x, y) => {
+            if (x === void 0 || y === void 0) {
+              target.scrollIntoView({ block: "center" });
+            }
             const rect = target.getBoundingClientRect();
             const cx = x ?? rect.left + rect.width / 2;
             const cy = y ?? rect.top + rect.height / 2;
-            const opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
-            target.dispatchEvent(new MouseEvent("mousedown", opts));
-            target.dispatchEvent(new MouseEvent("mouseup", opts));
-            target.dispatchEvent(new MouseEvent("click", opts));
+            const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0 };
+            target.dispatchEvent(new PointerEvent("pointerdown", { ...base, buttons: 1, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+            target.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
+            target.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+            target.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
+            target.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0 }));
+            return { cx, cy };
+          };
+          const coverageReport = (target, cx, cy) => {
+            const htmlEl = target;
+            const rect = htmlEl.getBoundingClientRect();
+            if (!isVisible(htmlEl) || rect.width === 0 || rect.height === 0) {
+              return { visible: false };
+            }
+            const top = document.elementFromPoint(cx, cy);
+            if (!top) return { visible: true, offscreen: true };
+            if (top !== target && !target.contains(top)) {
+              return { visible: true, coveredBy: describeLayer(top) };
+            }
+            return { visible: true };
+          };
+          const describeLayer = (top) => {
+            const htmlTop = top;
+            const desc = { tag: top.tagName.toLowerCase() };
+            const cls = Array.from(htmlTop.classList).slice(0, 3).join(".");
+            if (cls) desc.class = cls;
+            const txt = htmlTop.textContent || "";
+            if (txt) desc.text = txt;
+            return desc;
           };
           if (params.text) {
             const text = params.text;
             const found = findByText(text);
             if (!found) return { success: false, notFound: true, error: `No element found with text: ${text}` };
             el = found;
-            clickDesc = { text, tag: el.tagName.toLowerCase() };
-            dispatchFullClick(el);
+            const { cx, cy } = dispatchFullClick(el);
+            clickDesc = { text, tag: el.tagName.toLowerCase(), ...coverageReport(el, cx, cy) };
           } else if (params.x !== void 0 && params.y !== void 0) {
             const x = params.x;
             const y = params.y;
             const found = document.elementFromPoint(x, y);
             if (!found) return { success: false, notFound: true, error: `No element at (${x}, ${y})` };
             el = found;
-            clickDesc = { x, y, tag: el.tagName.toLowerCase() };
             dispatchFullClick(el, x, y);
+            clickDesc = { x, y, tag: el.tagName.toLowerCase() };
           } else {
             const selector = params.selector;
             if (!selector) return { success: false, error: "Need text, selector, or {x,y}" };
             const found = findElement(selector);
             if (!found) return { success: false, notFound: true, error: `Element not found: ${selector}` };
             el = found;
-            clickDesc = { selector, tag: el.tagName.toLowerCase() };
-            dispatchFullClick(el);
+            const { cx, cy } = dispatchFullClick(el);
+            clickDesc = { selector, tag: el.tagName.toLowerCase(), ...coverageReport(el, cx, cy) };
           }
           let navigated = false;
           const onBeforeUnload = () => {
@@ -148,11 +213,57 @@
           }
           return { success: true, data };
         }
+        case "get_prop": {
+          const known = ["selector", "text", "prop", "frame"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown get_prop parameter(s): ${unknown.join(", ")} (expected selector, text, prop, frame)` };
+          }
+          const prop = params.prop;
+          if (typeof prop !== "string" || !prop) {
+            return { success: false, error: 'Need "prop" parameter (e.g. "innerHTML", "value", "checked")' };
+          }
+          for (const k of ["selector", "text"]) {
+            const v = params[k];
+            if (v !== void 0 && typeof v !== "string") {
+              return { success: false, error: `"${k}" must be a string (got ${JSON.stringify(v)})` };
+            }
+          }
+          if (params.selector === void 0 && params.text === void 0) {
+            return { success: false, error: 'Need "selector" or "text" parameter' };
+          }
+          const el = params.text ? findByText(params.text) : findElement(params.selector);
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text ?? params.selector}` };
+          const tag = el.tagName.toLowerCase();
+          if (!(prop in el)) {
+            return {
+              success: false,
+              error: `No property "${prop}" on <${tag}> \u2014 examples: "innerHTML", "textContent", "value", "className", "checked", "id", "src", "href", "dataset"`
+            };
+          }
+          const val = el[prop];
+          if (typeof val === "function") {
+            return { success: false, error: `"${prop}" is a method on <${tag}> \u2014 get_prop only reads properties, it never calls methods` };
+          }
+          if (val === void 0) {
+            return { success: false, error: `Property "${prop}" on <${tag}> is undefined (element found, but the property has no value)` };
+          }
+          if (val !== null && typeof val === "object") {
+            const problem = nonJsonableReason(val);
+            if (problem) {
+              return { success: false, error: `Property "${prop}" on <${tag}> ${problem}` };
+            }
+          }
+          return { success: true, data: val };
+        }
         case "get_rect": {
           const selector = params.selector;
           if (!selector && !params.text) return { success: false, error: 'Need "selector" or "text" parameter' };
           const el = params.text ? findByText(params.text) : findElement(selector);
           if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text || selector}` };
+          if (params.scroll === true) {
+            el.scrollIntoView({ block: "center", behavior: "instant" });
+          }
           const rect = el.getBoundingClientRect();
           const lx = rect.left + rect.width / 2;
           const ly = rect.top + rect.height / 2;
@@ -184,7 +295,13 @@
           };
         }
         case "show": {
+          const known = ["selector", "frame"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown show parameter(s): ${unknown.join(", ")} (expected selector)` };
+          }
           const selector = params.selector;
+          if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
           const els = findAllPierced(selector);
           if (els.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           for (const el of els) {
@@ -204,6 +321,11 @@
           return { success: true, data: { selector, count: els.length } };
         }
         case "hide": {
+          const known = [];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown hide parameter(s): ${unknown.join(", ")} (hide takes no parameters)` };
+          }
           const els = Array.from(showRegistry.keys());
           let count = 0;
           for (const el of els) {
@@ -215,11 +337,16 @@
           return { success: true, data: { count } };
         }
         case "type": {
+          const known = ["selector", "text", "mode", "frame", "waitFor"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown type parameter(s): ${unknown.join(", ")} (expected selector, text, mode, waitFor)` };
+          }
           const selector = params.selector;
           const text = params.text;
           const mode = params.mode || "replace";
-          if (!selector) return { success: false, error: 'Need "selector" parameter' };
-          if (text == null) return { success: false, error: 'Need "text" parameter' };
+          if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
+          if (typeof text !== "string") return { success: false, error: 'Need "text" parameter (a string)' };
           if (mode !== "replace" && mode !== "append" && mode !== "insert") {
             return { success: false, error: `Invalid mode: ${mode} (expected replace|append|insert)` };
           }
@@ -272,11 +399,7 @@
                 }
               }
             }
-            const paragraphs = text.split(/\n+/).filter((s) => s.length > 0);
-            paragraphs.forEach((para, i) => {
-              document.execCommand("insertText", false, para);
-              if (i < paragraphs.length - 1) document.execCommand("insertParagraph", false);
-            });
+            document.execCommand("insertText", false, text);
             el.dispatchEvent(new Event("input", { bubbles: true }));
           }
           const stable = await waitForSettled(3e3);
@@ -286,8 +409,19 @@
           return { success: true, data: typeData };
         }
         case "keyboard": {
+          const known = ["selector", "key", "ctrl", "shift", "alt", "meta", "frame", "waitFor"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown keyboard parameter(s): ${unknown.join(", ")} (expected selector, key, ctrl, shift, alt, meta, waitFor)` };
+          }
+          for (const mod of ["ctrl", "shift", "alt", "meta"]) {
+            const v = params[mod];
+            if (v !== void 0 && typeof v !== "boolean") {
+              return { success: false, error: `"${mod}" must be true or false (got ${JSON.stringify(v)})` };
+            }
+          }
           const key = params.key;
-          if (!key) return { success: false, error: 'Need "key" parameter (e.g. Enter, Escape, Tab, ArrowDown, "a")' };
+          if (typeof key !== "string" || !key) return { success: false, error: 'Need "key" parameter (a string, e.g. Enter, Escape, Tab, ArrowDown, "a")' };
           const selector = params.selector;
           let el = null;
           if (selector) {
@@ -324,12 +458,19 @@
           return { success: true, data: keyData };
         }
         case "upload_file": {
+          const known = ["selector", "base64", "filename", "mime", "frame", "waitFor"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown upload_file parameter(s): ${unknown.join(", ")} (expected selector, base64, filename, mime, waitFor)` };
+          }
           const selector = params.selector;
           const base64 = params.base64;
-          const filename = params.filename || "upload.png";
-          const mime = params.mime || "image/png";
-          if (!selector) return { success: false, error: 'Need "selector" parameter' };
-          if (!base64) return { success: false, error: 'Need "base64" parameter' };
+          const filename = params.filename;
+          const mime = params.mime;
+          if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
+          if (typeof base64 !== "string" || !base64) return { success: false, error: 'Need "base64" parameter (a string)' };
+          if (typeof filename !== "string" || !filename) return { success: false, error: 'Need "filename" parameter (e.g. "a.jpg")' };
+          if (typeof mime !== "string" || !mime) return { success: false, error: 'Need "mime" parameter (e.g. "image/jpeg")' };
           const el = findElement(selector);
           if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           if (!(el instanceof HTMLInputElement) || el.type !== "file") {
@@ -363,7 +504,7 @@
         case "upload_dragdrop": {
           const selector = params.selector;
           const data = params.data;
-          if (!selector) return { success: false, error: 'Need "selector" parameter' };
+          if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
           if (!data || typeof data !== "object" || Array.isArray(data)) {
             return { success: false, error: '"data" must be an object: {"base64":"...","filename":"a.jpg","mime":"image/jpeg"} or {"url":"https://..."}' };
           }
@@ -384,8 +525,14 @@
           if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           let file;
           if (data.base64 !== void 0) {
-            const filename = data.filename || "upload.png";
-            const mime = data.mime || "image/png";
+            const filename = data.filename;
+            const mime = data.mime;
+            if (typeof filename !== "string" || !filename) {
+              return { success: false, error: '"data" needs "filename" (e.g. "a.jpg") when using base64 \u2014 no silent default file name' };
+            }
+            if (typeof mime !== "string" || !mime) {
+              return { success: false, error: '"data" needs "mime" (e.g. "image/jpeg") when using base64 \u2014 no silent default type' };
+            }
             try {
               file = base64ToFile(data.base64, filename, mime);
             } catch {
@@ -399,7 +546,11 @@
                 return { success: false, error: `Failed to fetch url: ${url} (HTTP ${resp.status})` };
               }
               const blob = await resp.blob();
-              const name = data.filename || url.split("/").pop() || "download";
+              const derived = url.split(/[?#]/)[0].split("/").pop() || "";
+              const name = data.filename || derived;
+              if (!name) {
+                return { success: false, error: 'Could not derive a file name from the URL path (e.g. redirect targets) \u2014 pass "data.filename" explicitly' };
+              }
               file = new File([blob], name, { type: blob.type || "application/octet-stream" });
             } catch (e) {
               return { success: false, error: `Failed to fetch url: ${url} (${e.message})` };
@@ -424,10 +575,19 @@
           return { success: true, data: dropData };
         }
         case "paste_rich": {
+          const known = ["selector", "html", "mode", "frame", "waitFor"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown paste_rich parameter(s): ${unknown.join(", ")} (expected selector, html, mode, waitFor)` };
+          }
           const selector = params.selector;
           const html = params.html;
-          if (!selector) return { success: false, error: 'Need "selector" parameter' };
-          if (html == null) return { success: false, error: 'Need "html" parameter' };
+          const mode = params.mode || "replace";
+          if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
+          if (typeof html !== "string" || !html) return { success: false, error: 'Need "html" parameter (a string)' };
+          if (mode !== "replace" && mode !== "append" && mode !== "insert") {
+            return { success: false, error: `Invalid mode: ${mode} (expected replace|append|insert)` };
+          }
           const el = findElement(selector);
           if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           if (!el.isContentEditable) {
@@ -437,10 +597,25 @@
           const sel = window.getSelection();
           if (sel) {
             const range = document.createRange();
-            range.selectNodeContents(el);
-            sel.removeAllRanges();
-            sel.addRange(range);
-            document.execCommand("delete", false);
+            if (mode === "replace") {
+              range.selectNodeContents(el);
+              sel.removeAllRanges();
+              sel.addRange(range);
+              document.execCommand("delete", false);
+            } else if (mode === "append") {
+              range.selectNodeContents(el);
+              range.collapse(false);
+              sel.removeAllRanges();
+              sel.addRange(range);
+            } else {
+              const anchor = sel.anchorNode;
+              if (!(anchor instanceof Node) || !el.contains(anchor)) {
+                range.selectNodeContents(el);
+                range.collapse(false);
+                sel.removeAllRanges();
+                sel.addRange(range);
+              }
+            }
           }
           document.execCommand("insertHTML", false, html);
           el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -448,6 +623,7 @@
           const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
           const pasteData = {
             selector,
+            mode,
             tag: el.tagName.toLowerCase(),
             inserted: true,
             settledMs: stable.waited
@@ -458,9 +634,9 @@
         case "trigger": {
           const selector = params.selector;
           const event = params.event;
-          if (!selector) return { success: false, error: 'Need "selector" parameter' };
-          if (!event) {
-            return { success: false, error: 'Need "event" parameter (e.g. "change", "blur", "focus", "input", "select", or a custom event name)' };
+          if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
+          if (typeof event !== "string" || !event) {
+            return { success: false, error: 'Need "event" parameter (a string, e.g. "change", "blur", "focus", "input", "select", or a custom event name)' };
           }
           const known = ["selector", "event", "value", "options", "frame", "waitFor"];
           const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
@@ -522,14 +698,27 @@
           return { success: true, data: triggerData };
         }
         case "get_text": {
+          const known = ["selector", "frame"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown get_text parameter(s): ${unknown.join(", ")} (expected selector)` };
+          }
           const selector = params.selector;
+          if (selector !== void 0 && typeof selector !== "string") {
+            return { success: false, error: `"selector" must be a string (got ${JSON.stringify(selector)})` };
+          }
           const el = selector ? findElement(selector) : document.body;
           if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
-          return { success: true, data: el.textContent?.trim() };
+          return { success: true, data: el.textContent ?? "" };
         }
         case "get_css": {
+          const known = ["selector", "frame"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown get_css parameter(s): ${unknown.join(", ")} (expected selector)` };
+          }
           const selector = params.selector;
-          if (!selector) return { success: false, error: "selector is required" };
+          if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
           const isCss = selector.startsWith("css:");
           const query = isCss ? selector.slice(4) : selector;
           const nodes = isCss ? findAllPierced(query) : [findElement(selector)].filter(Boolean);
@@ -570,8 +759,26 @@
           if (unknown.length) {
             return { success: false, error: `Unknown list_elements parameter(s): ${unknown.join(", ")} (expected frame, filter, text, max, visible)` };
           }
-          const filters = typeof params.filter === "string" ? params.filter.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
-          const textFilter = typeof params.text === "string" ? params.text.trim() : "";
+          if (params.filter !== void 0 && typeof params.filter !== "string") {
+            return { success: false, error: '"filter" must be a comma-separated string (button|link|input|select|textarea|label|editable|upload)' };
+          }
+          if (params.text !== void 0 && typeof params.text !== "string") {
+            return { success: false, error: '"text" must be a string (substring match on element text)' };
+          }
+          if (params.visible !== void 0 && typeof params.visible !== "boolean") {
+            return { success: false, error: '"visible" must be true (visible only) or false (hidden only)' };
+          }
+          if (params.max !== void 0 && (typeof params.max !== "number" || !Number.isFinite(params.max))) {
+            return { success: false, error: '"max" must be a number (1-200)' };
+          }
+          const VALID_FILTERS = /* @__PURE__ */ new Set(["button", "link", "input", "select", "textarea", "label", "editable", "upload"]);
+          const filters = params.filter ? params.filter.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
+          for (const f of filters) {
+            if (!VALID_FILTERS.has(f)) {
+              return { success: false, error: `Unknown list_elements filter: "${f}" (expected button|link|input|select|textarea|label|editable|upload)` };
+            }
+          }
+          const textFilter = typeof params.text === "string" ? params.text : "";
           let max = typeof params.max === "number" && Number.isFinite(params.max) ? Math.max(1, Math.floor(params.max)) : 50;
           max = Math.min(max, 200);
           const visibleOnly = params.visible === true;
@@ -597,7 +804,7 @@
             const tag = el.tagName.toLowerCase();
             const role = el.getAttribute("role")?.toLowerCase() ?? void 0;
             const type = el instanceof HTMLInputElement ? el.type : void 0;
-            const text = (html.innerText ?? "").trim().replace(/\s+/g, " ").slice(0, 80);
+            const text = (html.innerText ?? "").trim().replace(/\s+/g, " ");
             const visible = isVisible(html);
             if (visibleOnly && !visible) continue;
             if (hiddenOnly && visible) continue;
@@ -659,7 +866,8 @@
           };
         }
         case "get_js_errors": {
-          return { success: true, data: { errors: [...jsErrors], count: jsErrors.length } };
+          const all = [...jsErrors];
+          return { success: true, data: { errors: all, count: all.length } };
         }
         case "clear_js_errors": {
           jsErrors.length = 0;
@@ -706,6 +914,17 @@
           if (unknown.length) {
             return { success: false, error: `Unknown scroll parameter(s): ${unknown.join(", ")} (expected x, y, selector, block)` };
           }
+          for (const c of ["x", "y"]) {
+            const v = params[c];
+            if (v !== void 0 && typeof v !== "number") {
+              return { success: false, error: `"${c}" must be a number (got ${JSON.stringify(v)})` };
+            }
+          }
+          if (params.block !== void 0) {
+            if (typeof params.block !== "string" || !["start", "center", "end", "nearest"].includes(params.block)) {
+              return { success: false, error: `Invalid block: ${JSON.stringify(params.block)} (expected start|center|end|nearest)` };
+            }
+          }
           const x = params.x ?? 0;
           const y = params.y ?? 0;
           const selector = params.selector;
@@ -744,7 +963,8 @@
           return { success: false, error: `Unknown command: ${command}` };
       }
     } catch (err) {
-      return { success: false, error: String(err) };
+      const detail = err instanceof Error ? err.message : String(err);
+      return { success: false, error: `Unexpected error while running "${command}": ${detail} (please report this to cda)` };
     }
   }
   function throttleSafeTimer(ms) {
@@ -857,14 +1077,25 @@
     });
   }
   async function waitForCondition(waitFor, timeoutMs) {
+    const extra = Object.keys(waitFor).filter((k) => k !== "selector" && k !== "text");
+    if (extra.length > 0) throw new Error(`Invalid waitFor key(s): ${extra.join(", ")} (expected "selector" or "text")`);
+    if (waitFor.selector === void 0 && waitFor.text === void 0) {
+      throw new Error('waitFor: provide "selector" or "text"');
+    }
+    if (waitFor.selector !== void 0 && waitFor.text !== void 0) {
+      throw new Error('waitFor: provide "selector" or "text", not both');
+    }
+    if (waitFor.selector !== void 0 && typeof waitFor.selector !== "string") {
+      throw new Error("waitFor.selector must be a string");
+    }
+    if (waitFor.text !== void 0 && typeof waitFor.text !== "string") {
+      throw new Error("waitFor.text must be a string");
+    }
     const start = Date.now();
     const check = () => {
       if (waitFor.text) return !!findByText(waitFor.text);
-      if (waitFor.selector) {
-        const el = findElement(waitFor.selector);
-        return !!el && isVisible(el);
-      }
-      return false;
+      const el = findElement(waitFor.selector);
+      return !!el && isVisible(el);
     };
     if (check()) return { settled: true, waited: 0 };
     while (Date.now() - start < timeoutMs) {
@@ -906,6 +1137,36 @@
       const h = evalTextXPath(shadowXpath, sr);
       if (h) return h;
     }
+    return null;
+  }
+  function nonJsonableReason(val, seen = /* @__PURE__ */ new Set()) {
+    if (typeof val === "function") return "is a function \u2014 JSON cannot carry it";
+    if (val === null || typeof val !== "object") return null;
+    if (seen.has(val)) return "contains a circular reference \u2014 JSON cannot carry it";
+    seen.add(val);
+    if (Array.isArray(val)) {
+      for (const item of val) {
+        if (item === void 0) return "contains an undefined element \u2014 JSON cannot carry it";
+        const reason = nonJsonableReason(item, seen);
+        if (reason) return reason;
+      }
+      seen.delete(val);
+      return null;
+    }
+    const proto = Object.getPrototypeOf(val);
+    if (proto !== Object.prototype && proto !== null) {
+      return `holds a ${val.constructor?.name || "non-plain"} object \u2014 only plain data can be returned; read a string/number property like "innerHTML" or "value" instead`;
+    }
+    if (Object.getOwnPropertyNames(val).length !== Object.keys(val).length) {
+      return `holds a ${val.constructor?.name || "non-plain"} object \u2014 only plain data can be returned; read a string/number property like "innerHTML" or "value" instead`;
+    }
+    for (const key of Object.keys(val)) {
+      const item = val[key];
+      if (item === void 0) return `contains an undefined value under "${key}" \u2014 JSON cannot carry it`;
+      const reason = nonJsonableReason(item, seen);
+      if (reason) return reason;
+    }
+    seen.delete(val);
     return null;
   }
   function isVisible(el) {
@@ -1229,7 +1490,7 @@
     }
     let out = "";
     for (let i = 0; i < segs.length; i++) {
-      if (i > 0) out += segs[i - 1].cross ? " >>> " : " > ";
+      if (i > 0) out += segs[i].cross ? " >>> " : " > ";
       out += segs[i].seg;
     }
     return out || el.tagName.toLowerCase();

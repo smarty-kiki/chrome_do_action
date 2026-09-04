@@ -26,7 +26,7 @@
 For these situations, writing a Playwright / Selenium script often feels like overkill — here it's just **one command**:
 
 - Drive a browser on someone else's / a remote machine — open pages, fill forms, click buttons, grab screenshots
-- Post to WeChat Official Account backends and other admin sites where **synthetic clicks don't work**, where you need to **paste styled rich text** or **upload cover images** without a native file dialog
+- Admin backends where **synthetic clicks don't work** — where you need to **paste styled rich text** or **upload cover images** without a native file dialog
 - Scrape page content, lazy-loaded lists, and **listen for JavaScript errors** in the page
 - Get operation results back as **structured JSON** — ready to feed into scripts or an LLM agent
 
@@ -48,14 +48,16 @@ your command → server → Chrome extension → execute in the page → structu
 | Capability | What it does |
 |---|---|
 | 🖱️ Page actions | Open / refresh / close tabs, click, type, scroll, screenshot — most interactions a browser can do |
-| 🔥 Real clicks (`real_click`) | Sends a complete, genuine mouse event chain, breaking through sites that ignore synthetic events (e.g. WeChat MP backend); supports multi-level hover paths |
-| 📝 Rich text | `type` writes plain text into `contenteditable`; `paste_rich` pastes styled HTML, preserving font size / color / bold / layout |
+| 🔥 Real clicks (`real_click`) | Sends a complete, genuine mouse event chain, breaking through sites that ignore synthetic events (a synthetic click that looks successful but never fires); supports multi-level hover paths |
+| 📝 Rich text | `type` writes plain text verbatim (no auto paragraphing); `paste_rich` pastes styled HTML — font size / color / bold / layout live in the markup, handed to the page as-is |
 | 🖼️ File uploads | `upload_file` injects a base64 image into a file input and triggers upload, bypassing the native file dialog |
-| 🎯 Drag-drop uploads (`upload_dragdrop`) | Drags a file into an upload area that has no file input and only accepts drops (e.g. AntD Dragger), dispatching dragenter/dragover/drop |
+| 🎯 Drag-drop uploads (`upload_dragdrop`) | Drags a file into an upload area that has no file input and only accepts drops, dispatching dragenter/dragover/drop |
 | 📸 Page screenshots | Pixel-accurate "what you see" screenshot, saved to a local PNG — spot overlays, floating layers, scroll position |
 | 🐛 JS error collection | Keeps collecting `error` + `unhandledrejection` from page load; query or clear anytime |
 | ⚡ Selective fields (`--field`) | Every command returning an object supports dot-path projection (`--field "clickDesc.selector,settledMs,currentTab.url"`) — only requested fields are collected and returned; faster commands, leaner output |
 | ⏳ Impact-aware returns | Action commands wait for their impact to land before returning (event-driven via DOM mutations/long tasks, no fixed sleep; `settledMs` reports the wait). For late-arriving effects, pass a `waitFor` predicate (50ms polling, returns the moment the condition holds — reliable even on background tabs) |
+| 🗺️ Element map (`list_elements`) | One command lists every interactive element on the page — generated selectors ready to reuse, visibility, coordinates, `accept` and more; run it first when you can't find an element |
+| 🔍 Read-only property (`get_prop`) | Read an element property's exact raw value (`value` / `checked` / `innerHTML` / …); read-only, never executes — verify a type really landed, check a checkbox state, compare raw content |
 | 🔎 State-aware | Detects page navigations, newly opened tabs, and iframe changes, so a command returns the world *after* the action, not a bare event |
 | 🌘 Shadow DOM support | Every element command transparently pierces open shadow roots (DevTools `#shadow-root` paths / `>>>` / bare-selector fallback); `get_page_info` html includes shadow content by default |
 | 🔁 High availability | Auto-reconnect, per-tab serial command queue, automatic content-script re-injection |
@@ -150,7 +152,7 @@ cda send OfficePC open https://example.com
 
 Two documents in the repo complement this README:
 
-- **`SKILL.md`** — a **Skill definition** for AI assistants (Claude Code / WorkBuddy, …). Once wired into an AI tool, the AI can drive your local Chrome through `cda` directly — reusing your logged-in session to open pages, fill forms, lay out WeChat MP articles, upload covers, and confirm with screenshots. Setup and the self-check flow live in the "安装 / Install" section inside.
+- **`SKILL.md`** — a **Skill definition** for AI assistants (Claude Code / WorkBuddy, …). Once wired into an AI tool, the AI can drive your local Chrome through `cda` directly — reusing your logged-in session to open pages, fill forms, edit & publish web content, upload files, and confirm with screenshots. Setup and the self-check flow live in the "安装 / Install" section inside.
 - **`cli/help.md`** — the **complete CLI reference**: parameter formats, return structures, `--field` paths, plus the **design rationale** behind `show`/`hide`, `real_click` and other commands.
 
 > ⚠️ **Planning to install this project as a skill for your agent? Read both files thoroughly first.** `SKILL.md` defines the skill's trigger scenarios and standard flow (server self-check, node ID lookup, command syntax); `cli/help.md` captures hard-won field experience (confirm coordinates with a screenshot, use `show` for hover menus, the edge cases of rich text and uploads, …). Jumping in with only the README, an agent is likely to trip on the same pitfalls. For everyday manual use, the command reference below covers it.
@@ -179,11 +181,11 @@ cda send OfficePC click current '{"text":"Login"}' --field "currentTab.url,navig
 # after a successful login: navigated: true + the post-redirect page info
 ```
 
-### Rich text + cover upload on WeChat MP
+### Rich text layout + image upload
 
 ```bash
-# Paste styled markup into a ProseMirror editor
-cda send OfficePC paste_rich current '{"selector":".ProseMirror","html":"<section style=\"text-align:center\"><span style=\"font-weight:bold\">Heading</span></section>"}'
+# Paste styled markup into a rich-text editor
+cda send OfficePC paste_rich current '{"selector":".rich-editor","html":"<section style=\"text-align:center\"><span style=\"font-weight:bold\">Heading</span></section>"}'
 
 # Inject a local image (converted to base64) into a file input and trigger upload
 B64=$(base64 -i cover.jpg | tr -d '\n')
@@ -193,12 +195,12 @@ cda send OfficePC upload_file current "{\"selector\":\"input[type=file]\",\"base
 ### Real click on sites that ignore synthetic events
 
 ```bash
-# WeChat MP backend: genuine click
+# A backend that ignores synthetic events: genuine click
 cda send OfficePC real_click current '{"selector":"#submit"}'
 
-# Multi-level hover: sweep through the cover preview and the "change" icon
-# (firing the hover chain), then click a menu item
-cda send OfficePC real_click current '{"selector":".js_imagedialog","approach":[[720,224],[767,201],[811,200],[830,240]]}'
+# Multi-level hover: sweep through the trigger point first (open the hover
+# menu), then click the menu item
+cda send OfficePC real_click current '{"selector":".toolbar-menu","approach":[[720,224],[767,201],[811,200],[830,240]]}'
 ```
 
 ### Screenshot to confirm page state
@@ -239,15 +241,17 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 |---|---|---|
 | `click` | `send <id> click <tab> <params>` | Click an element (selector / text / coordinates) |
 | `real_click` | `send <id> real_click <tab> <params>` | Genuine real click (works on sites that ignore synthetic events); supports an `approach` hover path |
-| `type` | `send <id> type <tab> <params>` | Type text; supports input/textarea and `contenteditable` rich text |
+| `type` | `send <id> type <tab> <params>` | Type text; supports input/textarea and rich-text editing areas |
 | `keyboard` | `send <id> keyboard <tab> <params>` | Send a key press to an element (`{selector,key}`; selector optional, defaults to the focused element); optional `ctrl`/`shift`/`alt`/`meta` modifiers |
 | `trigger` | `send <id> trigger <tab> <params>` | Dispatch an event on an element (`{selector,event}`): `blur` for form validation, `change`+`value` to pick a `<select>` option (React controlled components included), custom events; `focus`/`blur` move real focus (form validation works); settle + waitFor semantics |
 | `upload_file` | `send <id> upload_file <tab> <params>` | Inject a base64 image into a file input and trigger upload |
-| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | Drag a file into an upload area with no file input that only accepts drops (e.g. AntD Dragger): `{selector,data}` where data is `{base64,filename,mime}` or `{url}` |
+| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | Drag a file into an upload area with no file input that only accepts drops: `{selector,data}` where data is `{base64,filename,mime}` or `{url}` |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | Paste styled HTML into a rich-text editor |
 | `get_text` | `send <id> get_text <tab> [selector]` | Get an element's / the page's text |
 | `get_css` | `send <id> get_css <tab> <selector>` | Get computed styles of all matching elements |
+| `get_prop` | `send <id> get_prop <tab> <params>` | Read an element property's exact raw value (`{selector\|text, prop}`); read-only, never calls methods; scalars returned as-is; non-JSON-safe object values error loudly instead of silently turning empty |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | Get page info (url / title / iframes) |
+| `list_elements` | `send <id> list_elements <tab> <params>` | Page element map: list interactive elements (generated selector / visibility / coordinates / accept) with filter/text/max/visible; pierces shadow DOM, aggregates all frames by default — run it first when you can't find an element |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | Get accumulated JS errors |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | Clear accumulated JS errors |
 | `screenshot` | `send <id> screenshot <tab> <params>` | Page screenshot; `{"path":"/tmp/s.png"}` saves locally |
@@ -270,14 +274,15 @@ All element commands automatically pierce **open shadow roots**: if a bare selec
 ### Params for the other commands
 
 ```json
-// type — rich text is split into paragraphs on newlines
-{"selector": ".ProseMirror", "text": "Paragraph one\n\nParagraph two"}
+// type — text is inserted verbatim, never split on newlines
+// (for paragraph structure send one paragraph per call, appending with mode:"append")
+{"selector": ".rich-editor", "text": "Paragraph one"}
 
 // upload_file — inject base64 into a file input
 {"selector": "input[type=file]", "base64": "<base64>", "filename": "a.jpg", "mime": "image/jpeg"}
 
-// paste_rich — paste styled HTML (clears existing content first)
-{"selector": ".ProseMirror", "html": "<section><span>hi</span></section>"}
+// paste_rich — paste styled HTML (mode like type: default replace clears the editor first)
+{"selector": ".rich-editor", "html": "<section><span>hi</span></section>"}
 
 // scroll — vertical / horizontal
 {"y": 500}                       // or {"x": 300, "y": 500}
@@ -289,7 +294,7 @@ All element commands automatically pierce **open shadow roots**: if a bare selec
 
 ### 1. `real_click` — for sites that ignore synthetic events
 
-Many admin backends (e.g. the Vue components behind WeChat MP) ignore synthesized clicks. `real_click` sends a **complete, genuine mouse event chain**:
+Many admin backends ignore synthesized clicks (the click looks successful but never fires). `real_click` sends a **complete, genuine mouse event chain**:
 
 - Mouse movement is **incremental** rather than teleported, so it genuinely fires the hover chain along the path
 - After the click the mouse **stays on the target**, keeping hover state for the next action
@@ -298,10 +303,10 @@ Many admin backends (e.g. the Vue components behind WeChat MP) ignore synthesize
 
 ### 2. Rich text & file uploads — bypassing the two hardest interactions
 
-- **`type`**: regular inputs get their value set plus `input`/`change` events; `contenteditable` (ProseMirror, UEditor, …) is focused and paragraphs are inserted one per newline, preserving structure
-- **`paste_rich`**: pastes HTML with inline styles into a rich-text editor, preserving font size / color / bold / spacing — equivalent to "select all, delete, paste a formatted document"
-- **`upload_file`**: injects a base64 image into `input[type=file]` and fires `change`, so the page uploads it — no native file dialog needed (works even without accessibility permission, e.g. posting WeChat MP covers)
-- **`upload_dragdrop`**: when there is no file input — only a drag-drop zone (AntD `Upload.Dragger` etc.) — dispatches dragenter/dragover/drop carrying the file at the target area, and the page's drop handler uploads it; complements `upload_file`
+- **`type`**: regular inputs get their value written plus `input`/`change` events; rich-text editing areas get the text inserted **verbatim in one piece — no trimming, no newline splitting, no rewriting**; how it ends up formatted is the editor's own behaviour — cda adapts to no editor (send one paragraph per call for exact structure, appending with `mode:"append"`)
+- **`paste_rich`**: pastes HTML with inline styles into a rich-text editor, preserving font size / color / bold / spacing; `mode` matches `type` (default `replace` is equivalent to "select all, delete, paste a formatted document"; `append`/`insert` available). HTML goes through the browser's native paste pipeline — no editor sniffing or adaptation
+- **`upload_file`**: injects a base64 image into `input[type=file]` and fires `change`, so the page uploads it — no native file dialog needed (works even without accessibility permission, e.g. uploading article covers)
+- **`upload_dragdrop`**: when there is no file input — only a drag-drop zone — dispatches dragenter/dragover/drop carrying the file at the target area, and the page's drop handler uploads it; complements `upload_file`
 
 ### 3. `--field` selective collection
 
@@ -314,7 +319,7 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-Supported by **every command returning an object**: `click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_page_info`/`get_js_errors`/`real_click`/`open`. Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and has nothing to filter.
+Supported by **every command returning an object**: `click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_prop`/`get_page_info`/`list_elements`/`get_js_errors`/`real_click`/`open` (for `get_prop`, when the value is a plain object). Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and `get_prop` scalar values pass through as-is — neither has fields to filter.
 
 ### 4. State awareness — commands return the world after the action
 
@@ -360,14 +365,14 @@ Cross-origin iframes expose only `src` and `sameOrigin: false`; same-origin ones
 ```json
 {
   "navigated": false,
-  "clickDesc": { "text": "Login", "tag": "button" },
+  "clickDesc": { "text": "Login", "tag": "button", "visible": true },
   "currentTab": { "url": "...", "title": "...", "iframes": [...] },
   "iframeChanges": [],
   "newTabs": []
 }
 ```
 
-- `clickDesc`: what was clicked (`text`/`selector`/`x,y` + `tag`)
+- `clickDesc`: what was clicked (`text`/`selector`/`x,y` + `tag`). For `selector`/`text` targets it carries a **clickability report**: `visible: true|false` (is the element actually visible and clickable); when it is covered it adds `coveredBy: {tag, class, text}` (an overlay/dialog sits on the target point), or `offscreen: true` when the target point is outside the viewport. `visible: false` / `coveredBy` / `offscreen` mean **this synthetic click most likely never reached the page** (the command still succeeds) — screenshot first to see the real state: dismiss the overlay / `show` the element / `waitFor` the condition, or fall back to a coordinate `real_click`
 - `navigated`: whether the page navigated; when `true`, the new page info is returned (including the post-redirect `currentTab`)
 - `newTabs`: tabs opened via `target="_blank"` (with tabId, url, title, iframes)
 - `iframeChanges`: `[{index, srcChanged, beforeSrc, afterSrc}]`, present only when a change was detected
@@ -378,6 +383,8 @@ Cross-origin iframes expose only `src` and `sameOrigin: false`; same-origin ones
 |---|---|
 | `get_text` | a string, e.g. `"Login"` |
 | `get_css` | `{ selector, count, results: [{index, css: {display, …}}] }` |
+| `get_prop` | the exact property value (string/number/boolean as-is; plain objects returned with the matched frame; values that can't survive JSON error loudly) |
+| `list_elements` | `{ count, truncated, elements: [{tag, text, visible, x, y, w, h, selector, …}] }` |
 | `type` / `clear_js_errors` | `{ success: true }` |
 | `upload_file` / `upload_dragdrop` | `{ success: true, data: { filename, size, mime } }` |
 | `scroll` | `{ success: true, data: { scrollX, scrollY } }` |
