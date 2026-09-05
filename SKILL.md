@@ -96,6 +96,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取页面 JS 报错（跨所有 frame 聚合，每条带 `source` 定位来源 frame） |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空已收集的 JS 报错，配合 get_js_errors 重新计数 |
 | `scroll` | `send <id> scroll <tab> '{"y":500}'` | 滚动页面：无 selector 滚窗口/iframe（`frame` 参数指定）；`{"selector":"..."}` 滚到元素（可滚动容器内滚、普通元素 scrollIntoView，穿透 shadow） |
+| `exec` | `send <id> exec <tab> '{"code":"document.title"}'` | ⚠ **仅排查问题使用（高风险，勿当常规手段）**：在页面主世界执行任意 JS 并返回结果，能读页面自身 JS 全局变量。需要先在插件配置页勾选「允许 exec 命令（仅排查问题）」（默认关闭），未启用即被拒绝报错。常规操作一律用上面具体命令（click/get_prop/list_elements 等），不要用 exec 注入任意代码替代 |
 
 ### 关键技巧
 
@@ -151,3 +152,4 @@ $CLI send $NODE click $TAB '{"text":"保存"}'
 - 扩展重载后节点 ID 变化、旧页面需刷新才注入新脚本
 - 服务默认 `ws://127.0.0.1:12345`，本地无需 `--server` 参数
 - Chrome 顶部"正在调试此浏览器"横幅为 debugger 能力提示，瞬间消失
+- **不要用 `exec` 跑任意 JS 当通用手段**：常规流程用具体命令（click/type/get_prop/list_elements/screenshot 等）足够；只有排查页面问题时才考虑 `exec`，且必须先确认插件配置已勾选「允许 exec 命令」——它在页面主世界执行任意代码，能读取/修改页面一切数据，仅排查问题临时开启，用完关闭

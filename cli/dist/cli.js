@@ -106,6 +106,25 @@ Page commands (tab required):
                               you cannot find an element - get a map first.
   get_js_errors <tab>         Get accumulated JS errors (aggregated across frames)
   clear_js_errors <tab>       Clear accumulated JS errors
+
+Troubleshooting only (enabled per session):
+  exec <tab> <params>         Execute arbitrary JavaScript in the page's MAIN
+                              world and return the result — for inspecting real
+                              page state (page JS globals etc.) when no
+                              built-in command fits. HIGH RISK: requires the
+                              plugin option "允许 exec 命令（仅排查问题）" to be
+                              ENABLED first (extension options page), else an
+                              explicit rejection error is returned. Params:
+                              {code} string, evaluated like the DevTools
+                              console — global scope, returns the last
+                              expression's completion value; Promise results
+                              are awaited; only JSON-serializable values
+                              return (cyclic/BigInt data must be stringified
+                              by your code first). {frame} targets an iframe
+                              (same values as the frame param below; default
+                              top frame). Turn the option back off after
+                              troubleshooting.
+
   screenshot <tab> <params>   Capture a page screenshot
                               ({path: "/tmp/shot.png"} saves PNG locally)
   scroll <tab> <params>       Scroll window/iframe ({y} or {x,y}; {frame} picks iframe),
@@ -154,7 +173,9 @@ Examples:
   cda send abc get_css current "h1.title"
   cda send abc get_prop current '{"selector":"#title","prop":"innerHTML"}'
   cda send abc list_elements current '{"filter":"upload","visible":true}'
-  cda send abc list_elements current '{"text":"发布","max":10}'`;
+  cda send abc list_elements current '{"text":"发布","max":10}'
+  cda send abc exec current '{"code":"document.title"}'
+  cda send abc exec current '{"code":"window.__INITIAL_STATE__.user"}'  # needs the plugin's allow-exec option enabled (troubleshooting only)`;
 function parseArgs(argv) {
     const raw = {};
     const positional = [];
@@ -203,6 +224,7 @@ function buildMessage(action, args) {
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
             console.error("Page commands (tab required): click | real_click | type | keyboard | trigger | upload_file | upload_dragdrop | paste_rich | show | hide | get_text | get_css | get_prop | get_page_info | list_elements | get_js_errors | clear_js_errors | screenshot | scroll");
+            console.error("Troubleshooting only (needs plugin option enabled): exec");
             console.error("");
             console.error("Example: cda send abc123 get_page_info current");
             process.exit(1);

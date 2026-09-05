@@ -443,6 +443,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空 JS 错误 |
 | `screenshot` | `send <id> screenshot <tab> <params>` | 截图当前页面（只读，不注入代码）；`{"path":"/tmp/shot.png"}` 保存到本地 |
 | `scroll` | `send <id> scroll <tab> <params>` | 滚动页面 |
+| `exec` | `send <id> exec <tab> <params>` | ⚠ **仅排查问题**：在页面主世界执行任意 JS 并返回结果（{code}）。高风险，默认关闭——必须先到插件配置页勾选「允许 exec 命令（仅排查问题）」，见下方「排查问题：exec」 |
 
 ### click 定位方式
 
@@ -653,6 +654,41 @@ send <id> hide <tabId>       // 无参数：还原全部被 show 的元素
 - 只读能力（等同 DevTools 截图），不注入代码、不修改页面
 - 用于确认页面真实视觉状态（元素遮挡、浮层、滚动位置），避免仅凭 DOM 快照盲猜坐标
 - 适用：操作前确认页面状态、排查点击无响应（如浮层遮罩挡住目标元素）
+
+### 排查问题：exec（高风险，仅排查问题使用）
+
+> ⚠ **exec 只在排查问题时临时使用**。它把一段**任意 JavaScript 注入页面主世界执行**——可以读取、修改页面乃至浏览器内的一切数据。日常流程不要用 exec：需要做什么动作请用上面的具体命令（click/type/get_prop 等）。排查完毕后请关闭开关。
+
+用法（与页面命令同形，tab 必填）：
+
+```bash
+cda send OfficePC exec current '{"code":"document.title"}'
+cda send OfficePC exec current '{"code":"window.__INITIAL_STATE__.article"}'
+cda send OfficePC exec current '{"code":"document.querySelector(\"#price\").textContent.trim()"}'
+```
+
+**先决条件——插件配置开关**：exec 默认关闭。第一次使用前必须到插件配置页（点击扩展图标 →「打开配置页」）勾选**「允许 exec 命令（仅排查问题）」**并保存。未启用时命令被浏览器端直接拒绝，返回明确报错（含启用路径），代码不会执行。开关每次执行都实时生效：勾选后立即可用，取消勾选后立即回到拒绝态——**无需重启浏览器，排查完请务必取消勾选**。
+
+执行位置与语义：
+
+- **主世界（MAIN world）**：与 DevTools console 同权限，**能读到页面自身的 JS 全局变量与内部状态**（`window.__INITIAL_STATE__`、Vue/React 内部对象等）——这正是普通元素命令（隔离世界）读不到、需要 exec 的原因
+- **代码语义 = console 求值**：整体间接求值，在全局作用域运行，返回**最后一个语句/表达式的完成值**；末尾是 `return` 的函数表达式等都能求值。`var` 声明会进全局，但 `let`/`const` 不暴露给后续调用——需要共享状态请挂到 `window` 上
+- **Promise 自动 await**：完成值是 Promise 时命令等它落定再返回结果（reject 则报错）
+- **结果必须 JSON 可序列化**：对象/数组/标量正常返回；循环引用、`BigInt`、`undefined`（转 `null`）等会明确报错——要拿这类内容先在自己代码里转成字符串（如 `JSON.stringify(...)`）
+- **运行时/语法错误如实上报**：返回错误（含 message 与堆栈首行），不会伪装成成功
+- **注入受限页面**（`chrome://`、Chrome 商店页等）无法注入，返回可读报错
+
+参数：
+
+```json
+{"code": "document.title"}                       // 必填：要执行的 JS 代码字符串
+{"code": "1+1", "frame": 0}                      // frame 语义同 scroll：数字序号定向顶层 iframe
+{"code": "1+1", "frame": {"url": "editor"}}      // 按 URL 子串定向 iframe（跨域最稳）
+```
+
+- `frame` 缺省 = 顶层 frame；`"top"` 明确顶层；数字按顶层 iframe 序号（依赖 content script 的 iframe 列表，未注入时不可用，此时用 `{"url":...}`）；`{"url":"子串"}` 匹配 URL 含子串的首个 frame
+- 返回的普通对象/数组支持 `--field` 裁剪；结果在浏览器端组装后经 server 回传，受 server 60s 超时上限约束（单条 exec 跑超过 60s 会超时报错）
+- 未启用开关时错误示例：`Error: exec 命令仅用于排查问题，未在插件配置中启用：请在插件配置页…勾选「允许 exec 命令（仅排查问题）」后再试`
 
 ## 注意事项
 

@@ -5,31 +5,45 @@
   var nodeNameInput = el("nodeName");
   var serverUrlInput = el("serverUrl");
   var toggle = el("autoConnectToggle");
+  var allowExecToggle = el("allowExecToggle");
+  var execWarn = el("execWarn");
   var btnConnect = el("btnConnect");
   var btnDisconnect = el("btnDisconnect");
   var retryBox = el("retryBox");
   var retryLine = el("retryLine");
   var autoConnect = true;
+  var allowExec = false;
   var countdownTimer = null;
   async function init() {
-    const result = await chrome.storage.local.get(["nodeName", "serverUrl", "autoConnect"]);
+    const result = await chrome.storage.local.get(["nodeName", "serverUrl", "autoConnect", "allowExec"]);
     nodeNameInput.value = result.nodeName || "";
     serverUrlInput.value = result.serverUrl || "";
     autoConnect = result.autoConnect ?? true;
     updateToggleUI();
+    allowExec = result.allowExec ?? false;
+    updateExecUI();
   }
   function updateToggleUI() {
     toggle.className = "toggle" + (autoConnect ? " on" : "");
+  }
+  function updateExecUI() {
+    allowExecToggle.className = "toggle danger" + (allowExec ? " on" : "");
+    execWarn.className = "exec-warn" + (allowExec ? " on" : "");
   }
   toggle.addEventListener("click", () => {
     autoConnect = !autoConnect;
     updateToggleUI();
   });
+  allowExecToggle.addEventListener("click", () => {
+    allowExec = !allowExec;
+    updateExecUI();
+  });
   el("btnSave").addEventListener("click", async () => {
     await chrome.storage.local.set({
       nodeName: nodeNameInput.value.trim(),
       serverUrl: serverUrlInput.value.trim(),
-      autoConnect
+      autoConnect,
+      allowExec
     });
   });
   btnConnect.addEventListener("click", async () => {

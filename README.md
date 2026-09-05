@@ -263,6 +263,7 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空累积的 JS 错误 |
 | `screenshot` | `send <id> screenshot <tab> <params>` | 截图，`{"path":"/tmp/s.png"}` 本地保存 |
 | `scroll` | `send <id> scroll <tab> <params>` | 滚动：窗口/iframe（`frame` 参数）或 `{"selector":...}` 滚到元素（可滚动容器内滚 / scrollIntoView，穿透 shadow）；smooth，等 DOM 稳定后返回 |
+| `exec` | `send <id> exec <tab> <params>` | ⚠ **仅排查问题，高风险**：页面主世界执行任意 JS（`{"code":"document.title"}`），能读页面自身 JS 全局变量；console 语义（返回末语句值）、Promise 自动 await、只回 JSON 可序列化值。默认关闭——必须先到插件配置页勾选「允许 exec 命令（仅排查问题）」，未启用即明确报错。排查完请关闭开关，细节见 `cli/help.md` |
 
 ### click / real_click 定位方式
 

@@ -5,28 +5,40 @@ const el = (id: string) => document.getElementById(id)!;
 const nodeNameInput = el("nodeName") as HTMLInputElement;
 const serverUrlInput = el("serverUrl") as HTMLInputElement;
 const toggle = el("autoConnectToggle");
+const allowExecToggle = el("allowExecToggle");
+const execWarn = el("execWarn");
 const btnConnect = el("btnConnect")!;
 const btnDisconnect = el("btnDisconnect")!;
 const retryBox = el("retryBox");
 const retryLine = el("retryLine");
 
 let autoConnect = true;
+let allowExec = false;
 let countdownTimer: number | null = null;
 
 async function init() {
-  const result = (await chrome.storage.local.get(["nodeName", "serverUrl", "autoConnect"])) as {
+  const result = (await chrome.storage.local.get(["nodeName", "serverUrl", "autoConnect", "allowExec"])) as {
     nodeName?: string;
     serverUrl?: string;
     autoConnect?: boolean;
+    allowExec?: boolean;
   };
   nodeNameInput.value = result.nodeName || "";
   serverUrlInput.value = result.serverUrl || "";
   autoConnect = result.autoConnect ?? true;
   updateToggleUI();
+  allowExec = result.allowExec ?? false;
+  updateExecUI();
 }
 
 function updateToggleUI() {
   toggle.className = "toggle" + (autoConnect ? " on" : "");
+}
+
+// exec 开关：开启即红色高亮（高风险功能已启用），与警示框 on 态联动；关闭保持灰态
+function updateExecUI() {
+  allowExecToggle.className = "toggle danger" + (allowExec ? " on" : "");
+  execWarn.className = "exec-warn" + (allowExec ? " on" : "");
 }
 
 toggle.addEventListener("click", () => {
@@ -34,11 +46,17 @@ toggle.addEventListener("click", () => {
   updateToggleUI();
 });
 
+allowExecToggle.addEventListener("click", () => {
+  allowExec = !allowExec;
+  updateExecUI();
+});
+
 el("btnSave").addEventListener("click", async () => {
   await chrome.storage.local.set({
     nodeName: nodeNameInput.value.trim(),
     serverUrl: serverUrlInput.value.trim(),
     autoConnect,
+    allowExec,
   });
 });
 

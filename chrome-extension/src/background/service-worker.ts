@@ -5,6 +5,7 @@ interface StoredConfig {
   nodeName: string;
   serverUrl: string;
   autoConnect: boolean;
+  allowExec: boolean;
 }
 
 const wsClient = new WsClient({
@@ -81,12 +82,13 @@ console.error = (...args: unknown[]) => {
 };
 
 chrome.runtime.onInstalled.addListener(async () => {
-  const result = await chrome.storage.local.get(["nodeName", "serverUrl", "autoConnect"]);
+  const result = await chrome.storage.local.get(["nodeName", "serverUrl", "autoConnect", "allowExec"]);
   if (!result.nodeName && !result.serverUrl) {
     await chrome.storage.local.set({
       nodeName: "",
       serverUrl: "",
       autoConnect: true,
+      allowExec: false, // exec 高风险能力：默认关闭，仅在配置页显式勾选后可用
     });
   }
   await ensureAlarm();
@@ -105,6 +107,13 @@ wsClient.onStatusChange((status) => {
 wsClient.onMessage("command", (msg: Message) => {
   if (msg.type !== "command") return;
   const cmd = msg as CommandMessage;
+
+  // exec：CLI 远程执行任意 JS（仅排查问题，受配置页「允许 exec 命令」开关控制）。
+  // 走 SW 主世界注入，不经 content script；开关闸门在 handleExecCommand 内实时读 storage
+  if (cmd.payload.command === "exec") {
+    void handleExecCommand(cmd);
+    return;
+  }
 
   if (BROWSER_COMMANDS.has(cmd.payload.command)) {
     handleBrowserCommand(cmd);
@@ -1407,6 +1416,105 @@ chrome.tabGroups.onRemoved.addListener((group: chrome.tabGroups.TabGroup) => {
     groupWindowId = null;
   }
 });
+
+// ============================ exec 命令（v0.21.0） ============================
+// CLI 远程执行任意 JS（仅排查问题，高风险）。三步：
+//   1. 开关闸门：实时读 storage 的 allowExec（配置页「允许 exec 命令（仅排查问题）」
+//      勾选项，默认关闭）。未启用一律拒绝并说明启用路径，绝不悄悄放行。
+//   2. 帧选择：复用 resolveSearchFrames——缺省 = 顶层 frame（与 scroll 语义一致），
+//      frame:"top"/数字/{url} 定向 iframe。
+//   3. 执行：chrome.scripting.executeScript({world:"MAIN"}) 在页面主世界运行。排查问题要读
+//      的是页面自身 JS 状态（window.__INITIAL_STATE__ 等全局变量），隔离世界看不到；
+//      主世界注入不依赖 content script、不占 debugger（不与 real_click/DevTools 冲突）。
+// 代码语义 = DevTools console：整体间接求值，返回最后一个语句/表达式的完成值；
+// 完成值是 Promise 则等它落定；结果必须 JSON 可序列化（预检失败给可读报错）。
+const EXEC_DISABLED_ERROR =
+  'exec 命令仅用于排查问题，未在插件配置中启用：请在插件配置页（点扩展图标 →「打开配置页」）勾选「允许 exec 命令（仅排查问题）」后再试，排查完请及时关闭';
+
+// 注入函数必须是模块级声明（executeScript 序列化 func 时拿不到闭包）
+async function execEvalInMainWorld(code: string): Promise<{ ok: boolean; value?: unknown; error?: string }> {
+  try {
+    // 间接求值 (0, eval)：在全局作用域跑（console 语义），不受页面局部同名 eval 遮蔽
+    let value: unknown = (0, eval)(code);
+    if (value !== null && typeof value === "object" && typeof (value as { then?: unknown }).then === "function") {
+      value = await (value as Promise<unknown>); // 完成值是 Promise：等落定（reject 走 catch）
+    }
+    // JSON 预检：结果经消息通道回传，循环引用/BigInt 提前报错而非静默变空
+    JSON.stringify(value);
+    return { ok: true, value: value === undefined ? null : value };
+  } catch (err) {
+    const detail = err instanceof Error ? err : new Error(String(err));
+    const stack = detail.stack ? `\n${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
+    return { ok: false, error: `${detail.name}: ${detail.message}${stack}` };
+  }
+}
+
+async function handleExecCommand(cmd: CommandMessage): Promise<void> {
+  const params = cmd.payload.params ?? {};
+  const fieldFilter = ((params as Record<string, unknown>)._field as string[] | undefined) || [];
+
+  function sendResult(payload: { success: boolean; data?: unknown; error?: string }): void {
+    wsClient.send({
+      type: "command_result",
+      payload: { commandId: cmd.id!, ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data },
+    });
+  }
+
+  // 1. 开关闸门：每次实时读 storage——配置页勾选/取消立即生效，不缓存
+  const stored = await chrome.storage.local.get("allowExec").catch(() => ({} as { allowExec?: boolean }));
+  if (!stored.allowExec) {
+    sendResult({ success: false, error: EXEC_DISABLED_ERROR });
+    return;
+  }
+
+  // 2. code 参数校验
+  const code = params.code as string | undefined;
+  if (typeof code !== "string" || !code.trim()) {
+    sendResult({ success: false, error: 'exec needs a non-empty "code" string parameter (e.g. {"code":"document.title"})' });
+    return;
+  }
+
+  // 3. 目标 tab：缺省回退当前活跃 tab（与 real_click 一致）；"current" 由 server 转成缺省
+  let tabId = params.tabId as number | undefined;
+  if (tabId == null) {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = tabs[0]?.id;
+    if (tabId == null) {
+      sendResult({ success: false, error: "No active tab" });
+      return;
+    }
+  }
+
+  // 4. 目标 frame：缺省/auto 取深度序首个 = 顶层；frame 参数语义同 scroll（url/top 走
+  //    webNavigation，无需 content script；数字序号依赖 CS 的 iframes 列表，未注入时无匹配）
+  const frames = await resolveSearchFrames(tabId, params.frame);
+  const target = frames[0];
+  if (!target) {
+    sendResult({ success: false, error: `No matching frame for exec${params.frame !== undefined ? ` (frame: ${JSON.stringify(params.frame)})` : ""}` });
+    return;
+  }
+
+  // 5. 主世界执行
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: target.frameId === 0 ? { tabId } : { tabId, frameIds: [target.frameId] },
+      world: "MAIN",
+      func: execEvalInMainWorld,
+      args: [code],
+    });
+    const out = results?.[0]?.result as { ok?: boolean; value?: unknown; error?: string } | undefined;
+    if (out?.ok) {
+      sendResult({ success: true, data: out.value });
+    } else {
+      sendResult({ success: false, error: out?.error || "exec returned no result" });
+    }
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    // Chrome 内建页/商店页等受限页面注入必然失败——附加可读提示而非裸报错
+    const hint = /chrome:|web store|new tab|settings/i.test(detail) ? "（Chrome 内建页、扩展商店等受限页面无法注入代码）" : "";
+    sendResult({ success: false, error: `exec 注入执行失败: ${detail}${hint}` });
+  }
+}
 
 async function handleBrowserCommand(cmd: CommandMessage): Promise<void> {
   const { command, params = {} } = cmd.payload;

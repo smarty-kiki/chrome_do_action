@@ -44,6 +44,28 @@
       transition: transform 0.2s;
     }
     .toggle.on::after { transform: translateX(20px); }
+    .danger-row { margin-bottom: 8px; }
+    .danger-row .danger-label { font-size: 13px; color: #c5221f; }
+    .danger-row .danger-hint { font-size: 12px; color: #999; margin-top: 2px; }
+    .danger-row .toggle { flex-shrink: 0; margin-left: 12px; }
+    .toggle.danger.on { background: #d93025; }  /* exec 高风险开关：开启变红，与警示框联动 */
+    .exec-warn {
+      margin-bottom: 16px;
+      padding: 10px 12px;
+      background: #fef7f7;
+      border: 1px solid #f5c2c0;
+      border-radius: 6px;
+      font-size: 12px;
+      line-height: 1.7;
+      color: #c5221f;
+    }
+    .exec-warn.on {
+      background: #fbe9e7;
+      border-color: #e57373;
+      color: #b71c1c;
+      font-weight: 500;
+    }
+    .exec-warn .exec-warn-title { font-weight: 600; margin-bottom: 2px; }
     .btn {
       padding: 8px 20px;
       background: #1a73e8;
@@ -95,6 +117,18 @@
   <div class="toggle-row">
     <label>自动连接</label>
     <div class="toggle on" id="autoConnectToggle"></div>
+  </div>
+
+  <div class="danger-row" style="display: flex; align-items: center; justify-content: space-between;">
+    <div style="flex: 1;">
+      <div class="danger-label">允许 exec 命令（仅排查问题）</div>
+      <div class="danger-hint">默认关闭。exec 命令可在页面中执行任意 JavaScript，仅供排查问题时临时使用</div>
+    </div>
+    <div class="toggle danger" id="allowExecToggle"></div>
+  </div>
+  <div class="exec-warn" id="execWarn">
+    <div class="exec-warn-title">⚠ 高风险功能：仅排查问题使用</div>
+    <div>勾选后，任何能连接到此节点的 CLI（send exec）都可以向页面注入并执行<strong>任意 JavaScript</strong>——可读取、修改页面与浏览器内的一切数据。此功能只允许在排查问题时临时开启，排查完毕后请务必关闭。</div>
   </div>
 
   <button class="btn" id="btnSave">保存</button>

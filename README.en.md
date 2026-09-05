@@ -256,6 +256,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | Clear accumulated JS errors |
 | `screenshot` | `send <id> screenshot <tab> <params>` | Page screenshot; `{"path":"/tmp/s.png"}` saves locally |
 | `scroll` | `send <id> scroll <tab> <params>` | Scroll: window/iframe (via `frame`) or `{"selector":...}` to an element (scrollable container / scrollIntoView, pierces shadow DOM); smooth, returns once the DOM settles |
+| `exec` | `send <id> exec <tab> <params>` | ⚠ **Troubleshooting only, high risk**: run arbitrary JS in the page's MAIN world (`{"code":"document.title"}`) — can read the page's own JS globals; console semantics (returns the last statement's value), Promises auto-awaited, only JSON-serializable values come back. Disabled by default — you must first tick the plugin option "允许 exec 命令（仅排查问题）" on the extension options page, otherwise the command is rejected with a clear error. Turn the option back off after troubleshooting; details in `cli/help.md` |
 
 ### Locating an element for click / real_click
 

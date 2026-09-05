@@ -240,12 +240,14 @@
     origConsoleError.apply(console, args);
   };
   chrome.runtime.onInstalled.addListener(async () => {
-    const result = await chrome.storage.local.get(["nodeName", "serverUrl", "autoConnect"]);
+    const result = await chrome.storage.local.get(["nodeName", "serverUrl", "autoConnect", "allowExec"]);
     if (!result.nodeName && !result.serverUrl) {
       await chrome.storage.local.set({
         nodeName: "",
         serverUrl: "",
-        autoConnect: true
+        autoConnect: true,
+        allowExec: false
+        // exec 高风险能力：默认关闭，仅在配置页显式勾选后可用
       });
     }
     await ensureAlarm();
@@ -262,6 +264,10 @@
   wsClient.onMessage("command", (msg) => {
     if (msg.type !== "command") return;
     const cmd = msg;
+    if (cmd.payload.command === "exec") {
+      void handleExecCommand(cmd);
+      return;
+    }
     if (BROWSER_COMMANDS.has(cmd.payload.command)) {
       handleBrowserCommand(cmd);
       return;
@@ -1235,6 +1241,75 @@
       groupWindowId = null;
     }
   });
+  var EXEC_DISABLED_ERROR = "exec \u547D\u4EE4\u4EC5\u7528\u4E8E\u6392\u67E5\u95EE\u9898\uFF0C\u672A\u5728\u63D2\u4EF6\u914D\u7F6E\u4E2D\u542F\u7528\uFF1A\u8BF7\u5728\u63D2\u4EF6\u914D\u7F6E\u9875\uFF08\u70B9\u6269\u5C55\u56FE\u6807 \u2192\u300C\u6253\u5F00\u914D\u7F6E\u9875\u300D\uFF09\u52FE\u9009\u300C\u5141\u8BB8 exec \u547D\u4EE4\uFF08\u4EC5\u6392\u67E5\u95EE\u9898\uFF09\u300D\u540E\u518D\u8BD5\uFF0C\u6392\u67E5\u5B8C\u8BF7\u53CA\u65F6\u5173\u95ED";
+  async function execEvalInMainWorld(code) {
+    try {
+      let value = (0, eval)(code);
+      if (value !== null && typeof value === "object" && typeof value.then === "function") {
+        value = await value;
+      }
+      JSON.stringify(value);
+      return { ok: true, value: value === void 0 ? null : value };
+    } catch (err) {
+      const detail = err instanceof Error ? err : new Error(String(err));
+      const stack = detail.stack ? `
+${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
+      return { ok: false, error: `${detail.name}: ${detail.message}${stack}` };
+    }
+  }
+  async function handleExecCommand(cmd) {
+    const params = cmd.payload.params ?? {};
+    const fieldFilter = params._field || [];
+    function sendResult(payload) {
+      wsClient.send({
+        type: "command_result",
+        payload: { commandId: cmd.id, ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data }
+      });
+    }
+    const stored = await chrome.storage.local.get("allowExec").catch(() => ({}));
+    if (!stored.allowExec) {
+      sendResult({ success: false, error: EXEC_DISABLED_ERROR });
+      return;
+    }
+    const code = params.code;
+    if (typeof code !== "string" || !code.trim()) {
+      sendResult({ success: false, error: 'exec needs a non-empty "code" string parameter (e.g. {"code":"document.title"})' });
+      return;
+    }
+    let tabId = params.tabId;
+    if (tabId == null) {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      tabId = tabs[0]?.id;
+      if (tabId == null) {
+        sendResult({ success: false, error: "No active tab" });
+        return;
+      }
+    }
+    const frames = await resolveSearchFrames(tabId, params.frame);
+    const target = frames[0];
+    if (!target) {
+      sendResult({ success: false, error: `No matching frame for exec${params.frame !== void 0 ? ` (frame: ${JSON.stringify(params.frame)})` : ""}` });
+      return;
+    }
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: target.frameId === 0 ? { tabId } : { tabId, frameIds: [target.frameId] },
+        world: "MAIN",
+        func: execEvalInMainWorld,
+        args: [code]
+      });
+      const out = results?.[0]?.result;
+      if (out?.ok) {
+        sendResult({ success: true, data: out.value });
+      } else {
+        sendResult({ success: false, error: out?.error || "exec returned no result" });
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      const hint = /chrome:|web store|new tab|settings/i.test(detail) ? "\uFF08Chrome \u5185\u5EFA\u9875\u3001\u6269\u5C55\u5546\u5E97\u7B49\u53D7\u9650\u9875\u9762\u65E0\u6CD5\u6CE8\u5165\u4EE3\u7801\uFF09" : "";
+      sendResult({ success: false, error: `exec \u6CE8\u5165\u6267\u884C\u5931\u8D25: ${detail}${hint}` });
+    }
+  }
   async function handleBrowserCommand(cmd) {
     const { command, params = {} } = cmd.payload;
     const fieldFilter = params._field || [];
