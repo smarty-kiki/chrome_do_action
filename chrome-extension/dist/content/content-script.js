@@ -631,9 +631,17 @@
           dt.setData("text/html", html);
           const pasteEvt = new ClipboardEvent("paste", { bubbles: true, cancelable: true, composed: true });
           Object.defineProperty(pasteEvt, "clipboardData", { value: dt });
+          const before = (el.textContent || "").length;
           el.dispatchEvent(pasteEvt);
-          const pipeline = pasteEvt.defaultPrevented ? "editor_paste" : "insertHTML_fallback";
-          if (pipeline === "insertHTML_fallback") {
+          await waitForSettled(3e3);
+          const changed = el.textContent !== null && el.textContent.length !== before;
+          let pipeline;
+          if (pasteEvt.defaultPrevented) {
+            pipeline = "editor_paste";
+          } else if (changed) {
+            pipeline = "default_paste";
+          } else {
+            pipeline = "insertHTML_fallback";
             document.execCommand("insertHTML", false, html);
             el.dispatchEvent(new Event("input", { bubbles: true }));
           }

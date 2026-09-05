@@ -740,15 +740,12 @@ async function handleCommand(
         // 向 contenteditable 粘贴带样式的 HTML（{selector,html[,mode][,waitFor]}）：
         //   mode replace（默认，先清空原内容）/ append（追加到末尾）/ insert（光标处插入）
         // 置光标（replace 用 execCommand delete 全选删除 / append 折叠到末尾 / insert 保留选区）
-        // 后模拟一次"粘贴"，两条管线按需生效：
-        //   1) 派发带 DataTransfer 的原生 ClipboardEvent('paste')——有 paste 处理器的编辑器
-        //      （如 wangEditor 的 pasteModule）从 clipboardData 读 text/html、按块解析进自身
-        //      模型，与真实 Ctrl+V 同一条管线；这才能让"HTML 分段/落块"由编辑器自己的解析
-        //      决定——旧实现 execCommand('insertHTML') 只是绕过模型的 DOM 直插，块级结构
-        //      不会被编辑器解析。
-        //   2) 无人拦截（defaultPrevented=false：纯 contenteditable 或编辑器不认合成事件）时
-        //      回退 execCommand('insertHTML') 直插 DOM，保持旧行为不回归。
-        // cda 不做编辑器嗅探/适配/清洗，哪条管线生效由编辑器自己的 paste 处理决定——
+        // 后模拟一次"粘贴"。落地方式分三种（判定逻辑见下方）：
+        //   1) 有 paste 处理器的编辑器（如 wangEditor 的 pasteModule）preventDefault 接管——
+        //      从 clipboardData 读 text/html 按块解析进自身模型，与真实 Ctrl+V 同管线；
+        //   2) 无人接管但浏览器默认粘贴行为把内容落地（通常把 text/plain 分行插入）；
+        //   3) 前两者都没落地，才回退 execCommand('insertHTML') 直插 DOM（旧行为不回归）。
+        // HTML 怎么解析、分段仍是编辑器自己的行为；cda 不做编辑器嗅探/适配/清洗，
         // 返回 pipeline 字段如实报告，供调用方判断效果。
         const known = ["selector", "html", "mode", "frame", "waitFor"];
         const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
@@ -811,17 +808,28 @@ async function handleCommand(
         dt.setData("text/html", html);
         const pasteEvt = new ClipboardEvent("paste", { bubbles: true, cancelable: true, composed: true });
         Object.defineProperty(pasteEvt, "clipboardData", { value: dt });
+        // dispatch 前记录基线：派发后内容可能经编辑器处理器或浏览器默认行为两条路径落地，
+        // 先等 DOM 稳定再比对 textContent，判定"是否真的什么都没落地"——避免拿不准时重复插入
+        const before = (el.textContent || "").length;
         el.dispatchEvent(pasteEvt);
-        // 有人 preventDefault = 编辑器接管了粘贴（pasteModule 已读 clipboardData、按块插入模型、
-        // 自会触发自己的 change 通知）——此时不再补 input，与真实粘贴语义一致；补发合成 input
-        // 反而可能让站点状态监听收到"二次编辑"信号
-        const pipeline: "editor_paste" | "insertHTML_fallback" = pasteEvt.defaultPrevented ? "editor_paste" : "insertHTML_fallback";
-        if (pipeline === "insertHTML_fallback") {
-          // 无处理器接管：回退浏览器原生编辑命令直插（旧路径能力不回归）
+        await waitForSettled(3000); // 默认行为落地可能是异步的，等稳定后再测
+        const changed = el.textContent !== null && el.textContent.length !== before;
+        let pipeline: "editor_paste" | "default_paste" | "insertHTML_fallback";
+        if (pasteEvt.defaultPrevented) {
+          // 编辑器接管：pasteModule 已读 clipboardData、按块插入自身模型，自会触发自己的
+          // change 通知——不再补 input（与真实粘贴语义一致，补发反而可能让状态监听收到
+          // "二次编辑"信号）
+          pipeline = "editor_paste";
+        } else if (changed) {
+          // 浏览器默认行为已把内容落地（多走 text/plain 纯文本行）——已落地就不再插 html
+          pipeline = "default_paste";
+        } else {
+          // 真没落地才兜底：无人接管且默认行为未生效，回退浏览器原生编辑命令直插
+          pipeline = "insertHTML_fallback";
           document.execCommand("insertHTML", false, html);
           el.dispatchEvent(new Event("input", { bubbles: true }));
         }
-        // 等影响落地：编辑器收到内容后的重排/防抖渲染完成再返回
+        // 等影响落地：编辑器收到内容后的重排/防抖渲染完成再返回（fallback 直插的落地也在内）
         const stable = await waitForSettled(3000);
         const waitForResult = params.waitFor
           ? await waitForCondition(params.waitFor as { selector?: string; text?: string }, 3000)
