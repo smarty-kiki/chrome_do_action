@@ -617,13 +617,33 @@
               }
             }
           }
-          document.execCommand("insertHTML", false, html);
-          el.dispatchEvent(new Event("input", { bubbles: true }));
+          const toPlainText = (markup) => {
+            const probe = document.createElement("div");
+            probe.style.cssText = "position:fixed;left:-9999px;top:0";
+            probe.innerHTML = markup;
+            document.body.appendChild(probe);
+            const text = probe.innerText;
+            probe.remove();
+            return text;
+          };
+          const dt = new DataTransfer();
+          dt.setData("text/plain", toPlainText(html));
+          dt.setData("text/html", html);
+          const pasteEvt = new ClipboardEvent("paste", { bubbles: true, cancelable: true, composed: true });
+          Object.defineProperty(pasteEvt, "clipboardData", { value: dt });
+          el.dispatchEvent(pasteEvt);
+          const pipeline = pasteEvt.defaultPrevented ? "editor_paste" : "insertHTML_fallback";
+          if (pipeline === "insertHTML_fallback") {
+            document.execCommand("insertHTML", false, html);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+          }
           const stable = await waitForSettled(3e3);
           const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
           const pasteData = {
             selector,
             mode,
+            pipeline,
+            // editor_paste=编辑器接管（走自身粘贴管线）；insertHTML_fallback=无人接管 DOM 直插
             tag: el.tagName.toLowerCase(),
             inserted: true,
             settledMs: stable.waited

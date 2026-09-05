@@ -309,7 +309,7 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 ### 2. 富文本与文件上传：绕开最难的两个交互
 
 - **`type`**：普通输入框直接写 value 并触发 `input`/`change`；富文本编辑区聚焦后文字**整段原样插入——不 trim、不按换行拆分、不改写**，怎么分段由编辑器自己决定（cda 不做编辑器适配；段落要精确可控就一段发一次，后续 `mode:"append"` 追加）
-- **`paste_rich`**：向富文本编辑器粘贴带内联样式的 HTML，保留字号/颜色/加粗/间距；`mode` 同 type（默认 `replace` 等价于「全选删除后粘贴排好版的文档」，`append`/`insert` 可选），HTML 交给浏览器原生粘贴管线落地、不做编辑器适配
+- **`paste_rich`**：向富文本编辑器粘贴带内联样式的 HTML，保留字号/颜色/加粗/间距；`mode` 同 type（默认 `replace` 等价于「全选删除后粘贴排好版的文档」，`append`/`insert` 可选）。粘贴内容交给编辑器的粘贴处理解析——**块级 HTML（段落/标题/列表）由编辑器自己分段**；返回值 `pipeline` 可确认编辑器是否接管了内容。不做编辑器嗅探适配
 - **`upload_file`**：把 base64 图片注入 `input[type=file]` 并触发 `change`，页面监听后自动上传——无需操作系统文件对话框（比如没有辅助功能权限时也能上传封面图）
 - **`upload_dragdrop`**：找不到文件输入框、只有拖拽上传区时，向目标区域派发带文件的 dragenter/dragover/drop，页面 drop 处理器自动上传——与 `upload_file` 互补
 
