@@ -338,11 +338,16 @@ class FramePicker {
     if (this.overlay) this.overlay.hover.style.display = "none";
   }
 
-  // 会话结束（面板关闭）：选择器与所有框全清
+  // 会话结束（面板关闭）：选择器与所有框全清。悬停框/坐标片必须同 stopPicking 一并收掉：
+  // 直接关闭浮层（Esc/×）的路径不经过 stopPicking，漏收会把最后悬停元素的高亮残影
+  // 留在页面上
   dispose(): void {
     this.active = false;
     this.detach();
     this.clearCallbacks();
+    this.hoverEl = null;
+    this.hideChip();
+    if (this.overlay) this.overlay.hover.style.display = "none";
     this.clearRing();
   }
 
