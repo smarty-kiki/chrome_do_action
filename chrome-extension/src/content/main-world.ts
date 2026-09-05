@@ -1,7 +1,10 @@
 // 主世界脚本（manifest content_scripts world:"MAIN" + run_at:"document_start" + all_frames 注入）。
 // 为什么需要主世界：普通 content script 跑在隔离世界，其 window.onerror 只能看到隔离世界自身
-// 的错误、事件拦截也拦不住页面（Chrome 各世界独立派发事件，隔离世界的 stopPropagation 不影响
-// 页面主世界）。这里做三件必须贴着页面的事：
+// 的错误、事件拦截也拦不住页面（隔离世界派发的 stop 传不进页面世界的派发）。这里做三件必须
+// 贴着页面的事：
+// ⚠ 方向性注意（v0.19.0 实证）：「隔离世界 stop 拦不住页面」正确，但反过来「主世界 stop
+// 不影响隔离世界」错误——主世界捕获监听 stopImmediatePropagation 会把同一物理事件在隔离
+// 世界的派发一并掐掉（调试拦截段有完整说明与对策，勿再以「各世界独立」为设计前提）。
 //   1. JS 错误捕获（__cda_js_error__ 中继给隔离世界 content script）；
 //   2. 调试模式 ⌘+]/Ctrl+] 全局快捷键（页面最早注册，早于任何页面脚本，可拦停）；
 //   3. 调试模式选择期的页面事件拦截 + frame-chain 定位 oracle。
@@ -81,7 +84,7 @@ document.addEventListener(SYNC_EVT, () => {
   });
 });
 
-// ============================ 调试模式（v0.18.0） ============================
+// ============================ 调试模式（v0.19.0） ============================
 // 键盘事件只派发到「当前获得焦点的 frame」。⌘+] 可能按在任意 frame（含页面输入框内，
 // 用户已确认要全局拦截）——所以每个 frame 的主世界都注册捕获；顶层直接在自己 document
 // 派发 toggle 事件，非顶层 frame 转发到 window.top.document（同源页面 JS 可达）。
@@ -95,6 +98,11 @@ const TOGGLE_EVT = "__cda_debug_toggle__";
 const INTERCEPT_EVT = "__cda_debug_intercept__";
 const GEO_EVT = "__cda_debug_geo__";
 const GEO_REPLY_EVT = "__cda_debug_geo_reply__";
+// 选择期页面点击 / Esc 拦停后的中继事件（隔离世界 debug-mode.js 收）：
+// 主世界的 stopImmediatePropagation 会把同一物理事件的隔离世界派发一并掐掉（见下方实证
+// 注释），隔离世界只能收到这里「拦停后新派发」的事件。
+const PICK_EVT = "__cda_debug_pick__";
+const ESC_EVT = "__cda_debug_esc__";
 
 // 拦截状态由隔离世界 content script（debug-mode.js）在切换选择模式/开关面板时下发
 let interceptState: { picking: boolean; iso: boolean } = { picking: false, iso: false };
@@ -139,13 +147,16 @@ document.addEventListener(TOGGLE_EVT, (ev: Event) => {
 });
 
 // —— 页面事件拦截：隔离世界调试浮层（debug-mode.js）下发状态，本世界负责真正拦停页面 ——
-// 选择模式（picking）：页面完全惰性——点击类事件全部拦停（stopImmediatePropagation 连页面
-//   捕获监听都收不到；preventDefault 防焦点/文本选择等默认行为），Esc 也拦停（页面弹层不因
-//   取消选择而被关）。事件路径含 [data-cda-debug-host]（面板宿主，隔离世界建的 DOM 节点对
-//   主世界可见、属性可读）→ 面板自身交互放行。
-// 面板开（iso）非 picking：只拦「路径命中面板」的按键（面板里输入参数时页面快捷键不触发）
-//   与指针事件传播（stopPropagation 即可，默认行为保留——面板按钮要能点）。
-// 注意事件派发各世界独立：这里的 stop 不影响隔离世界 picker 自己的监听（高亮/选点照常）。
+// 【实证结论 · v0.19.0 修正】同一物理事件跨世界在同一派发序列内先后派发，本世界（主世界，
+// document_start 最早注册）捕获监听里的 stopImmediatePropagation 会把同序列**后续世界**
+// （含隔离世界的 picker/面板监听）一并掐掉；而 preventDefault 不影响其他世界的派发。
+// 旧注释「各世界独立派发、stop 不影响隔离世界」与实测相反，曾被当作设计前提——三条用户
+// bug（点选完成不了 / × 关不掉 / Esc 无效）全部由此而来。据此定下两条铁律：
+//   1. 面板宿主（[data-cda-debug-host] 路径）上的事件一律不拦（面板 ×/按钮/输入框依赖
+//      隔离世界原生事件才能工作；页面能听到面板区域点击是此取舍的代价）；
+//   2. 选择期必须吞掉的页面事件（页面区点击、Esc），拦停后**新派发**一个 CustomEvent
+//      把事件中继进隔离世界——fresh event 从零开始派发，不受 stop 状态影响（方向与仓库
+//      既有错误中继一致，实测可达）。
 const POINTER_TYPES = [
   "pointerdown",
   "mousedown",
@@ -160,22 +171,24 @@ const POINTER_TYPES = [
 const hitsHost = (ev: Event): boolean =>
   ev.composedPath().some((n) => n instanceof Element && n.hasAttribute("data-cda-debug-host"));
 
-const pointerGuard = (ev: Event): void => {
-  if (interceptState.picking) {
-    if (hitsHost(ev)) {
-      // 面板交互不进页面世界：stopImmediatePropagation 拦掉页面监听（防误触发页面全局
-      // 点击逻辑），但保留默认行为（按钮可点、输入框可聚焦）。隔离世界面板自身事件
-      // 独立派发不受影响。
-      ev.stopImmediatePropagation();
-      return;
-    }
-    ev.stopImmediatePropagation();
-    ev.preventDefault();
-    return;
+const relayDebug = (type: string, detail: unknown): void => {
+  try {
+    document.dispatchEvent(new CustomEvent(type, { detail }));
+  } catch {
+    // 页面劫持 dispatchEvent 等极端情况：中继失败 = 调试交互失效，绝不影响页面
   }
-  if (interceptState.iso && hitsHost(ev)) {
-    // 面板内指针：只断传播不断默认（按钮/输入框需要默认行为）
-    ev.stopImmediatePropagation();
+};
+
+const pointerGuard = (ev: Event): void => {
+  if (!interceptState.picking) return; // 非选择期一律放行（面板期也不拦，见铁律 1）
+  if (hitsHost(ev)) return; // 面板自身交互放行（见铁律 1）
+  ev.stopImmediatePropagation();
+  ev.preventDefault();
+  if (ev.type === "click") {
+    // 页面区 click 已吞：隔离世界 picker 的 click 监听同样收不到（见实证结论），
+    // 中继点击坐标（clientX/Y 是本帧口径，同帧 picker 消费）
+    const me = ev as MouseEvent;
+    relayDebug(PICK_EVT, { x: me.clientX, y: me.clientY });
   }
 };
 
@@ -184,20 +197,14 @@ for (const type of POINTER_TYPES) {
 }
 
 const keyGuard = (ev: KeyboardEvent): void => {
-  if (interceptState.picking) {
-    // Esc：取消选择（隔离世界 picker 独立派发仍收得到，页面这边吞掉）
-    if (ev.key === "Escape" && !ev.repeat) {
-      ev.stopImmediatePropagation();
-      ev.preventDefault();
-    }
-    return;
-  }
-  if (interceptState.iso && hitsHost(ev) && (ev.key === "Escape" || ev.key.length === 1 || ev.key === "Backspace" || ev.key === "Tab")) {
-    // 面板内输入：字符键/Esc/Backspace/Tab 不与页面共享——页面全局快捷键不被面板输入触发。
-    // 只断传播不断默认行为：preventDefault 会取消按键的默认动作（文本框字符插入 / Backspace
-    // 删除 / Tab 焦点移动），面板自己的输入会失效。隔离世界 picker/输入框的派发独立，照常工作。
-    ev.stopImmediatePropagation();
-  }
+  // 浮层可见（选择期或面板开）期间 Esc 归浮层：取消/关闭的语义由隔离世界决定
+  if (!(interceptState.picking || interceptState.iso)) return;
+  if (ev.key !== "Escape" || ev.repeat) return;
+  // 页面与隔离世界的 Esc 监听都会被本 stop 掐掉 → 中继。
+  // detail.host = 焦点是否在面板内（隔离世界据此区分「取消参数输入行」与「关闭浮层」）
+  ev.stopImmediatePropagation();
+  ev.preventDefault();
+  if (ev.type === "keydown") relayDebug(ESC_EVT, { host: hitsHost(ev) });
 };
 
 window.addEventListener("keydown", (ev: KeyboardEvent) => safeRun(() => keyGuard(ev)), true);

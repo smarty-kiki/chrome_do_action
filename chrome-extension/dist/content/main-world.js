@@ -60,6 +60,8 @@
     const INTERCEPT_EVT = "__cda_debug_intercept__";
     const GEO_EVT = "__cda_debug_geo__";
     const GEO_REPLY_EVT = "__cda_debug_geo_reply__";
+    const PICK_EVT = "__cda_debug_pick__";
+    const ESC_EVT = "__cda_debug_esc__";
     let interceptState = { picking: false, iso: false };
     const isToggleKey = (e) => e.code === "BracketRight" && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && !e.repeat;
     window.addEventListener(
@@ -101,34 +103,31 @@
       "contextmenu"
     ];
     const hitsHost = (ev) => ev.composedPath().some((n) => n instanceof Element && n.hasAttribute("data-cda-debug-host"));
-    const pointerGuard = (ev) => {
-      if (interceptState.picking) {
-        if (hitsHost(ev)) {
-          ev.stopImmediatePropagation();
-          return;
-        }
-        ev.stopImmediatePropagation();
-        ev.preventDefault();
-        return;
+    const relayDebug = (type, detail) => {
+      try {
+        document.dispatchEvent(new CustomEvent(type, { detail }));
+      } catch {
       }
-      if (interceptState.iso && hitsHost(ev)) {
-        ev.stopImmediatePropagation();
+    };
+    const pointerGuard = (ev) => {
+      if (!interceptState.picking) return;
+      if (hitsHost(ev)) return;
+      ev.stopImmediatePropagation();
+      ev.preventDefault();
+      if (ev.type === "click") {
+        const me = ev;
+        relayDebug(PICK_EVT, { x: me.clientX, y: me.clientY });
       }
     };
     for (const type of POINTER_TYPES) {
       window.addEventListener(type, (ev) => safeRun(() => pointerGuard(ev)), true);
     }
     const keyGuard = (ev) => {
-      if (interceptState.picking) {
-        if (ev.key === "Escape" && !ev.repeat) {
-          ev.stopImmediatePropagation();
-          ev.preventDefault();
-        }
-        return;
-      }
-      if (interceptState.iso && hitsHost(ev) && (ev.key === "Escape" || ev.key.length === 1 || ev.key === "Backspace" || ev.key === "Tab")) {
-        ev.stopImmediatePropagation();
-      }
+      if (!(interceptState.picking || interceptState.iso)) return;
+      if (ev.key !== "Escape" || ev.repeat) return;
+      ev.stopImmediatePropagation();
+      ev.preventDefault();
+      if (ev.type === "keydown") relayDebug(ESC_EVT, { host: hitsHost(ev) });
     };
     window.addEventListener("keydown", (ev) => safeRun(() => keyGuard(ev)), true);
     window.addEventListener("keyup", (ev) => safeRun(() => keyGuard(ev)), true);

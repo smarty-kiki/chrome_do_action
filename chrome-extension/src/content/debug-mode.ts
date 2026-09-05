@@ -1,4 +1,4 @@
-// 调试模式（v0.18.0）：⌘+]/Ctrl+] 唤出右侧调试浮层 + 元素选择 + 坐标预览 + 单页动作执行。
+// 调试模式（v0.19.0）：⌘+]/Ctrl+] 唤出右侧调试浮层 + 元素选择 + 坐标预览 + 单页动作执行。
 // 注入方式：与 content-script.js 同一 content_scripts 项（同隔离世界、同文档、document_idle），
 // manifest 的 js 数组把本文件排在 content-script.js 之后 → window.__cdaDebug 桥必然已就位。
 //
@@ -9,12 +9,18 @@
 //   - 非顶层 frame：只跑本帧选择器。与顶层是否同源由主世界 frame-chain oracle 探测
 //     （main-world.ts 的 __cda_debug_geo__）：跨域链不可达 → 本帧不启动选择器（产品范围：
 //     跨域 iframe 内容不支持）。
-// 页面点击拦截按帧自理：同源子 frame 的 picker 挂上监听时把本帧主世界置为惰性
-// （setIntercept）——事件不跨 frame 边界，选择期的点击副作用只能靠本帧自己拦；
+// 事件拦截按帧执行：每帧「吞页面事件」由本帧主世界 guard（main-world.ts）执行，拦截状态
+// 由本文件会话对象下发（顶层 DebugController / 非顶层 ChildSession 持帧），子帧 picker 在
+// attach 时才开拦、detach 回 idle 语义。主世界拦停后把事件中继回本帧（PICK_EVT / ESC_EVT，
+// 见下 ⚠ 事件模型）驱动选择与取消；面板宿主路径事件主世界一律放行（面板交互走原生事件）。
 // 跨域 frame 拦不到也不拦（用户已确认跨域内容可以不支持）。
 // 跨帧通道：本文件只依赖 chrome.runtime 消息（content script ↔ service worker，天然跨 frame）；
 // 跨世界通道：隔离世界 → 主世界走「CustomEvent + postMessage」双投递（主世界 → 隔离世界为
 // 仓库已验证的 CustomEvent 中继方向），detail 仅纯数据（跨世界结构化克隆，DOM 节点过不去）。
+// ⚠ 事件模型（v0.19.0 实证修正）：主世界 guard 拦停事件时，隔离世界**收不到**同一物理事件
+// （点选 click / Esc 原本全被掐死）。因此选择期事件由主世界「拦停 + 新派发中继」（PICK_EVT/
+// ESC_EVT）送达本世界；面板宿主（data-cda-debug-host）路径事件主世界一律不拦，面板交互走
+// 原生事件。两套入口都收、幂等去重（finishPick/closePanel 状态机天然只生效一次）。
 // 选择结果聚合：非顶层选中的元素经 SW 上报顶层面板，面板展示；后续动作执行带
 // 「顶层→目标」逐跳 iframe 序号链（chain），SW 逐跳解析回目标 frame 执行既有 execute_command。
 // 坐标口径：面板显示与真实点击一律用「顶层视口坐标」——本帧元素局部坐标 + oracle 偏移换算。
@@ -37,6 +43,9 @@ const TOGGLE_EVT = "__cda_debug_toggle__";
 const INTERCEPT_EVT = "__cda_debug_intercept__";
 const GEO_EVT = "__cda_debug_geo__";
 const GEO_REPLY_EVT = "__cda_debug_geo_reply__";
+// 主世界拦停选择期页面事件后中继的点选 / Esc（main-world.ts PICK_EVT/ESC_EVT 同名对齐）
+const PICK_EVT = "__cda_debug_pick__";
+const ESC_EVT = "__cda_debug_esc__";
 
 interface BridgeResult {
   success: boolean;
@@ -81,7 +90,8 @@ function getBridge(): CdaBridge | null {
 }
 
 // —— 通用小工具 ——
-const PANEL_W = 320; // 面板宽度（顶层右侧悬浮层）
+const PANEL_W = 320; // 面板宽度（顶层右侧悬浮层；选择期可整体让到左侧，见 setPanelSide）
+const DODGE_HYST = 60; // 浮层左右切换的滞回带（px）：光标在右缘附近小范围移动不反复横跳
 const MAX_RESULT_CHARS = 4000;
 
 function stringifyData(d: unknown): string {
@@ -265,12 +275,14 @@ class FramePicker {
   private ringTarget: Element | null = null; // 选中后需要保持的框
   private ringTimer = 0;
   private onSelectCb: SelectCb | null = null;
-  private onEscCb: (() => void) | null = null;
+  private onEscCb: ((reason: "esc" | "fail") => void) | null = null;
 
   private readonly onMove = (ev: Event) => this.handleMove(ev as MouseEvent);
   private readonly onClick = (ev: Event) => this.handleClick(ev as MouseEvent);
   private readonly onOut = (ev: Event) => this.handleOut(ev as MouseEvent);
   private readonly onKey = (ev: Event) => this.handleKey(ev as KeyboardEvent);
+  private readonly onPickRelay = (ev: Event) => this.handlePickRelay(ev as CustomEvent);
+  private readonly onEscRelay = (_ev: Event) => this.abortPick("esc");
   private readonly onScroll = () => this.repositionAll();
   private readonly onResize = () => this.repositionAll();
 
@@ -279,7 +291,7 @@ class FramePicker {
   }
 
   // —— 会话生命周期（由 debug_mode 广播驱动，幂等）——
-  startPicking(onSelect: SelectCb, onEsc: () => void): void {
+  startPicking(onSelect: SelectCb, onEsc: (reason: "esc" | "fail") => void): void {
     if (this.active) return;
     this.onSelectCb = onSelect;
     this.onEscCb = onEsc;
@@ -344,9 +356,16 @@ class FramePicker {
     if (!this.overlay) this.overlay = makeOverlay();
     if (!this.overlay) return;
     this.attached = true;
-    // 非顶层：本帧页面进惰性态——事件不跨 frame 边界，子 frame 内的点击只能靠
-    // 本帧主世界拦（iso=false：子帧没有面板，无需面板路径放行逻辑）
+    // 非顶层：attach 成功才开本帧拦截——事件不跨 frame 边界，子 frame 内的点击只能靠
+    // 本帧主世界拦（iso=false：子帧没有面板；回 idle 的 Esc 归浮层由 detach 补置）。
+    // 顶层拦截（picking+iso）由顶层会话对象统一管理，这里不重复置位。
     if (!this.forTop) setIntercept(true, false);
+    // 主世界中继入口：选择期页面区 click / Esc 被主世界拦停后新派发到本帧文档（原生物理
+    // 事件的隔离世界派发已被 stop 掐掉，见文件头 ⚠ 事件模型），PICK_EVT / ESC_EVT 是
+    // 点选与取消的主路径；原生 click/keydown 监听保留作主世界缺席时的兜底（模型 Y）。
+    // 两路都到也只会生效一次：finishPick/abortPick 后 active=false，后到者被忽略。
+    document.addEventListener(PICK_EVT, this.onPickRelay);
+    document.addEventListener(ESC_EVT, this.onEscRelay);
     window.addEventListener("mousemove", this.onMove, true);
     window.addEventListener("click", this.onClick, true);
     window.addEventListener("mouseout", this.onOut, true);
@@ -358,7 +377,11 @@ class FramePicker {
   private detach(): void {
     if (!this.attached) return;
     this.attached = false;
-    if (!this.forTop) setIntercept(false, false);
+    // 非顶层：回 idle 语义——页面点击还原，Esc 继续归浮层（iso=true：焦点在本帧内时
+    // Esc 中继仍可达，由会话对象兜底上报顶层）；面板彻底关闭的清场由会话 dispose 补
+    if (!this.forTop) setIntercept(false, true);
+    document.removeEventListener(PICK_EVT, this.onPickRelay);
+    document.removeEventListener(ESC_EVT, this.onEscRelay);
     window.removeEventListener("mousemove", this.onMove, true);
     window.removeEventListener("click", this.onClick, true);
     window.removeEventListener("mouseout", this.onOut, true);
@@ -409,14 +432,46 @@ class FramePicker {
     }
   }
 
+  // 原生 click（兜底路径）：主世界缺席时（未注入/已损坏）原生物理事件仍能到达本世界。
+  // 正常模型下选择期页面区点击已被主世界吞掉，这里收不到；宿主路径点击则按面板交互跳过。
   private handleClick(ev: MouseEvent): void {
     if (!this.active || !this.overlay) return;
     if (ev.button !== 0) return;
     const path = ev.composedPath();
     if (hitsDebugHost(path)) return; // 面板自身交互不算点选
-    const el = deepestElement(path);
+    ev.stopPropagation(); // 本世界内停掉后续监听
+    this.pickAt(deepestElement(path), ev.clientX, ev.clientY);
+  }
+
+  // 主世界中继的点击（主路径）：detail 是纯坐标——跨世界结构化克隆带不了 DOM 节点。
+  // 主世界拦停 click 前一刻鼠标必然悬停在被点元素上（点击前没有 mousemove）→ hoverEl
+  // 优先；元素已失联/坐标对不上（布局变了）→ elementFromPoint 兜底（全部覆盖层
+  // pointer-events:none，不会命中到自身）。
+  private handlePickRelay(ev: CustomEvent): void {
+    if (!this.active || !this.overlay) return;
+    const d = ev.detail as { x?: number; y?: number } | undefined;
+    if (!d || typeof d.x !== "number" || typeof d.y !== "number") return;
+    let el = this.hoverEl;
+    if (el && el.isConnected) {
+      const r = el.getBoundingClientRect();
+      if (d.x < r.left - 1 || d.x > r.right + 1 || d.y < r.top - 1 || d.y > r.bottom + 1) el = null;
+    } else {
+      el = null;
+    }
+    if (!el) {
+      try {
+        el = document.elementFromPoint(d.x, d.y);
+      } catch {
+        el = null;
+      }
+    }
+    this.pickAt(el, d.x, d.y);
+  }
+
+  // 点选统一收尾（中继与原生兜底两路都汇到这里；x/y = 本帧口径的点击点）
+  private pickAt(el: Element | null, x: number, y: number): void {
+    if (!this.active || !this.overlay) return;
     if (!el || el === document.documentElement) return;
-    ev.stopPropagation(); // 本世界内停掉后续监听（主世界的拦截独立派发，互不影响）
 
     // 非顶层：点选瞬间重新探测一次，取最新 chain/偏移（父级滚动/iframe 重排后仍准确）
     const finalize = (chain: ChainHop[], ox: number, oy: number) => {
@@ -427,13 +482,13 @@ class FramePicker {
         type: (el.getAttribute("type") || "").toLowerCase(),
         editable: isEditableEl(el),
         chain,
-        clickX: Math.round(ev.clientX + ox),
-        clickY: Math.round(ev.clientY + oy),
+        clickX: Math.round(x + ox),
+        clickY: Math.round(y + oy),
         sourceFrameId: 0,
       };
       const bridge = getBridge();
       if (!bridge) {
-        this.abortPick();
+        this.abortPick("fail");
         return;
       }
       sel.selector = bridge.genSelector(el, el.ownerDocument);
@@ -448,20 +503,21 @@ class FramePicker {
         .then((r) => {
           if (!this.active) return;
           if (!r.ok) {
-            this.abortPick();
+            this.abortPick("fail");
             return;
           }
           finalize(r.chain, r.ox, r.oy);
         })
-        .catch(() => this.abortPick());
+        .catch(() => this.abortPick("fail"));
     }
   }
 
+  // 原生 Esc（兜底路径，见 handleClick 注释；正常模型的 Esc 走主世界中继）
   private handleKey(ev: KeyboardEvent): void {
     if (!this.active) return;
     if (ev.key === "Escape") {
       ev.stopPropagation();
-      this.abortPick();
+      this.abortPick("esc");
     }
   }
 
@@ -474,12 +530,13 @@ class FramePicker {
     cb?.(sel, el);
   }
 
-  // 取消选择（Esc 或跨域探测失败）：通知上层（顶层取消会话；子 frame 上报 SW 转发给面板）
-  private abortPick(): void {
+  // 取消选择：reason=esc（用户 Esc，顶层语义 = 关闭浮层）；fail（桥缺失 / 跨域探测失败，
+  // 顶层语义 = 退出选择会话但面板保留提示）。通知上层并停掉本帧选择状态
+  private abortPick(reason: "esc" | "fail"): void {
     const esc = this.onEscCb;
     this.clearCallbacks();
     this.stopPicking();
-    esc?.();
+    esc?.(reason);
   }
 
   // —— 选中框（ring）保持：选中后由本帧持续跟随元素，直到新会话/面板关闭 ——
@@ -586,6 +643,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
   /* 宿主是 pointer-events:none（不挡 hit-test），面板本体必须重新可命中：
      auto 沿子树继承，面板区整体拦截点击（页面收不到面板区域下的点击） */
   pointer-events: auto;
+}
+.panel.side-left {
+  /* 躲鼠标：picking 期光标逼近右侧时整层换到左侧。宿主仍占右缘但 pointer-events:none
+     不参与命中测试，换侧只改 .panel 自身，边线与投影跟着镜像 */
+  left: 0; right: auto;
+  border-left: none; border-right: 1px solid #dadce0;
+  box-shadow: 4px 0 16px rgba(0, 0, 0, 0.12);
 }
 .head {
   flex: none; display: flex; align-items: center; gap: 8px; padding: 10px 12px;
@@ -705,6 +769,8 @@ interface PanelResult {
 class DebugPanel {
   private root: ShadowRoot;
   private host: HTMLDivElement;
+  private panelEl: HTMLElement | null = null; // .panel 主容器（躲鼠标换侧用）
+  private paramRowEl: HTMLElement | null = null; // 当前参数输入行（Esc 取消该行时定位用）
   private fileInput: HTMLInputElement;
   private el: Record<string, HTMLElement> = {};
   private sel: Selection | null = null;
@@ -731,7 +797,9 @@ class DebugPanel {
     const style = document.createElement("style");
     style.textContent = PANEL_CSS;
     this.root.appendChild(style);
-    this.root.appendChild(this.buildDom());
+    const dom = this.buildDom();
+    this.panelEl = dom;
+    this.root.appendChild(dom);
     (document.body || document.documentElement).appendChild(this.host);
     this.fileInput = document.createElement("input");
     this.fileInput.type = "file";
@@ -774,7 +842,7 @@ class DebugPanel {
     wrap.innerHTML = `
       <div class="head">
         <div class="t">调试模式 <span class="k">(⌘]/Ctrl+] 开关)</span></div>
-        <button class="x" title="关闭（⌘+]/Ctrl+]）">×</button>
+        <button class="x" title="关闭（Esc / ⌘+]/Ctrl+]）">×</button>
       </div>
       <div class="status">准备中…</div>
       <div class="pickbar">
@@ -782,7 +850,7 @@ class DebugPanel {
       </div>
       <div class="body">
         <div class="hint" data-part="pickHint">
-          点击页面元素即可选中（支持 iframe 内与 shadow DOM 内元素；跨域 iframe 内部不支持；悬停有坐标预览，点击记录选中坐标）。
+          点击页面元素选中，悬停有坐标预览（支持 iframe 内与 shadow DOM 内元素；跨域 iframe 内部不支持）。选择期页面点击被拦停、不会触发页面；Esc / × 关闭浮层。
         </div>
         <div data-part="selection" style="display:none"></div>
         <div data-part="actions" style="display:none"></div>
@@ -844,7 +912,7 @@ class DebugPanel {
     this.picking = true;
     this.sel = null;
     this.locatable = false;
-    this.setStatus("选择模式：点击页面元素选中（Esc 取消）", true);
+    this.setStatus("选择模式：点击页面元素选中（Esc 关闭浮层）", true);
     this.el.pickHint.style.display = "";
     this.el.selection.style.display = "none";
     this.el.actions.style.display = "none";
@@ -867,6 +935,21 @@ class DebugPanel {
     if (this.el.pickBtn) (this.el.pickBtn as HTMLButtonElement).disabled = false;
     this.renderSelection();
     this.renderActions();
+  }
+
+  hasParamRow(): boolean {
+    return !!this.paramRowEl;
+  }
+
+  removeParamRow(): void {
+    const row = this.paramRowEl;
+    this.paramRowEl = null;
+    if (row) row.remove();
+  }
+
+  // 躲鼠标：picking 期浮层整体在左右侧之间切换（由 controller 的 mousemove 驱动）
+  setPanelSide(side: "right" | "left"): void {
+    if (this.panelEl) this.panelEl.classList.toggle("side-left", side === "left");
   }
 
   private setStatus(text: string, picking: boolean): void {
@@ -1038,8 +1121,7 @@ class DebugPanel {
 
   private openParamRow(def: ActionDef): void {
     if (!this.sel || !def.params) return;
-    const existing = this.el.actions.querySelector(".param-row");
-    if (existing) existing.remove();
+    this.removeParamRow(); // 同根只留一行（点其他参数动作时顶掉旧行）
     const row = document.createElement("div");
     row.className = "param-row";
     const values: Record<string, HTMLInputElement> = {};
@@ -1062,21 +1144,23 @@ class DebugPanel {
         const v = values[p.key].value;
         params[p.key] = p.def && v === "" ? p.def : v;
       }
-      row.remove();
+      this.removeParamRow();
       this.execParamsAction(def.id, params);
     });
     const cancel = document.createElement("button");
     cancel.className = "act";
     cancel.textContent = "取消";
-    cancel.addEventListener("click", () => row.remove());
+    cancel.addEventListener("click", () => this.removeParamRow());
     row.append(okBtn, cancel);
-    // 回车执行
+    // 回车执行；Esc 取消本行（正常模型下 Esc 被主世界拦停中继给 controller 处理，
+    // 由 ESC_EVT detail.host 命中本行后 removeParamRow——这里是主世界缺席时的兜底路径）
     for (const input of Object.values(values)) {
       input.addEventListener("keydown", (ev) => {
         if (ev.key === "Enter") okBtn.click();
-        if (ev.key === "Escape") row.remove();
+        if (ev.key === "Escape") this.removeParamRow();
       });
     }
+    this.paramRowEl = row;
     this.el.actions.appendChild(row);
     const first = Object.values(values)[0];
     if (first) first.focus();
@@ -1236,10 +1320,44 @@ class DebugController {
   private picker: FramePicker | null = null;
   private session: "idle" | "picking" | "closed" = "closed";
   private pendingProbe = 0; // 可定位性探测序号：探测返回时若已进入新会话/新选择则丢弃
+  private dodgeSide: "right" | "left" = "right"; // 浮层躲鼠标当前侧（picking 期联动）
 
   constructor() {
     this.picker = new FramePicker(true);
+    // 浮层可见期（picking/iso）主世界把页面 Esc 拦停后中继到本帧文档：Esc 语义统一为
+    // 「焦点在参数输入行 → 只取消该行；否则关闭浮层」。registered 于会话开始前（本构造
+    // 先于 picker attach），同一次中继先于 picker 的 ESC 监听执行，关闭路径一次走完
+    document.addEventListener(ESC_EVT, this.onEscRelayTop);
   }
+
+  private readonly onEscRelayTop = (ev: Event): void => {
+    if (!this.panel) return;
+    const d = (ev as CustomEvent).detail as { host?: boolean } | undefined;
+    if (d && d.host === true && this.panel.hasParamRow()) {
+      // 焦点在参数输入行：Esc 只取消该行（行内 Esc 的兜底路径见 openParamRow）
+      this.panel.removeParamRow();
+      return;
+    }
+    this.closePanel();
+  };
+
+  private readonly onDodgeMove = (ev: Event): void => {
+    const panel = this.panel;
+    if (!panel) return;
+    const x = (ev as MouseEvent).clientX;
+    const w = window.innerWidth;
+    if (this.dodgeSide === "right") {
+      // 光标逼近右缘面板区 → 浮层让到左侧，不再遮挡右侧页面
+      if (x >= w - PANEL_W) {
+        this.dodgeSide = "left";
+        panel.setPanelSide("left");
+      }
+    } else if (x < PANEL_W || x < w - PANEL_W - DODGE_HYST) {
+      // 光标离开右侧区（或逼近左置的浮层）→ 回右侧；带滞回带防右缘小范围抖动
+      this.dodgeSide = "right";
+      panel.setPanelSide("right");
+    }
+  };
 
   toggle(): void {
     if (this.panel) {
@@ -1269,22 +1387,26 @@ class DebugController {
   }
 
   private leavePicking(): void {
-    // 面板/会话彻底结束：停选择器、清空本帧一切覆盖物、关拦截
+    // 面板/会话彻底结束：停选择器、清空本帧一切覆盖物、关拦截、停躲鼠标
     this.pendingProbe++; // 丢弃在途探测结果
     this.session = "closed";
     this.picker!.dispose();
     setIntercept(false, false);
+    window.removeEventListener("mousemove", this.onDodgeMove, true);
   }
 
   private enterPicking(): void {
     if (!this.panel) return;
     if (this.session !== "picking") {
-      // 新选择会话：旧选择的覆盖物/结果全部作废
+      // 新选择会话：旧选择的覆盖物/结果全部作废；浮层回右侧并开始躲鼠标
       this.pendingProbe++;
       this.session = "picking";
-      this.picker!.startPicking((sel) => this.onLocalPick(sel), () => this.cancelPicking());
+      this.picker!.startPicking((sel) => this.onLocalPick(sel), (reason) => this.onPickerAbort(reason));
       setIntercept(true, true);
       this.broadcastState("picking");
+      this.dodgeSide = "right";
+      this.panel.setPanelSide("right");
+      window.addEventListener("mousemove", this.onDodgeMove, true);
     }
     this.panel.enterPicking();
   }
@@ -1297,6 +1419,19 @@ class DebugController {
     setIntercept(false, true);
     this.panel.exitPickNoSelect();
     this.broadcastState("idle");
+    window.removeEventListener("mousemove", this.onDodgeMove, true);
+  }
+
+  // 选择器会话中止（relay 与原生兜底两路都汇到这里）：reason=esc → 关闭浮层（Esc 语义
+  // 统一为关闭，正常模型下 relay 路径已由 onEscRelayTop 先行关闭，这里兜 native Esc）；
+  // reason=fail（桥缺失等）→ 留在面板，仅退出选择并提示
+  private onPickerAbort(reason: "esc" | "fail"): void {
+    if (!this.panel) return;
+    if (reason === "esc") {
+      this.closePanel();
+    } else if (this.session === "picking") {
+      this.cancelPicking();
+    }
   }
 
   private onLocalPick(sel: Selection): void {
@@ -1318,6 +1453,7 @@ class DebugController {
     this.picker!.stopPicking();
     setIntercept(false, true);
     this.broadcastState("idle");
+    window.removeEventListener("mousemove", this.onDodgeMove, true);
     // 立即上屏（locatable 未定 → 动作先置灰），随后探测修正
     this.panel.applySelection(sel, false);
     const seq = this.pendingProbe;
@@ -1331,8 +1467,16 @@ class DebugController {
       });
   }
 
-  onEscFromChild(): void {
-    if (this.session === "picking") this.cancelPicking();
+  // 子 frame 上报的 Esc / 中止（子帧主世界把该帧 Esc 拦停中继 → 子会话经 SW 上报）：
+  // reason=esc → 关闭浮层（焦点留在 iframe 内时 Esc 也能关面板）；fail（子帧探测失败）→
+  // 仅退出选择会话、面板保留提示
+  onEscFromChild(reason?: string): void {
+    if (!this.panel) return;
+    if (reason === "fail") {
+      if (this.session === "picking") this.cancelPicking();
+      return;
+    }
+    this.closePanel();
   }
 
   // 面板操作路由：选中元素可能在子 frame —— 顶层走本地桥，其余经 SW 逐跳解析执行
@@ -1377,29 +1521,52 @@ class DebugController {
   }
 }
 
-// —— 非顶层实例：子 frame 选择器（跨域不可选时静默停用；intercept 由广播统一驱动）——
+// —— 非顶层实例：子 frame 选择器（跨域不可选时静默停用）——
+// 本帧主世界拦截状态机：broadcast picking → picker 同源探测成功后 attach 置 (true,false)
+// 吞本帧页面点击/Esc（探测失败的本帧不开拦截，页面保持原样——同源探测失败是 oracle 故障
+// 的罕见情形）；回 idle → picker detach 置 (false,true)：页面点击还原、Esc 继续归浮层
+// （焦点留在 iframe 内时 Esc 也能关顶层浮层）；closed → dispose 补 (false,false) 全关。
 class ChildSession {
   private picker: FramePicker | null = null;
   private picking = false;
 
   constructor() {
     this.picker = new FramePicker(false);
+    // idle 期 Esc 中继：主世界把本帧 Esc 拦停后中继 ESC_EVT → 上报顶层关闭浮层。
+    // picking 期的 Esc 由 picker 会话路径上报（本监听按 picking 跳过，避免双报）
+    document.addEventListener(ESC_EVT, this.onEscRelay);
   }
+
+  private readonly onEscRelay = (): void => {
+    if (this.picking) return;
+    this.reportEsc("esc");
+  };
 
   startPicking(): void {
     if (this.picking) return;
     this.picking = true;
-    this.picker!.startPicking((sel) => this.report(sel), () => this.reportEsc());
+    this.picker!.startPicking((sel) => this.report(sel), (reason) => this.onPickerAbort(reason));
   }
 
   stopPicking(): void {
+    if (!this.picking) return;
     this.picking = false;
+    // 内部 detach 把本帧拦截置回 (false,true)：页面活性还原、Esc 仍归浮层（idle 语义）
     this.picker!.stopPicking();
   }
 
   dispose(): void {
     this.picking = false;
     this.picker!.dispose();
+    setIntercept(false, false); // 收掉 detach 留下的 iso=true——面板已关，页面完全还原
+  }
+
+  // picker 会话中止（pick 之外的结束路径）：还原本帧状态并上报顶层（顶层按 reason 决定
+  // 关闭浮层或仅退出选择）
+  private onPickerAbort(reason: "esc" | "fail"): void {
+    if (!this.picking) return;
+    this.picking = false;
+    this.reportEsc(reason);
   }
 
   private report(sel: Selection): void {
@@ -1408,9 +1575,9 @@ class ChildSession {
       .catch(() => {});
   }
 
-  private reportEsc(): void {
+  private reportEsc(reason: "esc" | "fail"): void {
     chrome.runtime
-      .sendMessage({ type: "debug_pick_esc", payload: {} })
+      .sendMessage({ type: "debug_pick_esc", payload: { reason } })
       .catch(() => {});
   }
 }
@@ -1448,7 +1615,8 @@ chrome.runtime.onMessage.addListener(
         return true;
       }
       if (IS_TOP && msg.type === "debug_pick_esc") {
-        controller?.onEscFromChild();
+        const payload = msg.payload as { reason?: string } | undefined;
+        controller?.onEscFromChild(payload?.reason);
         sendResponse?.({ ok: true });
         return true;
       }

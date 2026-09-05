@@ -13,11 +13,14 @@
     const INTERCEPT_EVT = "__cda_debug_intercept__";
     const GEO_EVT = "__cda_debug_geo__";
     const GEO_REPLY_EVT = "__cda_debug_geo_reply__";
+    const PICK_EVT = "__cda_debug_pick__";
+    const ESC_EVT = "__cda_debug_esc__";
     function getBridge() {
       const b = window.__cdaDebug;
       return b && typeof b.handleCommand === "function" && typeof b.genSelector === "function" ? b : null;
     }
     const PANEL_W = 320;
+    const DODGE_HYST = 60;
     const MAX_RESULT_CHARS = 4e3;
     function stringifyData(d) {
       let s;
@@ -169,6 +172,8 @@
         this.onClick = (ev) => this.handleClick(ev);
         this.onOut = (ev) => this.handleOut(ev);
         this.onKey = (ev) => this.handleKey(ev);
+        this.onPickRelay = (ev) => this.handlePickRelay(ev);
+        this.onEscRelay = (_ev) => this.abortPick("esc");
         this.onScroll = () => this.repositionAll();
         this.onResize = () => this.repositionAll();
       }
@@ -229,6 +234,8 @@
         if (!this.overlay) return;
         this.attached = true;
         if (!this.forTop) setIntercept(true, false);
+        document.addEventListener(PICK_EVT, this.onPickRelay);
+        document.addEventListener(ESC_EVT, this.onEscRelay);
         window.addEventListener("mousemove", this.onMove, true);
         window.addEventListener("click", this.onClick, true);
         window.addEventListener("mouseout", this.onOut, true);
@@ -239,7 +246,9 @@
       detach() {
         if (!this.attached) return;
         this.attached = false;
-        if (!this.forTop) setIntercept(false, false);
+        if (!this.forTop) setIntercept(false, true);
+        document.removeEventListener(PICK_EVT, this.onPickRelay);
+        document.removeEventListener(ESC_EVT, this.onEscRelay);
         window.removeEventListener("mousemove", this.onMove, true);
         window.removeEventListener("click", this.onClick, true);
         window.removeEventListener("mouseout", this.onOut, true);
@@ -284,14 +293,44 @@
           this.hideChip();
         }
       }
+      // 原生 click（兜底路径）：主世界缺席时（未注入/已损坏）原生物理事件仍能到达本世界。
+      // 正常模型下选择期页面区点击已被主世界吞掉，这里收不到；宿主路径点击则按面板交互跳过。
       handleClick(ev) {
         if (!this.active || !this.overlay) return;
         if (ev.button !== 0) return;
         const path = ev.composedPath();
         if (hitsDebugHost(path)) return;
-        const el = deepestElement(path);
-        if (!el || el === document.documentElement) return;
         ev.stopPropagation();
+        this.pickAt(deepestElement(path), ev.clientX, ev.clientY);
+      }
+      // 主世界中继的点击（主路径）：detail 是纯坐标——跨世界结构化克隆带不了 DOM 节点。
+      // 主世界拦停 click 前一刻鼠标必然悬停在被点元素上（点击前没有 mousemove）→ hoverEl
+      // 优先；元素已失联/坐标对不上（布局变了）→ elementFromPoint 兜底（全部覆盖层
+      // pointer-events:none，不会命中到自身）。
+      handlePickRelay(ev) {
+        if (!this.active || !this.overlay) return;
+        const d = ev.detail;
+        if (!d || typeof d.x !== "number" || typeof d.y !== "number") return;
+        let el = this.hoverEl;
+        if (el && el.isConnected) {
+          const r = el.getBoundingClientRect();
+          if (d.x < r.left - 1 || d.x > r.right + 1 || d.y < r.top - 1 || d.y > r.bottom + 1) el = null;
+        } else {
+          el = null;
+        }
+        if (!el) {
+          try {
+            el = document.elementFromPoint(d.x, d.y);
+          } catch {
+            el = null;
+          }
+        }
+        this.pickAt(el, d.x, d.y);
+      }
+      // 点选统一收尾（中继与原生兜底两路都汇到这里；x/y = 本帧口径的点击点）
+      pickAt(el, x, y) {
+        if (!this.active || !this.overlay) return;
+        if (!el || el === document.documentElement) return;
         const finalize = (chain, ox, oy) => {
           if (!this.active) return;
           const sel = {
@@ -300,13 +339,13 @@
             type: (el.getAttribute("type") || "").toLowerCase(),
             editable: isEditableEl(el),
             chain,
-            clickX: Math.round(ev.clientX + ox),
-            clickY: Math.round(ev.clientY + oy),
+            clickX: Math.round(x + ox),
+            clickY: Math.round(y + oy),
             sourceFrameId: 0
           };
           const bridge = getBridge();
           if (!bridge) {
-            this.abortPick();
+            this.abortPick("fail");
             return;
           }
           sel.selector = bridge.genSelector(el, el.ownerDocument);
@@ -318,18 +357,19 @@
           this.geo.probe().then((r) => {
             if (!this.active) return;
             if (!r.ok) {
-              this.abortPick();
+              this.abortPick("fail");
               return;
             }
             finalize(r.chain, r.ox, r.oy);
-          }).catch(() => this.abortPick());
+          }).catch(() => this.abortPick("fail"));
         }
       }
+      // 原生 Esc（兜底路径，见 handleClick 注释；正常模型的 Esc 走主世界中继）
       handleKey(ev) {
         if (!this.active) return;
         if (ev.key === "Escape") {
           ev.stopPropagation();
-          this.abortPick();
+          this.abortPick("esc");
         }
       }
       // 点选收尾：停监听、保留选中框、回调（顶层：面板；子 frame：SW 上报）
@@ -340,12 +380,13 @@
         this.adoptRing(el);
         cb?.(sel, el);
       }
-      // 取消选择（Esc 或跨域探测失败）：通知上层（顶层取消会话；子 frame 上报 SW 转发给面板）
-      abortPick() {
+      // 取消选择：reason=esc（用户 Esc，顶层语义 = 关闭浮层）；fail（桥缺失 / 跨域探测失败，
+      // 顶层语义 = 退出选择会话但面板保留提示）。通知上层并停掉本帧选择状态
+      abortPick(reason) {
         const esc = this.onEscCb;
         this.clearCallbacks();
         this.stopPicking();
-        esc?.();
+        esc?.(reason);
       }
       // —— 选中框（ring）保持：选中后由本帧持续跟随元素，直到新会话/面板关闭 ——
       adoptRing(el) {
@@ -438,6 +479,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
   /* \u5BBF\u4E3B\u662F pointer-events:none\uFF08\u4E0D\u6321 hit-test\uFF09\uFF0C\u9762\u677F\u672C\u4F53\u5FC5\u987B\u91CD\u65B0\u53EF\u547D\u4E2D\uFF1A
      auto \u6CBF\u5B50\u6811\u7EE7\u627F\uFF0C\u9762\u677F\u533A\u6574\u4F53\u62E6\u622A\u70B9\u51FB\uFF08\u9875\u9762\u6536\u4E0D\u5230\u9762\u677F\u533A\u57DF\u4E0B\u7684\u70B9\u51FB\uFF09 */
   pointer-events: auto;
+}
+.panel.side-left {
+  /* \u8EB2\u9F20\u6807\uFF1Apicking \u671F\u5149\u6807\u903C\u8FD1\u53F3\u4FA7\u65F6\u6574\u5C42\u6362\u5230\u5DE6\u4FA7\u3002\u5BBF\u4E3B\u4ECD\u5360\u53F3\u7F18\u4F46 pointer-events:none
+     \u4E0D\u53C2\u4E0E\u547D\u4E2D\u6D4B\u8BD5\uFF0C\u6362\u4FA7\u53EA\u6539 .panel \u81EA\u8EAB\uFF0C\u8FB9\u7EBF\u4E0E\u6295\u5F71\u8DDF\u7740\u955C\u50CF */
+  left: 0; right: auto;
+  border-left: none; border-right: 1px solid #dadce0;
+  box-shadow: 4px 0 16px rgba(0, 0, 0, 0.12);
 }
 .head {
   flex: none; display: flex; align-items: center; gap: 8px; padding: 10px 12px;
@@ -540,6 +588,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
         this.runInFrame = runInFrame;
         this.broadcast = broadcast;
         this.realClick = realClick;
+        this.panelEl = null;
+        // .panel 主容器（躲鼠标换侧用）
+        this.paramRowEl = null;
         this.el = {};
         this.sel = null;
         this.locatable = false;
@@ -556,7 +607,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
         const style = document.createElement("style");
         style.textContent = PANEL_CSS;
         this.root.appendChild(style);
-        this.root.appendChild(this.buildDom());
+        const dom = this.buildDom();
+        this.panelEl = dom;
+        this.root.appendChild(dom);
         (document.body || document.documentElement).appendChild(this.host);
         this.fileInput = document.createElement("input");
         this.fileInput.type = "file";
@@ -595,7 +648,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
         wrap.innerHTML = `
       <div class="head">
         <div class="t">\u8C03\u8BD5\u6A21\u5F0F <span class="k">(\u2318]/Ctrl+] \u5F00\u5173)</span></div>
-        <button class="x" title="\u5173\u95ED\uFF08\u2318+]/Ctrl+]\uFF09">\xD7</button>
+        <button class="x" title="\u5173\u95ED\uFF08Esc / \u2318+]/Ctrl+]\uFF09">\xD7</button>
       </div>
       <div class="status">\u51C6\u5907\u4E2D\u2026</div>
       <div class="pickbar">
@@ -603,7 +656,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
       </div>
       <div class="body">
         <div class="hint" data-part="pickHint">
-          \u70B9\u51FB\u9875\u9762\u5143\u7D20\u5373\u53EF\u9009\u4E2D\uFF08\u652F\u6301 iframe \u5185\u4E0E shadow DOM \u5185\u5143\u7D20\uFF1B\u8DE8\u57DF iframe \u5185\u90E8\u4E0D\u652F\u6301\uFF1B\u60AC\u505C\u6709\u5750\u6807\u9884\u89C8\uFF0C\u70B9\u51FB\u8BB0\u5F55\u9009\u4E2D\u5750\u6807\uFF09\u3002
+          \u70B9\u51FB\u9875\u9762\u5143\u7D20\u9009\u4E2D\uFF0C\u60AC\u505C\u6709\u5750\u6807\u9884\u89C8\uFF08\u652F\u6301 iframe \u5185\u4E0E shadow DOM \u5185\u5143\u7D20\uFF1B\u8DE8\u57DF iframe \u5185\u90E8\u4E0D\u652F\u6301\uFF09\u3002\u9009\u62E9\u671F\u9875\u9762\u70B9\u51FB\u88AB\u62E6\u505C\u3001\u4E0D\u4F1A\u89E6\u53D1\u9875\u9762\uFF1BEsc / \xD7 \u5173\u95ED\u6D6E\u5C42\u3002
         </div>
         <div data-part="selection" style="display:none"></div>
         <div data-part="actions" style="display:none"></div>
@@ -662,7 +715,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
         this.picking = true;
         this.sel = null;
         this.locatable = false;
-        this.setStatus("\u9009\u62E9\u6A21\u5F0F\uFF1A\u70B9\u51FB\u9875\u9762\u5143\u7D20\u9009\u4E2D\uFF08Esc \u53D6\u6D88\uFF09", true);
+        this.setStatus("\u9009\u62E9\u6A21\u5F0F\uFF1A\u70B9\u51FB\u9875\u9762\u5143\u7D20\u9009\u4E2D\uFF08Esc \u5173\u95ED\u6D6E\u5C42\uFF09", true);
         this.el.pickHint.style.display = "";
         this.el.selection.style.display = "none";
         this.el.actions.style.display = "none";
@@ -683,6 +736,18 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
         if (this.el.pickBtn) this.el.pickBtn.disabled = false;
         this.renderSelection();
         this.renderActions();
+      }
+      hasParamRow() {
+        return !!this.paramRowEl;
+      }
+      removeParamRow() {
+        const row = this.paramRowEl;
+        this.paramRowEl = null;
+        if (row) row.remove();
+      }
+      // 躲鼠标：picking 期浮层整体在左右侧之间切换（由 controller 的 mousemove 驱动）
+      setPanelSide(side) {
+        if (this.panelEl) this.panelEl.classList.toggle("side-left", side === "left");
       }
       setStatus(text, picking) {
         this.el.status.textContent = text;
@@ -850,8 +915,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
       }
       openParamRow(def) {
         if (!this.sel || !def.params) return;
-        const existing = this.el.actions.querySelector(".param-row");
-        if (existing) existing.remove();
+        this.removeParamRow();
         const row = document.createElement("div");
         row.className = "param-row";
         const values = {};
@@ -874,20 +938,21 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
             const v = values[p.key].value;
             params[p.key] = p.def && v === "" ? p.def : v;
           }
-          row.remove();
+          this.removeParamRow();
           this.execParamsAction(def.id, params);
         });
         const cancel = document.createElement("button");
         cancel.className = "act";
         cancel.textContent = "\u53D6\u6D88";
-        cancel.addEventListener("click", () => row.remove());
+        cancel.addEventListener("click", () => this.removeParamRow());
         row.append(okBtn, cancel);
         for (const input of Object.values(values)) {
           input.addEventListener("keydown", (ev) => {
             if (ev.key === "Enter") okBtn.click();
-            if (ev.key === "Escape") row.remove();
+            if (ev.key === "Escape") this.removeParamRow();
           });
         }
+        this.paramRowEl = row;
         this.el.actions.appendChild(row);
         const first = Object.values(values)[0];
         if (first) first.focus();
@@ -1027,13 +1092,40 @@ ${stringifyData(r.data ?? {})}` : String(r.error ?? "\u771F\u5B9E\u70B9\u51FB\u5
       }
     }
     class DebugController {
-      // 可定位性探测序号：探测返回时若已进入新会话/新选择则丢弃
+      // 浮层躲鼠标当前侧（picking 期联动）
       constructor() {
         this.panel = null;
         this.picker = null;
         this.session = "closed";
         this.pendingProbe = 0;
+        // 可定位性探测序号：探测返回时若已进入新会话/新选择则丢弃
+        this.dodgeSide = "right";
+        this.onEscRelayTop = (ev) => {
+          if (!this.panel) return;
+          const d = ev.detail;
+          if (d && d.host === true && this.panel.hasParamRow()) {
+            this.panel.removeParamRow();
+            return;
+          }
+          this.closePanel();
+        };
+        this.onDodgeMove = (ev) => {
+          const panel = this.panel;
+          if (!panel) return;
+          const x = ev.clientX;
+          const w = window.innerWidth;
+          if (this.dodgeSide === "right") {
+            if (x >= w - PANEL_W) {
+              this.dodgeSide = "left";
+              panel.setPanelSide("left");
+            }
+          } else if (x < PANEL_W || x < w - PANEL_W - DODGE_HYST) {
+            this.dodgeSide = "right";
+            panel.setPanelSide("right");
+          }
+        };
         this.picker = new FramePicker(true);
+        document.addEventListener(ESC_EVT, this.onEscRelayTop);
       }
       toggle() {
         if (this.panel) {
@@ -1064,15 +1156,19 @@ ${stringifyData(r.data ?? {})}` : String(r.error ?? "\u771F\u5B9E\u70B9\u51FB\u5
         this.session = "closed";
         this.picker.dispose();
         setIntercept(false, false);
+        window.removeEventListener("mousemove", this.onDodgeMove, true);
       }
       enterPicking() {
         if (!this.panel) return;
         if (this.session !== "picking") {
           this.pendingProbe++;
           this.session = "picking";
-          this.picker.startPicking((sel) => this.onLocalPick(sel), () => this.cancelPicking());
+          this.picker.startPicking((sel) => this.onLocalPick(sel), (reason) => this.onPickerAbort(reason));
           setIntercept(true, true);
           this.broadcastState("picking");
+          this.dodgeSide = "right";
+          this.panel.setPanelSide("right");
+          window.addEventListener("mousemove", this.onDodgeMove, true);
         }
         this.panel.enterPicking();
       }
@@ -1084,6 +1180,18 @@ ${stringifyData(r.data ?? {})}` : String(r.error ?? "\u771F\u5B9E\u70B9\u51FB\u5
         setIntercept(false, true);
         this.panel.exitPickNoSelect();
         this.broadcastState("idle");
+        window.removeEventListener("mousemove", this.onDodgeMove, true);
+      }
+      // 选择器会话中止（relay 与原生兜底两路都汇到这里）：reason=esc → 关闭浮层（Esc 语义
+      // 统一为关闭，正常模型下 relay 路径已由 onEscRelayTop 先行关闭，这里兜 native Esc）；
+      // reason=fail（桥缺失等）→ 留在面板，仅退出选择并提示
+      onPickerAbort(reason) {
+        if (!this.panel) return;
+        if (reason === "esc") {
+          this.closePanel();
+        } else if (this.session === "picking") {
+          this.cancelPicking();
+        }
       }
       onLocalPick(sel) {
         sel.sourceFrameId = 0;
@@ -1102,6 +1210,7 @@ ${stringifyData(r.data ?? {})}` : String(r.error ?? "\u771F\u5B9E\u70B9\u51FB\u5
         this.picker.stopPicking();
         setIntercept(false, true);
         this.broadcastState("idle");
+        window.removeEventListener("mousemove", this.onDodgeMove, true);
         this.panel.applySelection(sel, false);
         const seq = this.pendingProbe;
         this.probeLocatable(sel.chain, sel.selector).then((ok) => {
@@ -1110,8 +1219,16 @@ ${stringifyData(r.data ?? {})}` : String(r.error ?? "\u771F\u5B9E\u70B9\u51FB\u5
         }).catch(() => {
         });
       }
-      onEscFromChild() {
-        if (this.session === "picking") this.cancelPicking();
+      // 子 frame 上报的 Esc / 中止（子帧主世界把该帧 Esc 拦停中继 → 子会话经 SW 上报）：
+      // reason=esc → 关闭浮层（焦点留在 iframe 内时 Esc 也能关面板）；fail（子帧探测失败）→
+      // 仅退出选择会话、面板保留提示
+      onEscFromChild(reason) {
+        if (!this.panel) return;
+        if (reason === "fail") {
+          if (this.session === "picking") this.cancelPicking();
+          return;
+        }
+        this.closePanel();
       }
       // 面板操作路由：选中元素可能在子 frame —— 顶层走本地桥，其余经 SW 逐跳解析执行
       runCommand(command, params, chain) {
@@ -1141,27 +1258,41 @@ ${stringifyData(r.data ?? {})}` : String(r.error ?? "\u771F\u5B9E\u70B9\u51FB\u5
       constructor() {
         this.picker = null;
         this.picking = false;
+        this.onEscRelay = () => {
+          if (this.picking) return;
+          this.reportEsc("esc");
+        };
         this.picker = new FramePicker(false);
+        document.addEventListener(ESC_EVT, this.onEscRelay);
       }
       startPicking() {
         if (this.picking) return;
         this.picking = true;
-        this.picker.startPicking((sel) => this.report(sel), () => this.reportEsc());
+        this.picker.startPicking((sel) => this.report(sel), (reason) => this.onPickerAbort(reason));
       }
       stopPicking() {
+        if (!this.picking) return;
         this.picking = false;
         this.picker.stopPicking();
       }
       dispose() {
         this.picking = false;
         this.picker.dispose();
+        setIntercept(false, false);
+      }
+      // picker 会话中止（pick 之外的结束路径）：还原本帧状态并上报顶层（顶层按 reason 决定
+      // 关闭浮层或仅退出选择）
+      onPickerAbort(reason) {
+        if (!this.picking) return;
+        this.picking = false;
+        this.reportEsc(reason);
       }
       report(sel) {
         chrome.runtime.sendMessage({ type: "debug_pick_selected", payload: sel }).catch(() => {
         });
       }
-      reportEsc() {
-        chrome.runtime.sendMessage({ type: "debug_pick_esc", payload: {} }).catch(() => {
+      reportEsc(reason) {
+        chrome.runtime.sendMessage({ type: "debug_pick_esc", payload: { reason } }).catch(() => {
         });
       }
     }
@@ -1191,7 +1322,8 @@ ${stringifyData(r.data ?? {})}` : String(r.error ?? "\u771F\u5B9E\u70B9\u51FB\u5
             return true;
           }
           if (IS_TOP && msg.type === "debug_pick_esc") {
-            controller?.onEscFromChild();
+            const payload = msg.payload;
+            controller?.onEscFromChild(payload?.reason);
             sendResponse?.({ ok: true });
             return true;
           }
