@@ -49,6 +49,7 @@ const build = async () => {
   const entries = [
     { src: "src/background/service-worker.ts", out: "dist/background/service-worker.js" },
     { src: "src/content/content-script.ts",   out: "dist/content/content-script.js" },
+    { src: "src/content/debug-mode.ts",       out: "dist/content/debug-mode.js" },
     { src: "src/content/main-world.ts",       out: "dist/content/main-world.js" },
     { src: "src/popup/popup.ts",              out: "dist/popup/popup.js" },
     { src: "src/options/options.ts",          out: "dist/options/options.js" },

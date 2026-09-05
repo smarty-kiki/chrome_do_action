@@ -297,7 +297,7 @@
     }
   });
   chrome.runtime.onMessage.addListener(
-    (msg, _sender, sendResponse) => {
+    (msg, sender, sendResponse) => {
       if (msg.type === "cs_injected") {
         sendResponse({ ok: true });
         return;
@@ -316,6 +316,48 @@
         sendResponse({ status: wsClient.getStatus() });
       } else if (msg.type === "get_status") {
         sendResponse({ status: wsClient.getStatus(), retry: wsClient.getRetryState() });
+      } else if (msg.type === "debug_mode") {
+        const tabId = sender.tab?.id;
+        const state = msg.payload?.state;
+        if (tabId == null || typeof state !== "string") {
+          sendResponse({ ok: false, error: "debug_mode \u7F3A\u5C11 tab/state" });
+        } else {
+          void broadcastDebugSession(tabId, state, sendResponse);
+        }
+      } else if (msg.type === "debug_broadcast") {
+        const tabId = sender.tab?.id;
+        const command = msg.payload?.command;
+        if (tabId == null || typeof command !== "string") {
+          sendResponse({ success: false, error: "debug_broadcast \u7F3A\u5C11 tab/command" });
+        } else {
+          void broadcastDebugCommand(tabId, command, sendResponse);
+        }
+      } else if (msg.type === "debug_pick_selected" || msg.type === "debug_pick_esc") {
+        const tabId = sender.tab?.id;
+        const payload = msg.payload;
+        if (tabId == null || sender.frameId == null) {
+          sendResponse({ ok: false, error: "debug_pick \u7F3A\u5C11 tab/frame" });
+        } else {
+          void forwardDebugPick(tabId, msg.type, payload, sender.frameId, sendResponse);
+        }
+      } else if (msg.type === "debug_execute") {
+        const tabId = sender.tab?.id;
+        const payload = msg.payload;
+        if (tabId == null || !payload || typeof payload.command !== "string") {
+          sendResponse({ success: false, error: "debug_execute \u7F3A\u5C11\u53C2\u6570" });
+        } else {
+          void runDebugExecute(tabId, payload, sendResponse);
+        }
+      } else if (msg.type === "debug_real_click") {
+        const tabId = sender.tab?.id;
+        const p = msg.payload;
+        const x = p?.x;
+        const y = p?.y;
+        if (tabId == null || typeof x !== "number" || !Number.isFinite(x) || typeof y !== "number" || !Number.isFinite(y)) {
+          sendResponse({ success: false, error: "debug_real_click \u9700\u8981\u6570\u5B57\u5750\u6807 {x, y}" });
+        } else {
+          void runDebugRealClick(tabId, x, y, msg.payload?.chain, sendResponse);
+        }
       }
       return true;
     }
@@ -325,6 +367,137 @@
       autoConnect();
     }
   });
+  var DEBUG_FRAME_GONE = "\u76EE\u6807 iframe \u5DF2\u5BFC\u822A\u6216\u7ED3\u6784\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9";
+  async function broadcastDebugSession(tabId, state, sendResponse) {
+    const frames = await getFrameTree(tabId);
+    for (const f of frames) {
+      await sendToFrame(tabId, f.frameId, { type: "debug_mode", payload: { state } });
+    }
+    sendResponse({ ok: true });
+  }
+  async function broadcastDebugCommand(tabId, command, sendResponse) {
+    const frames = await getFrameTree(tabId);
+    let count = 0;
+    for (const f of frames) {
+      const { response } = await sendToFrame(tabId, f.frameId, {
+        type: "execute_command",
+        payload: { command, params: {} }
+      });
+      count += response?.data?.count ?? 0;
+    }
+    sendResponse({ success: true, data: { count } });
+  }
+  async function forwardDebugPick(tabId, type, payload, sourceFrameId, sendResponse) {
+    if (sourceFrameId === 0) {
+      sendResponse({ ok: true });
+      return;
+    }
+    const { missing } = await sendToFrame(tabId, 0, { type, payload, sourceFrameId });
+    sendResponse(missing ? { ok: false, error: "\u9876\u5C42\u8C03\u8BD5\u6D6E\u5C42\u4E0D\u53EF\u8FBE" } : { ok: true });
+  }
+  async function resolveFrameByChain(tabId, chain) {
+    const urlOf = (e) => e && (e.url || e.src) || "";
+    let current = 0;
+    for (const hop of chain) {
+      if (typeof hop?.index !== "number" || typeof hop?.url !== "string") {
+        return { ok: false, error: DEBUG_FRAME_GONE };
+      }
+      const { response } = await sendToFrame(
+        tabId,
+        current,
+        { type: "execute_command", payload: { command: "get_page_info", params: { _field: ["iframes"] } } },
+        2e3
+      );
+      const list = response?.data?.iframes;
+      if (!Array.isArray(list)) return { ok: false, error: DEBUG_FRAME_GONE };
+      const matches = (e) => {
+        const u = urlOf(e);
+        return !!u && (u === hop.url || u.startsWith(hop.url));
+      };
+      const entry = matches(list[hop.index]) ? list[hop.index] : list.find(matches);
+      if (!entry) return { ok: false, error: DEBUG_FRAME_GONE };
+      const frames = await getFrameTree(tabId);
+      const targetUrl = urlOf(entry);
+      const child = frames.find((f) => f.parentFrameId === current && f.url && (f.url === targetUrl || f.url.startsWith(targetUrl)));
+      if (!child) return { ok: false, error: DEBUG_FRAME_GONE };
+      current = child.frameId;
+    }
+    return { ok: true, frameId: current };
+  }
+  async function runDebugExecute(tabId, payload, sendResponse) {
+    const chain = Array.isArray(payload.chain) ? payload.chain : [];
+    const resolved = await resolveFrameByChain(tabId, chain);
+    if (!resolved.ok) {
+      sendResponse({ success: false, error: resolved.error });
+      return;
+    }
+    const { response, missing } = await sendToFrame(
+      tabId,
+      resolved.frameId,
+      { type: "execute_command", payload: { command: payload.command, params: payload.params ?? {} } },
+      1e4
+    );
+    if (missing) {
+      sendResponse({ success: false, error: DEBUG_FRAME_GONE });
+      return;
+    }
+    sendResponse(response ?? { success: false, error: "content script \u672A\u8FD4\u56DE\u7ED3\u679C" });
+  }
+  async function runDebugRealClick(tabId, x, y, chain, sendResponse) {
+    try {
+      await chrome.debugger.attach({ tabId }, "1.3");
+      try {
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          if (tab.windowId != null) {
+            await chrome.windows.update(tab.windowId, { focused: true });
+          }
+          await chrome.tabs.update(tabId, { active: true });
+        } catch {
+        }
+        const clickPoint = { x, y, button: "left", clickCount: 1 };
+        await moveMouseInSteps(tabId, x, y);
+        await new Promise((r) => setTimeout(r, 120));
+        await cdpSend(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...clickPoint });
+        await cdpSend(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...clickPoint });
+      } finally {
+        await chrome.debugger.detach({ tabId }).catch(() => {
+        });
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      sendResponse({ success: false, error: `\u771F\u5B9E\u70B9\u51FB\u5931\u8D25: ${detail}${/already attached/i.test(detail) ? "\uFF08DevTools/\u5176\u4ED6\u8C03\u8BD5\u5668\u5DF2\u5360\u7528\uFF0C\u8BF7\u5148\u5173\u95ED\uFF09" : ""}` });
+      return;
+    }
+    const chainArr = Array.isArray(chain) ? chain : [];
+    const resolved = await resolveFrameByChain(tabId, chainArr);
+    const settleFrameId = resolved.ok ? resolved.frameId : 0;
+    const { response: settleResp, missing } = await sendToFrame(
+      tabId,
+      settleFrameId,
+      { type: "execute_command", payload: { command: "wait_for_settle", params: { timeout: 3e3 } } },
+      8e3
+    );
+    if (missing) {
+      const tabNow = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tabNow) {
+        sendResponse({ success: false, error: "\u70B9\u51FB\u540E\u6807\u7B7E\u9875\u5DF2\u5173\u95ED\uFF0C\u7ED3\u679C\u672A\u77E5" });
+        return;
+      }
+      sendResponse({ success: true, data: { x, y, trusted: true, settleLost: true } });
+      return;
+    }
+    const settleInfo = settleResp?.data;
+    sendResponse({
+      success: true,
+      data: {
+        x,
+        y,
+        trusted: true,
+        ...settleInfo ? { settled: settleInfo.settled, settledMs: settleInfo.settledMs } : {}
+      }
+    });
+  }
   async function ensureAlarm() {
     const alarm = await chrome.alarms.get("keepalive");
     if (!alarm) {

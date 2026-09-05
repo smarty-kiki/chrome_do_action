@@ -146,7 +146,7 @@ wsClient.onMessage("command", (msg: Message) => {
 });
 
 chrome.runtime.onMessage.addListener(
-  (msg: { type: string }, _sender: chrome.runtime.MessageSender, sendResponse: (res: Record<string, unknown>) => void) => {
+  (msg: { type: string }, sender: chrome.runtime.MessageSender, sendResponse: (res: Record<string, unknown>) => void) => {
     // 内容脚本就绪信号（动态注入后，或 manifest all_frames 注入时都会发）。
     // 立即响应并关闭消息通道，不进入下面 return true 的异步保活。
     if (msg.type === "cs_injected") {
@@ -168,6 +168,55 @@ chrome.runtime.onMessage.addListener(
       sendResponse({ status: wsClient.getStatus() });
     } else if (msg.type === "get_status") {
       sendResponse({ status: wsClient.getStatus(), retry: wsClient.getRetryState() });
+    } else if (msg.type === "debug_mode") {
+      // 调试浮层会话状态：顶层 CS 广播 picking/idle/closed，SW 转播到全部 frame——
+      // 选择器按帧独立工作（事件不跨 frame 边界），各帧 CS 收到后启停本帧 picker
+      const tabId = sender.tab?.id;
+      const state = (msg as { payload?: { state?: unknown } }).payload?.state;
+      if (tabId == null || typeof state !== "string") {
+        sendResponse({ ok: false, error: "debug_mode 缺少 tab/state" });
+      } else {
+        void broadcastDebugSession(tabId, state, sendResponse);
+      }
+    } else if (msg.type === "debug_broadcast") {
+      // 全帧广播命令（还原显示 hide 等：show 可能发生在任意子帧，只还原本帧会漏）
+      const tabId = sender.tab?.id;
+      const command = (msg as { payload?: { command?: unknown } }).payload?.command;
+      if (tabId == null || typeof command !== "string") {
+        sendResponse({ success: false, error: "debug_broadcast 缺少 tab/command" });
+      } else {
+        void broadcastDebugCommand(tabId, command, sendResponse);
+      }
+    } else if (msg.type === "debug_pick_selected" || msg.type === "debug_pick_esc") {
+      // 子 frame 点选结果/Esc：子帧 CS 上报 → 转发回顶层帧（sourceFrameId 标记来源，
+      // 顶层浮层据此知道元素在哪个 frame、点选坐标是哪个 frame 的口径）
+      const tabId = sender.tab?.id;
+      const payload = (msg as { payload?: unknown }).payload;
+      if (tabId == null || sender.frameId == null) {
+        sendResponse({ ok: false, error: "debug_pick 缺少 tab/frame" });
+      } else {
+        void forwardDebugPick(tabId, msg.type, payload, sender.frameId, sendResponse);
+      }
+    } else if (msg.type === "debug_execute") {
+      // 对选中元素所在 frame 执行单页动作（frameChain 逐跳解析目标 frame）
+      const tabId = sender.tab?.id;
+      const payload = (msg as { payload?: DebugExecutePayload }).payload;
+      if (tabId == null || !payload || typeof payload.command !== "string") {
+        sendResponse({ success: false, error: "debug_execute 缺少参数" });
+      } else {
+        void runDebugExecute(tabId, payload, sendResponse);
+      }
+    } else if (msg.type === "debug_real_click") {
+      // 调试浮层版真实点击：坐标已是顶层视口口径，CDP 序列同远程 real_click
+      const tabId = sender.tab?.id;
+      const p = (msg as { payload?: { x?: unknown; y?: unknown } }).payload;
+      const x = p?.x;
+      const y = p?.y;
+      if (tabId == null || typeof x !== "number" || !Number.isFinite(x) || typeof y !== "number" || !Number.isFinite(y)) {
+        sendResponse({ success: false, error: "debug_real_click 需要数字坐标 {x, y}" });
+      } else {
+        void runDebugRealClick(tabId, x, y, (msg as { payload?: { chain?: DebugChainHop[] } }).payload?.chain, sendResponse);
+      }
     }
     return true;
   },
@@ -178,6 +227,205 @@ chrome.alarms.onAlarm.addListener((alarm: chrome.alarms.Alarm) => {
     autoConnect();
   }
 });
+
+// ============================ 调试模式路由（v0.18.0） ============================
+// 顶层 content script（debug-mode.js）把浮层操作经 runtime 消息转发到这里执行：
+//   debug_mode         会话状态广播 → 转播到全部 frame（各帧选择器独立启停）
+//   debug_broadcast    全帧执行同一命令（hide 还原显示等）→ 聚合 count 返回
+//   debug_pick_*       子 frame 点选结果/Esc → 转发回顶层帧（sourceFrameId 标记来源）
+//   debug_execute      按 frameChain 逐跳解析目标 frameId，复用 execute_command → CS 通道
+//   debug_real_click   面板版真实点击：CDP 序列与远程 real_click 对齐（无 approach 轨迹）
+// frameChain：选择元素时主世界 geo oracle 沿同源链逐层记录的「父文档 iframe 的 DOM
+// 序号 + 该层 url」快照（顶层→深层顺序）；每跳解析都向当前帧 CS 要最新 iframes 列表
+// 重新核对——任何一层对不上都说明页面结构已变，让用户重新选择（不做注入重试：
+// all_frames 已自动注入，逐跳 get_page_info 本身就是存活探针）。
+interface DebugChainHop {
+  index: number;
+  url: string;
+}
+interface DebugExecutePayload {
+  command: string;
+  params?: Record<string, unknown>;
+  chain?: unknown;
+}
+const DEBUG_FRAME_GONE = "目标 iframe 已导航或结构变化，请重新选择";
+
+async function broadcastDebugSession(
+  tabId: number,
+  state: string,
+  sendResponse: (res: Record<string, unknown>) => void,
+): Promise<void> {
+  const frames = await getFrameTree(tabId);
+  for (const f of frames) {
+    await sendToFrame(tabId, f.frameId, { type: "debug_mode", payload: { state } });
+  }
+  sendResponse({ ok: true });
+}
+
+// 全帧执行同一命令（hide：各 frame 各自还原本帧 show 过的元素；count 聚合）
+async function broadcastDebugCommand(
+  tabId: number,
+  command: string,
+  sendResponse: (res: Record<string, unknown>) => void,
+): Promise<void> {
+  const frames = await getFrameTree(tabId);
+  let count = 0;
+  for (const f of frames) {
+    const { response } = await sendToFrame(tabId, f.frameId, {
+      type: "execute_command",
+      payload: { command, params: {} },
+    });
+    count += (response?.data as { count?: number } | undefined)?.count ?? 0;
+  }
+  sendResponse({ success: true, data: { count } });
+}
+
+async function forwardDebugPick(
+  tabId: number,
+  type: string,
+  payload: unknown,
+  sourceFrameId: number,
+  sendResponse: (res: Record<string, unknown>) => void,
+): Promise<void> {
+  // 顶层自身不发此类消息（防御）；子帧上报 → 顶层帧 CS 的 onMessage 处理
+  if (sourceFrameId === 0) {
+    sendResponse({ ok: true });
+    return;
+  }
+  const { missing } = await sendToFrame(tabId, 0, { type, payload, sourceFrameId });
+  sendResponse(missing ? { ok: false, error: "顶层调试浮层不可达" } : { ok: true });
+}
+
+// frameChain 逐跳解析：目标帧 frameId（顶层元素链为空 → 直接返回 0）
+async function resolveFrameByChain(
+  tabId: number,
+  chain: DebugChainHop[],
+): Promise<{ ok: true; frameId: number } | { ok: false; error: string }> {
+  const urlOf = (e: { url?: string; src?: string } | undefined): string => (e && (e.url || e.src)) || "";
+  let current = 0; // 顶层 frameId；每跳后推进到该层 iframe 对应的子 frame
+  for (const hop of chain) {
+    if (typeof hop?.index !== "number" || typeof hop?.url !== "string") {
+      return { ok: false, error: DEBUG_FRAME_GONE };
+    }
+    // 1. 向当前帧 CS 取 iframes 列表（收不到响应 = 该帧 CS 已失联，链不可续）
+    const { response } = await sendToFrame(
+      tabId,
+      current,
+      { type: "execute_command", payload: { command: "get_page_info", params: { _field: ["iframes"] } } },
+      2000,
+    );
+    const list = (response?.data as { iframes?: { index: number; src?: string; url?: string }[] } | undefined)?.iframes;
+    if (!Array.isArray(list)) return { ok: false, error: DEBUG_FRAME_GONE };
+    // 2. 定位这一跳的 iframe 条目：DOM 序号直取；url 对不上则全表按 url 再找
+    //    （容忍 iframe 增删导致的位置漂移）；仍无 → 结构已变
+    const matches = (e: { url?: string; src?: string } | undefined): boolean => {
+      const u = urlOf(e);
+      return !!u && (u === hop.url || u.startsWith(hop.url));
+    };
+    const entry = matches(list[hop.index]) ? list[hop.index] : list.find(matches);
+    if (!entry) return { ok: false, error: DEBUG_FRAME_GONE };
+    // 3. 在 frame 树里找 parentFrameId === current、url 匹配的子 frame
+    const frames = await getFrameTree(tabId);
+    const targetUrl = urlOf(entry);
+    const child = frames.find((f) => f.parentFrameId === current && f.url && (f.url === targetUrl || f.url.startsWith(targetUrl)));
+    if (!child) return { ok: false, error: DEBUG_FRAME_GONE };
+    current = child.frameId;
+  }
+  return { ok: true, frameId: current };
+}
+
+async function runDebugExecute(
+  tabId: number,
+  payload: DebugExecutePayload,
+  sendResponse: (res: Record<string, unknown>) => void,
+): Promise<void> {
+  const chain = Array.isArray(payload.chain) ? (payload.chain as DebugChainHop[]) : [];
+  const resolved = await resolveFrameByChain(tabId, chain);
+  if (!resolved.ok) {
+    sendResponse({ success: false, error: resolved.error });
+    return;
+  }
+  const { response, missing } = await sendToFrame(
+    tabId,
+    resolved.frameId,
+    { type: "execute_command", payload: { command: payload.command, params: payload.params ?? {} } },
+    10000,
+  );
+  if (missing) {
+    // noreceiver/portclosed/timeout：执行帧已不可达（写命令可能已执行——如实报错重选）
+    sendResponse({ success: false, error: DEBUG_FRAME_GONE });
+    return;
+  }
+  // CS 执行结果（success/data/error/notFound/navigated）原样透传，浮层按字段渲染
+  sendResponse(response ?? { success: false, error: "content script 未返回结果" });
+}
+
+async function runDebugRealClick(
+  tabId: number,
+  x: number,
+  y: number,
+  chain: DebugChainHop[] | undefined,
+  sendResponse: (res: Record<string, unknown>) => void,
+): Promise<void> {
+  // 复用远程 real_click 的 CDP 序列（attach → 激活窗口/tab → 渐进移动 → 停留 → 按下/松开）。
+  // debugger attach 会显示"正在调试此浏览器"提示条——与远程 real_click 一致的已知表现。
+  try {
+    await chrome.debugger.attach({ tabId }, "1.3");
+    try {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.windowId != null) {
+          await chrome.windows.update(tab.windowId, { focused: true });
+        }
+        await chrome.tabs.update(tabId, { active: true });
+      } catch {
+        // 窗口激活失败不阻断，继续尝试点击
+      }
+      const clickPoint = { x, y, button: "left" as const, clickCount: 1 };
+      await moveMouseInSteps(tabId, x, y);
+      // 短暂停留让 hover/样式生效（与远程路径的 120ms 一致）
+      await new Promise((r) => setTimeout(r, 120));
+      await cdpSend(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...clickPoint });
+      await cdpSend(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...clickPoint });
+    } finally {
+      await chrome.debugger.detach({ tabId }).catch(() => {});
+    }
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    sendResponse({ success: false, error: `真实点击失败: ${detail}${/already attached/i.test(detail) ? "（DevTools/其他调试器已占用，请先关闭）" : ""}` });
+    return;
+  }
+
+  // 等影响落地：向元素所在 frame 发 settle（链解析失败/顶层元素 → 顶层帧，
+  // 与远程 x/y 坐标点击的 settle 回退语义一致）
+  const chainArr = Array.isArray(chain) ? chain : [];
+  const resolved = await resolveFrameByChain(tabId, chainArr);
+  const settleFrameId = resolved.ok ? resolved.frameId : 0;
+  const { response: settleResp, missing } = await sendToFrame(
+    tabId,
+    settleFrameId,
+    { type: "execute_command", payload: { command: "wait_for_settle", params: { timeout: 3000 } } },
+    8000,
+  );
+  if (missing) {
+    // 点击本身（CDP trusted）已确定执行：失联只影响 settle 确认——不编造 settle 结果
+    const tabNow = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tabNow) {
+      sendResponse({ success: false, error: "点击后标签页已关闭，结果未知" });
+      return;
+    }
+    sendResponse({ success: true, data: { x, y, trusted: true, settleLost: true } });
+    return;
+  }
+  const settleInfo = settleResp?.data as { settled?: boolean; settledMs?: number } | undefined;
+  sendResponse({
+    success: true,
+    data: {
+      x, y, trusted: true,
+      ...(settleInfo ? { settled: settleInfo.settled, settledMs: settleInfo.settledMs } : {}),
+    },
+  });
+}
 
 async function ensureAlarm(): Promise<void> {
   const alarm = await chrome.alarms.get("keepalive");

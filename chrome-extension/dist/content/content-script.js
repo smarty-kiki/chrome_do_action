@@ -1059,7 +1059,7 @@
           } catch {
           }
         };
-        observeRoot(document.body);
+        if (document.body) observeRoot(document.body);
         for (const sr of openShadowRootsDeep(document)) observeRoot(sr);
       } catch {
       }
@@ -1450,7 +1450,7 @@
     }
     return findCssPierced(selector);
   }
-  function genSelector(el) {
+  function genSelector(el, rootDoc = document) {
     const esc = (s) => CSS.escape(s);
     const nthOfType = (e) => {
       let n = 1;
@@ -1462,9 +1462,9 @@
     const segs = [];
     let cur = el;
     let lastCross = false;
-    while (cur && cur !== document.body && cur !== document.documentElement) {
+    while (cur && cur !== rootDoc.body && cur !== rootDoc.documentElement) {
       let seg;
-      if (cur.id && document.querySelectorAll(`#${esc(cur.id)}`).length === 1) {
+      if (cur.id && rootDoc.querySelectorAll(`#${esc(cur.id)}`).length === 1) {
         seg = `#${esc(cur.id)}`;
         if (segs.length > 0) segs[0].cross = lastCross;
         segs.unshift({ seg, cross: false });
@@ -1497,4 +1497,9 @@
   }
   chrome.runtime.sendMessage({ type: "cs_injected" }).catch(() => {
   });
+  var __cdaDebugBridge = {
+    handleCommand,
+    genSelector
+  };
+  window.__cdaDebug = __cdaDebugBridge;
 })();

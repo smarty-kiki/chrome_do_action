@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chrome Do Action",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Remote control browser via WebSocket",
   "permissions": [
     "storage",
@@ -33,7 +33,8 @@
         "<all_urls>"
       ],
       "js": [
-        "content/content-script.js"
+        "content/content-script.js",
+        "content/debug-mode.js"
       ],
       "run_at": "document_idle",
       "all_frames": true

@@ -368,7 +368,7 @@ async function handleCommand(
         // 返回 iframe 本地坐标，由 service worker 走 CDP getContentQuads 精确定位。
         const selector = params.selector as string;
         if (!selector && !params.text) return { success: false, error: 'Need "selector" or "text" parameter' };
-        const el = (params.text ? findByText(params.text) : findElement(selector)) as HTMLElement | null;
+        const el = (params.text ? findByText(params.text as string) : findElement(selector)) as HTMLElement | null;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text || selector}` };
         // scroll:true（real_click 专用）：先滚进视口再测坐标——real_click 按坐标派发
         // CDP 真实鼠标事件，目标在视口外时坐标落在页面外，点击会静默落空。
@@ -1251,7 +1251,7 @@ function waitForSettled(maxWaitMs: number): Promise<{ waited: number }> {
   const ACTIVITY_WINDOW_MS = 600;
   const start = Date.now();
   return new Promise((resolve) => {
-    let quiet: { cancel: () => void } | undefined;
+    let quiet: ReturnType<typeof throttleSafeTimer> | undefined;
     let inQuiet = false;
     let done = false;
     const finish = () => {
@@ -1299,12 +1299,12 @@ function waitForSettled(maxWaitMs: number): Promise<{ waited: number }> {
       domObserver = new MutationObserver(() => onActivity());
       // MutationObserver 不穿透 shadow boundary：除 document.body 外，对当前所有
       // open shadow root 也挂观察（shadow tree 内的文字/属性/结构变化同样算活动信号）
-      const observeRoot = (root: Document | ShadowRoot) => {
+      const observeRoot = (root: Node) => {
         try {
           domObserver?.observe(root, { childList: true, subtree: true, attributes: true, characterData: true });
         } catch { /* 单个 root 失败忽略 */ }
       };
-      observeRoot(document.body);
+      if (document.body) observeRoot(document.body);
       for (const sr of openShadowRootsDeep(document)) observeRoot(sr);
     } catch { /* body 不存在等极端情况：跳过 DOM 信号 */ }
     let longtaskObserver: PerformanceObserver | undefined;
@@ -1360,9 +1360,10 @@ async function waitForCondition(
 
 // 在指定上下文内按文本 XPath 查找第一个可见元素（light DOM 与 shadow root 共用，
 // shadow tree 内没有 body，用不带 //body// 前缀的变体）
-function evalTextXPath(xpath: string, context: Document | ShadowRoot): Element | null {
+function evalTextXPath(xpath: string, context: Document | ShadowRoot | Element): Element | null {
   // Chrome 的 document.evaluate 不接受 ShadowRoot（#document-fragment）作 context node，
-  // 对 shadow tree 改按顶层子元素逐个求值（// 相对 context 节点展开，覆盖整棵子树）
+  // 对 shadow tree 改按顶层子元素逐个求值（// 相对 context 节点展开，覆盖整棵子树；
+  // 子元素是 Element，递归落入下方 evaluate 分支，Element 与 Document 同为合法 context）
   if (context instanceof ShadowRoot) {
     for (const child of Array.from(context.children)) {
       const hit = evalTextXPath(xpath, child);
@@ -1744,7 +1745,9 @@ function findElement(selector: string): Element | null {
 // 生成稳定可复用的 CSS 选择器（list_elements 返回，agent 可直接用于 click/type/upload_file 等）：
 // 优先全局唯一 id；否则逐级构建 tag+前 2 个稳定类 / tag:nth-of-type 路径；
 // 元素在 open shadow root 内时跨边界段用 >>> 连接（与 findElement 的穿透语义一致）
-function genSelector(el: Element): string {
+// rootDoc 参数：iframe 内元素传 el.ownerDocument（id 唯一性检查与 body 停止条件都要
+// 在元素所属文档内判定，否则生成的选择器在子 frame 里查不到/误用顶层文档判唯一）。
+function genSelector(el: Element, rootDoc: Document = document): string {
   const esc = (s: string) => CSS.escape(s);
   const nthOfType = (e: Element): number => {
     let n = 1;
@@ -1756,9 +1759,9 @@ function genSelector(el: Element): string {
   const segs: { seg: string; cross: boolean }[] = [];
   let cur: Element | null = el;
   let lastCross = false;
-  while (cur && cur !== document.body && cur !== document.documentElement) {
+  while (cur && cur !== rootDoc.body && cur !== rootDoc.documentElement) {
     let seg: string;
-    if (cur.id && document.querySelectorAll(`#${esc(cur.id)}`).length === 1) {
+    if (cur.id && rootDoc.querySelectorAll(`#${esc(cur.id)}`).length === 1) {
       seg = `#${esc(cur.id)}`;
       // 唯一 id 已能唯一定位，祖先路径全部冗余——截断，selector 短且不受祖先结构变化影响
       if (segs.length > 0) segs[0].cross = lastCross;
@@ -1799,3 +1802,12 @@ function genSelector(el: Element): string {
 // 就绪信号：动态注入（chrome.scripting.executeScript）时告知 service worker 已注册完成；
 // manifest 正常注入（all_frames）时由 service worker 常驻 listener 静默响应，无副作用。
 chrome.runtime.sendMessage({ type: "cs_injected" }).catch(() => {});
+
+// 调试模式桥：debug-mode.js 与 content-script.js 同属一个 content_scripts 项（同隔离世界、
+// 同文档、按 js 数组顺序加载），后加载的 debug-mode.js 经 window.__cdaDebug 复用本文件的
+// 命令执行与选择器生成，不重复实现也不改动上方任何逻辑。
+const __cdaDebugBridge = {
+  handleCommand,
+  genSelector,
+};
+(window as unknown as { __cdaDebug?: unknown }).__cdaDebug = __cdaDebugBridge;
