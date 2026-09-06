@@ -283,6 +283,10 @@
       handleRealClick(cmd);
       return;
     }
+    if (cmd.payload.command === "upload_dragdrop" && cmd.payload.params?.trusted === true) {
+      handleTrustedDrop(cmd);
+      return;
+    }
     const tabId = cmd.payload.params?.tabId;
     const params = { ...cmd.payload.params };
     delete params.tabId;
@@ -716,7 +720,7 @@
     }
     const isCoordinateClick = isClick && params.x !== void 0 && params.y !== void 0;
     const searchable = ELEMENT_SEARCH_COMMANDS.has(command) && !isCoordinateClick;
-    const destructive = /* @__PURE__ */ new Set(["click", "type", "keyboard", "trigger", "upload_file", "upload_dragdrop", "paste_rich"]);
+    const destructive = /* @__PURE__ */ new Set(["click", "type", "keyboard", "trigger", "upload_file", "upload_dragdrop", "paste_rich", "set_cursor"]);
     const isSlow = destructive.has(command);
     let response;
     let matchedFrame;
@@ -913,7 +917,7 @@
       return [];
     }
   }
-  var ELEMENT_SEARCH_COMMANDS = /* @__PURE__ */ new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "upload_dragdrop", "paste_rich", "get_rect", "get_prop", "trigger"]);
+  var ELEMENT_SEARCH_COMMANDS = /* @__PURE__ */ new Set(["click", "type", "keyboard", "get_text", "show", "upload_file", "upload_dragdrop", "paste_rich", "get_rect", "get_prop", "trigger", "set_cursor", "get_cursor"]);
   var frameTreeCache = /* @__PURE__ */ new Map();
   chrome.tabs.onUpdated.addListener((tabId, info) => {
     if (info.status === "complete") frameTreeCache.delete(tabId);
@@ -1588,6 +1592,170 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       sendResult({ success: false, error: `Unexpected error while running "${cmd.payload.command}": ${detail} (please report this to cda)` });
+    }
+  }
+  async function handleTrustedDrop(cmd) {
+    const params = cmd.payload.params || {};
+    let tabId = params.tabId;
+    const selector = params.selector;
+    const fieldFilter = params._field || [];
+    function sendResult(payload) {
+      wsClient.send({
+        type: "command_result",
+        payload: { commandId: cmd.id, ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data }
+      });
+    }
+    const data = params.data;
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      sendResult({ success: false, error: 'upload_dragdrop (trusted mode) needs "data": {"path": "/abs/path"}' });
+      return;
+    }
+    const path = data.path;
+    if (typeof path !== "string" || !path) {
+      sendResult({
+        success: false,
+        error: 'upload_dragdrop (trusted mode) needs "data.path" \u2014 an absolute path to a file on the machine running Chrome. base64/url payloads belong to the synthetic (non-trusted) path: omit trusted:true for those'
+      });
+      return;
+    }
+    if (!(path.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(path) || path.startsWith("\\\\"))) {
+      sendResult({ success: false, error: `data.path must be absolute (got: ${path})` });
+      return;
+    }
+    if (data.base64 !== void 0 || data.url !== void 0) {
+      sendResult({
+        success: false,
+        error: 'trusted mode only accepts "data.path"; "base64"/"url" go through the synthetic (non-trusted) path \u2014 drop trusted:true for those'
+      });
+      return;
+    }
+    const filename = path.split(/[\\/]/).filter(Boolean).pop() || path;
+    try {
+      if (tabId == null) {
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const tid = tabs[0]?.id;
+        if (tid == null) {
+          sendResult({ success: false, error: "No active tab" });
+          return;
+        }
+        tabId = tid;
+      }
+      let x = params.x;
+      let y = params.y;
+      let cdpFrameId;
+      let hitFrame;
+      if (x == null || y == null) {
+        if (!selector && !params.text) {
+          sendResult({ success: false, error: 'upload_dragdrop (trusted mode) needs "selector", "text", or {x, y}' });
+          return;
+        }
+        const frames = await resolveSearchFrames(tabId, params.frame);
+        for (const f of frames) {
+          const r = await sendToFrame(tabId, f.frameId, {
+            type: "execute_command",
+            payload: { command: "get_rect", params: { selector, text: params.text, scroll: true } }
+          }, 8e3);
+          if (r.missing || r.response?.notFound) continue;
+          const d = r.response?.data;
+          if (d?.crossOrigin) {
+            cdpFrameId = f.frameId;
+            hitFrame = f;
+            break;
+          }
+          x = d?.x;
+          y = d?.y;
+          hitFrame = f;
+          break;
+        }
+      }
+      if (x == null || y == null) {
+        sendResult({ success: false, error: `Could not locate element: ${selector || params.text || "unknown"}` });
+        return;
+      }
+      await chrome.debugger.attach({ tabId }, "1.3");
+      try {
+        if (cdpFrameId != null) {
+          const point = await getElementCenterViaCdp(tabId, cdpFrameId, params);
+          if (!point) {
+            sendResult({ success: false, error: `Could not locate element in iframe via CDP: ${selector}` });
+            return;
+          }
+          x = point.x;
+          y = point.y;
+        }
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          if (tab.windowId != null) {
+            await chrome.windows.update(tab.windowId, { focused: true });
+          }
+          await chrome.tabs.update(tabId, { active: true });
+        } catch {
+        }
+        await moveMouseInSteps(tabId, x, y);
+        await new Promise((r) => setTimeout(r, 120));
+        const dragData = { files: [path], items: [], dragOperationsMask: 1 };
+        await cdpSend(tabId, "Input.dispatchDragEvent", { type: "dragEnter", x, y, data: dragData });
+        await new Promise((r) => setTimeout(r, 120));
+        await cdpSend(tabId, "Input.dispatchDragEvent", { type: "dragOver", x, y, data: dragData });
+        await new Promise((r) => setTimeout(r, 80));
+        await cdpSend(tabId, "Input.dispatchDragEvent", { type: "drop", x, y, data: dragData });
+      } finally {
+        await chrome.debugger.detach({ tabId }).catch(() => {
+        });
+      }
+      const settleFrameId = hitFrame ? hitFrame.frameId : 0;
+      const tabBefore = await chrome.tabs.get(tabId).catch(() => null);
+      const beforeUrl = tabBefore?.url || "";
+      const { response: settleResp, missing } = await sendToFrame(tabId, settleFrameId, {
+        type: "execute_command",
+        payload: { command: "wait_for_settle", params: { timeout: 3e3, wait_for: params.waitFor } }
+      }, 8e3);
+      const settleInfo = settleResp?.data;
+      if (missing) {
+        const tabNow = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tabNow) {
+          sendResult({ success: false, error: "Tab was closed during the real drop \u2014 outcome unknown" });
+          return;
+        }
+        const frames = await getFrameTree(tabId);
+        const now = frames.find((f) => f.frameId === settleFrameId);
+        const navigatedNow = !!beforeUrl && !!tabNow.url && tabNow.url !== beforeUrl || settleFrameId !== 0 && !now || !!now && !!hitFrame?.url && !!now.url && now.url !== hitFrame.url;
+        if (navigatedNow) {
+          sendResult({
+            success: true,
+            data: {
+              selector,
+              filename,
+              x,
+              y,
+              trusted: true,
+              settleLost: true,
+              ...params.waitFor ? { waitFor: { settled: false, skipped: "page navigated after the drop \u2014 condition not evaluated" } } : {}
+            }
+          });
+          return;
+        }
+        if (params.waitFor) {
+          sendResult({ success: false, error: "waitFor could not be verified: content script unresponsive after the real drop (the drop itself was dispatched)" });
+          return;
+        }
+        sendResult({ success: true, data: { selector, filename, x, y, trusted: true, settleLost: true } });
+        return;
+      }
+      sendResult({
+        success: true,
+        data: {
+          selector,
+          filename,
+          x,
+          y,
+          trusted: true,
+          ...settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {} } : {}
+        }
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      sendResult({ success: false, error: `Unexpected error while running "upload_dragdrop" (trusted mode): ${detail} (please report this to cda)` });
     }
   }
   async function getElementCenterViaCdp(tabId, frameId, params) {

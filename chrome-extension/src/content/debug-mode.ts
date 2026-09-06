@@ -759,7 +759,6 @@ const ACTIONS: ActionDef[] = [
   { id: "upload_file", label: "选择文件上传", group: "file", needsLocatable: true, file: true },
   { id: "upload_drop", label: "拖拽上传", group: "drop", needsLocatable: true, file: true },
   { id: "get_text", label: "读取文本", group: "common", needsLocatable: true },
-  { id: "get_css", label: "读取样式", group: "common", needsLocatable: true },
   { id: "get_prop", label: "读取属性", group: "common", needsLocatable: true, params: [{ key: "prop", label: "属性", def: "value", placeholder: "如 value / checked / href" }] },
   { id: "show", label: "强制显示", group: "common", needsLocatable: true },
 ];
@@ -1079,9 +1078,6 @@ class DebugPanel {
         break;
       case "get_text":
         this.exec(this.runInFrame("get_text", { selector: s.selector }, s.chain), "get_text");
-        break;
-      case "get_css":
-        this.exec(this.runInFrame("get_css", { selector: s.selector }, s.chain), "get_css");
         break;
       case "show":
         this.exec(this.runInFrame("show", { selector: s.selector }, s.chain), "show");

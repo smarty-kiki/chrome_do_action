@@ -35,6 +35,49 @@
     document.dispatchEvent(new CustomEvent(MAIN_ERROR_SYNC_EVT));
   } catch {
   }
+  var MAIN_ACTION_EVT = "__cda_main_action__";
+  var MAIN_ACTION_REPLY_EVT = "__cda_main_action_reply__";
+  var mainPending = /* @__PURE__ */ new Map();
+  var mainSeq = 0;
+  function onMainActionReply(detail) {
+    const d = detail;
+    if (!d || typeof d !== "object" || typeof d.requestId !== "number") return;
+    const p = mainPending.get(d.requestId);
+    if (!p) return;
+    mainPending.delete(d.requestId);
+    window.clearTimeout(p.timer);
+    const { requestId, ...rest } = d;
+    p.resolve({ ...rest, ok: rest.ok === true });
+  }
+  document.addEventListener(
+    MAIN_ACTION_REPLY_EVT,
+    (ev) => onMainActionReply(ev.detail)
+  );
+  window.addEventListener("message", (ev) => {
+    const m = ev.data;
+    if (m && typeof m === "object" && m.__cdaMain === MAIN_ACTION_REPLY_EVT) {
+      onMainActionReply(m.detail);
+    }
+  });
+  function requestMainWorld(action, params, timeoutMs = 500) {
+    const requestId = ++mainSeq;
+    return new Promise((resolve) => {
+      const timer = window.setTimeout(() => {
+        mainPending.delete(requestId);
+        resolve({ ok: false, error: "\u4E3B\u4E16\u754C\u65E0\u5E94\u7B54\uFF08\u4E3B\u4E16\u754C\u811A\u672C\u672A\u6CE8\u5165\u6216\u6267\u884C\u5F02\u5E38\uFF09" });
+      }, timeoutMs);
+      mainPending.set(requestId, { resolve, timer });
+      const detail = { requestId, action, ...params };
+      try {
+        document.dispatchEvent(new CustomEvent(MAIN_ACTION_EVT, { detail }));
+      } catch {
+      }
+      try {
+        window.postMessage({ __cdaMain: MAIN_ACTION_EVT, detail }, "*");
+      } catch {
+      }
+    });
+  }
   var showRegistry = /* @__PURE__ */ new Map();
   function restoreShownElement(el) {
     const orig = showRegistry.get(el);
@@ -558,7 +601,7 @@
           }
           const dt = new DataTransfer();
           dt.items.add(file);
-          for (const type of ["dragenter", "dragover", "drop"]) {
+          for (const type of ["dragenter", "dragover", "drop", "dragleave"]) {
             el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
           }
           const stable = await waitForSettled(3e3);
@@ -617,26 +660,12 @@
               }
             }
           }
-          const toPlainText = (markup) => {
-            const probe = document.createElement("div");
-            probe.style.cssText = "position:fixed;left:-9999px;top:0";
-            probe.innerHTML = markup;
-            document.body.appendChild(probe);
-            const text = probe.innerText;
-            probe.remove();
-            return text;
-          };
-          const dt = new DataTransfer();
-          dt.setData("text/plain", toPlainText(html));
-          dt.setData("text/html", html);
-          const pasteEvt = new ClipboardEvent("paste", { bubbles: true, cancelable: true, composed: true });
-          Object.defineProperty(pasteEvt, "clipboardData", { value: dt });
           const before = (el.textContent || "").length;
-          el.dispatchEvent(pasteEvt);
+          const pasteResult = await requestMainWorld("paste_dispatch", { html });
           await waitForSettled(3e3);
           const changed = el.textContent !== null && el.textContent.length !== before;
           let pipeline;
-          if (pasteEvt.defaultPrevented) {
+          if (pasteResult.ok && pasteResult.defaultPrevented) {
             pipeline = "editor_paste";
           } else if (changed) {
             pipeline = "default_paste";
@@ -739,28 +768,88 @@
           if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           return { success: true, data: el.textContent ?? "" };
         }
-        case "get_css": {
+        case "set_cursor": {
+          const known = ["selector", "text", "occurrence", "position", "frame", "waitFor"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown set_cursor parameter(s): ${unknown.join(", ")} (expected selector, text, occurrence, position, waitFor)` };
+          }
+          const selector = params.selector;
+          const text = params.text;
+          const occurrence = params.occurrence === void 0 ? 1 : params.occurrence;
+          const position = params.position === void 0 ? "after" : params.position;
+          if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
+          if (typeof text !== "string" || !text) return { success: false, error: 'Need "text" parameter (a string)' };
+          if (typeof occurrence !== "number" || !Number.isInteger(occurrence) || occurrence < 1) {
+            return { success: false, error: `"occurrence" must be a positive integer (got ${JSON.stringify(params.occurrence)})` };
+          }
+          if (position !== "before" && position !== "after" && position !== "start" && position !== "end") {
+            return { success: false, error: `Invalid position: ${JSON.stringify(params.position)} (expected before|after|start|end)` };
+          }
+          const el = findElement(selector);
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+          if (!el.isContentEditable) {
+            return { success: false, error: `Element is not contenteditable: ${selector} (tag=${el.tagName})` };
+          }
+          const placed = await requestMainWorld("caret_set", { selector, text, occurrence, position });
+          if (!placed.ok) {
+            return { success: false, error: typeof placed.error === "string" ? placed.error : "caret_set failed" };
+          }
+          const stable = await waitForSettled(3e3);
+          const waitForResult = params.waitFor ? await waitForCondition(params.waitFor, 3e3) : null;
+          const readback = await requestMainWorld("caret_get", { selector });
+          if (!readback.ok) {
+            return { success: false, error: typeof readback.error === "string" ? readback.error : "caret_get failed" };
+          }
+          if (readback.inEditor !== true) {
+            return { success: false, error: "\u5149\u6807\u672A\u88AB\u7F16\u8F91\u5668\u4FDD\u6301\uFF1A\u843D\u70B9\u540E\u5149\u6807\u4E0D\u5728\u7F16\u8F91\u5668\u5185\uFF08\u7126\u70B9\u88AB\u62D2\u6216\u9009\u533A\u88AB\u9875\u9762\u63A5\u7BA1\uFF09" };
+          }
+          const cursorData = {
+            selector,
+            position,
+            // 请求的相对位置（落点是否被编辑器归整看 row/col）
+            row: readback.row,
+            // 0 基行号：编辑器归整后的实际光标所在行
+            col: readback.col,
+            // 行内 JS UTF-16 偏移（可直接对下方 text 做 slice(0,col) 对账）
+            text: readback.text,
+            // 光标所在行逻辑全文（含定位目标的上下文）
+            settledMs: stable.waited
+          };
+          if (waitForResult) cursorData.waitFor = waitForResult;
+          return { success: true, data: cursorData };
+        }
+        case "get_cursor": {
           const known = ["selector", "frame"];
           const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
           if (unknown.length) {
-            return { success: false, error: `Unknown get_css parameter(s): ${unknown.join(", ")} (expected selector)` };
+            return { success: false, error: `Unknown get_cursor parameter(s): ${unknown.join(", ")} (expected selector)` };
           }
           const selector = params.selector;
           if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
-          const isCss = selector.startsWith("css:");
-          const query = isCss ? selector.slice(4) : selector;
-          const nodes = isCss ? findAllPierced(query) : [findElement(selector)].filter(Boolean);
-          if (nodes.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
-          const results = Array.from(nodes).map((el, i) => {
-            const computed = window.getComputedStyle(el);
-            const css = {};
-            for (let j = 0; j < computed.length; j++) {
-              const prop = computed[j];
-              css[prop] = computed.getPropertyValue(prop);
+          const el = findElement(selector);
+          if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+          if (!el.isContentEditable) {
+            return { success: false, error: `Element is not contenteditable: ${selector} (tag=${el.tagName})` };
+          }
+          const read = await requestMainWorld("caret_get", { selector });
+          if (!read.ok) {
+            return { success: false, error: typeof read.error === "string" ? read.error : "caret_get failed" };
+          }
+          return {
+            success: true,
+            data: {
+              selector,
+              inEditor: read.inEditor === true,
+              // 光标是否在该编辑器内；false 时下方三项为 null
+              row: read.row,
+              // 0 基行号
+              col: read.col,
+              // 行内 JS UTF-16 偏移
+              text: read.text
+              // 光标所在行逻辑全文
             }
-            return { index: i, css };
-          });
-          return { success: true, data: { selector, count: nodes.length, results } };
+          };
         }
         case "frame_info": {
           return {

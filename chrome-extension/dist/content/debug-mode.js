@@ -582,7 +582,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
       { id: "upload_file", label: "\u9009\u62E9\u6587\u4EF6\u4E0A\u4F20", group: "file", needsLocatable: true, file: true },
       { id: "upload_drop", label: "\u62D6\u62FD\u4E0A\u4F20", group: "drop", needsLocatable: true, file: true },
       { id: "get_text", label: "\u8BFB\u53D6\u6587\u672C", group: "common", needsLocatable: true },
-      { id: "get_css", label: "\u8BFB\u53D6\u6837\u5F0F", group: "common", needsLocatable: true },
       { id: "get_prop", label: "\u8BFB\u53D6\u5C5E\u6027", group: "common", needsLocatable: true, params: [{ key: "prop", label: "\u5C5E\u6027", def: "value", placeholder: "\u5982 value / checked / href" }] },
       { id: "show", label: "\u5F3A\u5236\u663E\u793A", group: "common", needsLocatable: true }
     ];
@@ -877,9 +876,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Ping
             break;
           case "get_text":
             this.exec(this.runInFrame("get_text", { selector: s.selector }, s.chain), "get_text");
-            break;
-          case "get_css":
-            this.exec(this.runInFrame("get_css", { selector: s.selector }, s.chain), "get_css");
             break;
           case "show":
             this.exec(this.runInFrame("show", { selector: s.selector }, s.chain), "show");

@@ -71,19 +71,49 @@ Page commands (tab required):
                               file input and only accepts drops: dispatches
                               dragenter/dragover/drop carrying the file
                               ({selector,data}[,waitFor]);
-                              data = {base64,filename,mime} or {url} (fetched)
+                              data = {base64,filename,mime} or {url} (fetched);
+                              {trusted:true} instead performs a real
+                              browser-level drag of the disk file at data.path
+                              (absolute path on the machine running Chrome) —
+                              trusted events, passes uploaders that validate
+                              isTrusted (e.g. WeChat media library); returns
+                              {selector,filename,x,y,trusted,settledMs}
+                              (no size/mime — no stat access)
   paste_rich <tab> <params>   Paste styled HTML into contenteditable
                               ({selector,html[,mode][,waitFor]}); mode:
                               replace(default)/append/insert;
                               uses only the browser's native editing commands —
                               the editor decides how the HTML lands;
                               no editor sniffing/adaptation
+  set_cursor <tab> <params>   Place the caret at a text substring inside a
+                              contenteditable editor — e.g. right after a keyword
+                              to trigger its suggestion popup
+                              ({selector,text[,occurrence][,position]});
+                              position: after (default, right after the match) /
+                              before (right before the match) / start (start of
+                              the matching line) / end (end of the matching line);
+                              occurrence: nth match (default 1); not found →
+                              error including the total match count. Waits for
+                              the editor to land the caret, then reads the ACTUAL
+                              caret back — returns {row,col,text}: row 0-based,
+                              col = offset inside the line text (JS string index),
+                              text = full line containing the caret. The editor
+                              may normalize the caret; the read-back is
+                              authoritative. Same settle + waitFor semantics as
+                              click.
+  get_cursor <tab> <params>   Read the caret position inside a contenteditable
+                              editor ({selector}): returns
+                              {inEditor,row,col,text} — row 0-based, col = offset
+                              inside the line text (JS string index), text = full
+                              line containing the caret. Caret not inside that
+                              editor → {inEditor:false, row:null, col:null,
+                              text:null} (not an error). Use it to verify where a
+                              set_cursor or a manual click left the caret.
   show <tab> <selector>       Force-show all matching hidden elements
                               (inline style; makes hover-only menus clickable)
   hide <tab>                  Restore all elements shown by show
                               (clears inline style back to CSS control)
   get_text <tab> [params]     Get text of element ({selector}) or entire page
-  get_css <tab> <selector>    Get computed CSS of element ({selector})
   get_prop <tab> <params>     Read a property of an element and return its exact
                               value ({selector|text, prop}); prop e.g. "innerHTML",
                               "value", "checked", "src". Read-only: reads the real
@@ -139,7 +169,7 @@ frame param (optional, for element commands that search iframes):
                               (most reliable for cross-origin iframes)
 
 Settle — impact-aware returns (click/type/keyboard/trigger/upload_file/
-upload_dragdrop/paste_rich/scroll/real_click):
+upload_dragdrop/paste_rich/set_cursor/scroll/real_click):
   Commands wait for the action's impact to land before returning. Event-driven
   (DOM mutations + long tasks, no fixed sleep), returns {settledMs} (ms waited):
   no-impact actions return ~0.6s; impacted actions return once the DOM is quiet
@@ -165,12 +195,13 @@ Examples:
   cda send abc click current --field "currentTab.url,newTabs"
   cda send abc type current '{"selector":"#title","text":"hello"}'
   cda send abc paste_rich current '{"selector":".rich-editor","html":"<section><span>hi</span></section>"}'
+  cda send abc set_cursor current '{"selector":".rich-editor","text":"#发布","position":"after"}'
+  cda send abc get_cursor current '{"selector":".rich-editor"}'
   cda send abc upload_file current '{"selector":"input[type=file]","base64":"<b64>","filename":"a.jpg","mime":"image/jpeg"}'
   cda send abc upload_dragdrop current '{"selector":".upload-area","data":{"base64":"<b64>","filename":"a.jpg","mime":"image/jpeg"}}'
   cda send abc scroll current '{"y":500}'
   cda send abc trigger current '{"selector":"#username","event":"blur"}'
   cda send abc trigger current '{"selector":"#category","event":"change","value":"2"}'
-  cda send abc get_css current "h1.title"
   cda send abc get_prop current '{"selector":"#title","prop":"innerHTML"}'
   cda send abc list_elements current '{"filter":"upload","visible":true}'
   cda send abc list_elements current '{"text":"发布","max":10}'
@@ -223,7 +254,7 @@ function buildMessage(action, args) {
             console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
             console.error("");
             console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
-            console.error("Page commands (tab required): click | real_click | type | keyboard | trigger | upload_file | upload_dragdrop | paste_rich | show | hide | get_text | get_css | get_prop | get_page_info | list_elements | get_js_errors | clear_js_errors | screenshot | scroll");
+            console.error("Page commands (tab required): click | real_click | type | keyboard | trigger | upload_file | upload_dragdrop | paste_rich | set_cursor | get_cursor | show | hide | get_text | get_prop | get_page_info | list_elements | get_js_errors | clear_js_errors | screenshot | scroll");
             console.error("Troubleshooting only (needs plugin option enabled): exec");
             console.error("");
             console.error("Example: cda send abc123 get_page_info current");
@@ -271,7 +302,7 @@ function buildMessage(action, args) {
             process.exit(1);
         }
         let params = {};
-        if (command === "get_css" || command === "show") {
+        if (command === "show") {
             const selector = args[3];
             if (!selector) {
                 console.error(`Error: "${command}" requires a selector argument.`);

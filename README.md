@@ -252,10 +252,11 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 | `keyboard` | `send <id> keyboard <tab> <params>` | 向元素发送按键（`{selector,key}`，selector 省略用当前聚焦元素），可加 `ctrl`/`shift`/`alt`/`meta` 组合键 |
 | `trigger` | `send <id> trigger <tab> <params>` | 触发元素事件（`{selector,event}`）：`blur` 触发表单校验、`change`+`value` 选下拉选项（React 受控组件同样生效）、自定义事件；`focus`/`blur` 触发真实焦点转移；带 settle + waitFor |
 | `upload_file` | `send <id> upload_file <tab> <params>` | 向 file input 注入 base64 图片并触发上传 |
-| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | 向拖拽上传区（无 file input、只认 drop）拖入文件（`{selector,data}`，data 为 `{base64,filename,mime}` 或 `{url}`） |
+| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | 向拖拽上传区（无 file input、只认 drop）拖入文件（`{selector,data}`：data 为 `{base64,filename,mime}`、`{url}`，或 `trusted:true` 时 `{path}` 本机绝对路径）；默认派发 dragenter/dragover/drop，`trusted` 走浏览器级真实拖放（过微信这类校验 isTrusted 的组件） |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | 向富文本编辑器粘贴带样式的 HTML |
+| `set_cursor` | `send <id> set_cursor <tab> <params>` | 把光标**精确落到编辑器正文某个文字片段前后**（`{selector,text[,occurrence][,position]}`）：after/before/所在行行首(start)/所在行行尾(end)，occurrence 取第 N 次出现；落点后读回实际光标 `{row,col,text}`（编辑器可能归整光标，读回为准） |
+| `get_cursor` | `send <id> get_cursor <tab> <params>` | 读编辑器当前光标（`{selector}`）：`{inEditor,row,col,text}`——行号 0 基、col 行内字符偏移、text 所在行全文；光标不在编辑区时 inEditor:false + null |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取元素/整页文本 |
-| `get_css` | `send <id> get_css <tab> <selector>` | 获取所有匹配元素的 computed style |
 | `get_prop` | `send <id> get_prop <tab> <params>` | 读取元素属性真实原值（`{selector\|text, prop}`），只读不调用方法；标量原样返回，无法无损转 JSON 的对象明确报错 |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息（url / title / iframes） |
 | `list_elements` | `send <id> list_elements <tab> <params>` | 页面元素地图：列出可交互元素（自动生成 selector/可见性/坐标/accept），支持 filter/text/max/visible 过滤，穿透 shadow、缺省聚合所有 frame；找不到元素先跑它 |
@@ -288,6 +289,13 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 // paste_rich —— 粘贴带样式的 HTML（mode 同 type：默认 replace 先清空再粘贴）
 {"selector": ".rich-editor", "html": "<section><span>hi</span></section>"}
 
+// set_cursor —— 光标精确落到正文某段文字后（触发联想浮层/继续输入）
+{"selector": ".rich-editor", "text": "#发布", "position": "after"}    // after/before/start(行首)/end(行尾)
+{"selector": ".rich-editor", "text": "#发布", "occurrence": 2}        // 多处同名时取第 N 次
+
+// get_cursor —— 读编辑器当前光标（行文本/行号/偏移）
+{"selector": ".rich-editor"}
+
 // scroll —— 垂直/水平滚动
 {"y": 500}                       // 或 {"x": 300, "y": 500}
 ```
@@ -311,7 +319,7 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 - **`type`**：普通输入框直接写 value 并触发 `input`/`change`；富文本编辑区聚焦后文字**整段原样插入——不 trim、不按换行拆分、不改写**，怎么分段由编辑器自己决定（cda 不做编辑器适配；段落要精确可控就一段发一次，后续 `mode:"append"` 追加）
 - **`paste_rich`**：向富文本编辑器粘贴带内联样式的 HTML，保留字号/颜色/加粗/间距；`mode` 同 type（默认 `replace` 等价于「全选删除后粘贴排好版的文档」，`append`/`insert` 可选）。粘贴内容交给编辑器的粘贴处理解析——**块级 HTML（段落/标题/列表）由编辑器自己分段**；返回值 `pipeline` 可确认编辑器是否接管了内容。不做编辑器嗅探适配
 - **`upload_file`**：把 base64 图片注入 `input[type=file]` 并触发 `change`，页面监听后自动上传——无需操作系统文件对话框（比如没有辅助功能权限时也能上传封面图）
-- **`upload_dragdrop`**：找不到文件输入框、只有拖拽上传区时，向目标区域派发带文件的 dragenter/dragover/drop，页面 drop 处理器自动上传——与 `upload_file` 互补
+- **`upload_dragdrop`**：找不到文件输入框、只有拖拽上传区时，向目标区域派发带文件的 dragenter/dragover/drop，页面 drop 处理器自动上传——与 `upload_file` 互补。页面**校验真实受信任拖放**时（如微信媒体库，合成事件 isTrusted=false 会被拒），加 `trusted:true` + `data.path`（本机绝对路径）改用浏览器级真实拖放（isTrusted=true、真实 File），前提是文件在运行 Chrome 的本机上
 
 ### 3. `--field` 按需采集
 
@@ -324,7 +332,7 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-**所有返回对象的命令**都支持：`click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_prop`/`get_page_info`/`list_elements`/`get_js_errors`/`real_click`/`open`（`get_prop` 仅在值为普通对象时）。字段路径逗号分隔、点号嵌套投影：`--field a.b` 返回 `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）；路径段遇数组逐项投影（`newTabs.url` → `{newTabs: [url, ...]}`）；不存在的路径忽略。`get_text` 返回纯文本、`get_prop` 标量值原样返回——均无字段可滤。
+**所有返回对象的命令**都支持：`click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`set_cursor`/`get_cursor`/`scroll`/`show`/`hide`/`get_prop`/`get_page_info`/`list_elements`/`get_js_errors`/`real_click`/`open`（`get_prop` 仅在值为普通对象时）。字段路径逗号分隔、点号嵌套投影：`--field a.b` 返回 `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）；路径段遇数组逐项投影（`newTabs.url` → `{newTabs: [url, ...]}`）；不存在的路径忽略。`get_text` 返回纯文本、`get_prop` 标量值原样返回——均无字段可滤。
 
 ### 4. 状态感知：操作之后自动「看结果」
 
@@ -348,7 +356,7 @@ cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "sett
 
 ### 7. iframe 读写操作
 
-所有元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`get_prop`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`）都**自动搜索 iframe**：顶层优先、深度优先遍历每个 frame（含跨域），首个命中即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
+所有元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_prop`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`set_cursor`/`get_cursor`/`list_elements`）都**自动搜索 iframe**：顶层优先、深度优先遍历每个 frame（含跨域），首个命中即为目标，返回中带 `frame: {frameId, url}` 标明命中位置。
 
 ```bash
 # 读取 iframe 内元素文本（自动搜索到跨域 iframe）
@@ -372,7 +380,7 @@ cda send OfficePC get_text current '{"selector":"#editor","frame":0}'
 
 ### 8. shadow DOM 读写操作
 
-Web Components 站点（小红书创作后台、部分中后台系统）把发布按钮、编辑器包在 shadow root 里——浏览器原生 `querySelector` 不认 `>>>`、XPath 不穿透 shadow 边界，普通选择器全都找不到。cda 让所有元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_css`/`get_prop`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`list_elements`）**透明穿透 open shadow root**，三种方式从显式到隐式：
+Web Components 站点（小红书创作后台、部分中后台系统）把发布按钮、编辑器包在 shadow root 里——浏览器原生 `querySelector` 不认 `>>>`、XPath 不穿透 shadow 边界，普通选择器全都找不到。cda 让所有元素命令（`click`/`real_click`/`type`/`keyboard`/`trigger`/`get_text`/`get_prop`/`show`/`upload_file`/`upload_dragdrop`/`paste_rich`/`set_cursor`/`get_cursor`/`list_elements`）**透明穿透 open shadow root**，三种方式从显式到隐式：
 
 ```bash
 # 1. DevTools 路径：直接粘贴元素面板「Copy → Copy element path」的完整路径（含 #shadow-root）
@@ -434,11 +442,12 @@ cda send OfficePC click current '{"text":"发布"}'
 | 命令 | 返回 |
 |---|---|
 | `get_text` | 字符串，如 `"登录"` |
-| `get_css` | `{ selector, count, results: [{index, css: {display, …}}] }` |
+| `set_cursor` | `{ selector, position, row, col, text, settledMs }`（row 0 基；col 行内字符偏移；text 光标所在行全文——读回为准） |
+| `get_cursor` | `{ selector, inEditor, row, col, text }`（光标不在编辑区时 `inEditor:false` + null，非错误） |
 | `get_prop` | 属性真实原值（字符串/数字/布尔原样返回；普通对象返回并带命中 frame；无法无损转 JSON 的报错） |
 | `list_elements` | `{ count, truncated, elements: [{tag, text, visible, x, y, w, h, selector, …}] }` |
 | `type` / `clear_js_errors` | `{ success: true }` |
-| `upload_file` / `upload_dragdrop` | `{ success: true, data: { filename, size, mime } }` |
+| `upload_file` / `upload_dragdrop` | `{ success: true, data: { filename, size, mime } }`（`upload_dragdrop` 加 `trusted:true` 时：`{ filename, x, y, trusted, settledMs }`，无 size/mime） |
 | `scroll` | `{ success: true, data: { scrollX, scrollY } }` |
 | `get_js_errors` | `{ errors: [{message, source, lineno}], count }` |
 | `close_tab` | `{ success: true, data: { tabId } }` |

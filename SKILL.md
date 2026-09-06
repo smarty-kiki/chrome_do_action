@@ -1,7 +1,7 @@
 ---
 name: cda-chrome-control
 description: 通过 cda CLI 控制本机 Chrome 浏览器执行页面操作：打开网页、点击、输入文本、触发事件、富文本排版、上传文件、截图、显示隐藏元素、提取内容、监听 JS 错误、管理标签页。通用浏览器自动化工具，适用于网页后台、CMS、电商、建站、抓取等各种场景。当用户要求"用 Chrome 打开某网页"、"控制浏览器做 XX"、"在网页上填表/发布内容"、"编辑排版网页内容"、"抓取网页内容"、"上传文件"等场景时使用。前置条件：Node.js 18+、本机 Chrome，按"安装"章节完成一次配置。
-version: 1.5.1
+version: 1.5.2
 display_name: cda Chrome 控制
 display_name_en: cda Chrome Control
 description_zh: 用命令行控制本机 Chrome 浏览器执行通用网页操作（打开/点击/输入/富文本排版/上传/截图/抓取/管理标签页）
@@ -83,12 +83,13 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | `keyboard` | `send <id> keyboard <tab> '{"selector":"#title","key":"Enter"}'` | 向元素发送按键（keydown/keypress/keyup，合成事件）；selector 省略用当前聚焦元素；支持 `ctrl`/`shift`/`alt`/`meta` 组合键 |
 | `trigger` | `send <id> trigger <tab> '{"selector":"#username","event":"blur"}'` | 触发元素事件：`blur` 触发表单校验、`change`+`value` 选下拉选项（React 受控组件同样生效）、自定义事件；`focus`/`blur` 触发真实焦点转移（表单校验生效）；带 settle + waitFor；`{options}` 透传事件属性 |
 | `paste_rich` | `send <id> paste_rich <tab> '{"selector":".rich-editor","html":"<section>..."}'` | 向富文本编辑区注入带样式 HTML（`mode` 同 type：默认 `replace` 先清空再粘贴，`append`/`insert` 可选），等价粘贴排好版的文档 |
+| `set_cursor` | `send <id> set_cursor <tab> '{"selector":".rich-editor","text":"#发布","position":"after"}'` | 把光标**精确定位到编辑区正文某个文字片段**前后（`position`：after 匹配后/before 匹配前/start 所在行行首/end 所在行行尾；`occurrence` 取第 N 次出现），落点后读回实际光标 `{row,col,text}`——典型场景：光标移到「#话题」后触发联想浮层 |
+| `get_cursor` | `send <id> get_cursor <tab> '{"selector":".rich-editor"}'` | 读编辑器当前光标：所在行文本/行号/字符偏移（`{inEditor,row,col,text}`，光标不在编辑区时 `inEditor:false` + null），set_cursor 后对账闭环 |
 | `upload_file` | `send <id> upload_file <tab> '{"selector":"input[type=file]","base64":"...","filename":"a.jpg","mime":"image/jpeg"}'` | base64 图片注入 file input，触发 change 上传；注入前预检 accept（类型不匹配直接报错，不静默失败） |
-| `upload_dragdrop` | `send <id> upload_dragdrop <tab> '{"selector":".upload-area","data":{"base64":"...","filename":"a.jpg","mime":"image/jpeg"}}'` | 向无 file input、只认拖拽的上传区拖入文件，派发 dragenter/dragover/drop；`data` 支持 base64 或 `{url}` |
+| `upload_dragdrop` | `send <id> upload_dragdrop <tab> '{"selector":".upload-area","data":{"base64":"...","filename":"a.jpg","mime":"image/jpeg"}}'` | 向无 file input、只认拖拽的上传区拖入文件，派发 dragenter/dragover/drop；`data` 支持 base64 或 `{url}`；校验真实拖放的站点（微信媒体库）加 `"trusted":true` + `data.path`（本机绝对路径）走浏览器级真实拖放 |
 | `show` | `send <id> show <tab> '.toolbar-menu'` | 强制显示隐藏元素（仅改 CSS：visibility/opacity/display），让 hover 菜单常驻可见后可点击 |
 | `hide` | `send <id> hide <tab>` | 还原所有被 show 的元素（清 inline style 回 CSS 控制） |
 | `get_text` | `send <id> get_text <tab> [selector]` | 获取文本（无 selector 取整页；带 selector 自动搜索 iframe） |
-| `get_css` | `send <id> get_css <tab> <selector>` | 获取元素 computed style |
 | `get_prop` | `send <id> get_prop <tab> '{"selector":"#title","prop":"value"}'` | 读取元素属性的**真实原值**（只读，从不调用方法）：`value` 校验输入写入、`checked` 看勾选态、`innerHTML`/`src`/`className` 等任意属性；标量原样返回，无法无损转 JSON 的对象明确报错而非静默变空 |
 | `get_page_info` | `send <id> get_page_info <tab>` | 页面信息（url/title/iframes），支持 --field；iframes 对**跨域也补全 url/html** |
 | `list_elements` | `send <id> list_elements <tab> '{"filter":"upload","visible":true}'` | **页面元素地图**：列出可交互元素（生成好的 selector/可见性/坐标/accept 等），支持 filter/text/max/visible；穿透 shadow DOM，缺省聚合所有 frame（元素带 frame url）；找不到元素先查它 |
@@ -100,10 +101,10 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 
 ### 关键技巧
 
-1. **找不到元素先 `list_elements`**：别猜 selector、别挖 MB 级 HTML。先 `list_elements` 拿元素地图——返回每条元素带生成好的 `selector`（可直接喂给 click/type/upload_file）、可见性、坐标、`accept` 等关键属性。想找上传控件用 `'{"filter":"upload"}'`（同时列出多个 file input 时用 accept 对比选目标，如抖音视频/图文两个 tab）；被 CSS 隐藏的输入框用 `'{"visible":false}'`；shadow DOM 内元素同样列出（selector 带 `>>>`）。多 file input 页面配 `--field "elements.accept,elements.selector"` 快速对比。
+1. **找不到元素先 `list_elements`**：别猜 selector、别挖 MB 级 HTML。先 `list_elements` 拿元素地图——返回每条元素带生成好的 `selector`（可直接喂给 click/type/upload_file）、可见性、坐标、`accept` 等关键属性。想找上传控件：`send <id> list_elements <tab> '{"filter":"upload"}'`（同时列出多个 file input 时用 accept 对比选目标，如抖音视频/图文两个 tab）；被 CSS 隐藏的输入框用 `'{"visible":false}'`；shadow DOM 内元素同样列出（selector 带 `>>>`）。多 file input 页面配 `--field "elements.accept,elements.selector"` 快速对比。
 2. **等影响落地（settle）**：click/type/keyboard/trigger/upload_file/upload_dragdrop/paste_rich/scroll/real_click 返回前会事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），返回 `settledMs`。影响落地晚（服务端请求后才渲染、长 debounce）时加 `waitFor` 谓词：`'{"selector":"#btn","waitFor":{"text":"发布成功"}}'`——50ms 轮询、条件满足瞬间返回 `{"settled":true,"waited":615}`。后台 tab 的 Chrome 定时器节流会让 settle 追加 ~1s 确认期，深度后台等不到就用 waitFor 或把 tab 切前台。**任何命令都有 60 秒硬超时**（服务端截断）——单条命令别做分钟级等待，大任务拆小。
 3. **坐标必须截图确认**：先 `screenshot` 看真实页面，再取坐标定位。
-4. **hover 菜单用 show 解决**：触发不了 hover 时别硬怼事件模拟，`show` 强制显示元素后普通 `click` 即可命中。操作完 `hide` 还原。确需真实 hover 链（如悬停才展开的嵌套菜单）时，用 `real_click` 的 `approach` 渐进路径逐级触发。
+4. **hover 菜单用 show 解决**：触发不了 hover 时别硬怼事件模拟，`show` 强制显示元素后普通 `click` 即可命中，操作完 `hide` 还原：`send <id> show <tab> '.toolbar-menu'` → `click` → `send <id> hide <tab>`。确需真实 hover 链（如悬停才展开的嵌套菜单）时，用 `real_click` 的 `approach` 渐进路径逐级触发。
 5. **iframe 自动搜索**：元素命令默认顶层优先搜遍所有 iframe（含跨域），返回带命中 `frame.url`。目标在 iframe 内且自动搜索未命中时，加 `frame` 参数固定：`{"selector":"...","frame":{"url":"子串"}}`（跨域最稳）或 `{"frame":0}`（第 N 个顶层 iframe）。
 6. **shadow DOM 自动穿透**：Web Components 站点（小红书后台等）的按钮/编辑器在 shadow root 里，普通选择器找不到。三种方式：① 直接粘贴 DevTools 元素路径（含 `#shadow-root` 标记）；② `selector: "xhs-publish-btn >>> button"`（`>>>` 穿透所有层）；③ 裸选择器/xpath/text 会自动兜底搜索 open shadow root。closed root 只能用坐标 `real_click {"x":..,"y":..}`。`get_page_info --field html` 默认含 shadow 内容（`<template shadowrootmode="open">` 内联）。
 7. **paste_rich 传参**：HTML 含英文引号时 shell 单引号会截断参数，用 Node `spawnSync`（参数数组，不经 shell）传参。
@@ -130,11 +131,16 @@ $CLI send $NODE open "https://example.com/admin/post/edit"
 $CLI send $NODE type $TAB '{"selector":"#title","text":"文章标题"}'
 
 # 3. 排版正文：已排好版的 HTML 用 paste_rich 粘贴（带样式）；纯文本用 type，
-#    要分段就 mode:"append" 逐段追加
+#    要分段就 mode:"append" 逐段追加；光标要精确落到正文某段文字前后（如移到
+#    "#话题" 后触发联想浮层）用 set_cursor，落点是否被编辑器归整用 get_cursor 对账
 $CLI send $NODE paste_rich $TAB '{"selector":".rich-editor","html":"<section>...</section>"}'
+$CLI send $NODE set_cursor $TAB '{"selector":".rich-editor","text":"#话题","position":"after"}'
+$CLI send $NODE get_cursor $TAB '{"selector":".rich-editor"}'
 
 # 4. 上传图片：有 file input 用 upload_file；只有拖拽区用 upload_dragdrop
 $CLI send $NODE upload_file $TAB '{"selector":"input[type=file]","base64":"<b64>","filename":"cover.jpg","mime":"image/jpeg"}'
+$CLI send $NODE upload_dragdrop $TAB '{"selector":".upload-area","data":{"base64":"<b64>","filename":"cover.jpg","mime":"image/jpeg"}}'   # 无 file input、只认拖拽的上传区
+$CLI send $NODE upload_dragdrop $TAB '{"selector":".upload-area","trusted":true,"data":{"path":"<本机图片绝对路径>"}}'   # 微信媒体库等校验真实拖放的组件：真实拖放（isTrusted=true）
 
 # 5. 提交前截图确认真实状态，再用 get_text/get_prop 校验关键内容（不盲交）
 $CLI send $NODE screenshot $TAB '{"path":"/tmp/before-submit.png"}'

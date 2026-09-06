@@ -54,6 +54,74 @@ try {
   // 页面劫持 dispatchEvent 的极端情况：早于注入的错误拿不到，静默放弃
 }
 
+// --- 主世界页面动作总线（隔离世界侧） ---
+// 两类页面动作必须在主世界执行（实证见 main-world.ts 底部同节，实现同处）：
+//   1. 合成 paste 派发：浏览器默认粘贴行为只在主世界派发时生效——从隔离世界派发同一事件，
+//      页面编辑器监听能收到（可 preventDefault、可读 clipboardData），但浏览器默认行为不
+//      触发 → paste_rich 恒落兜底直插、HTML 整块并入不分段（v0.24 实证）；
+//   2. 编辑器光标读写（set_cursor/get_cursor）：编辑器只认主世界放置/读取的 DOM 光标，
+//      隔离世界放置的光标编辑器模型不同步（v0.25 实证）。
+// 本段是隔离世界侧的请求/回复通道，一个入口按 action 分发（paste_dispatch | caret_set |
+// caret_get），detail = {requestId, action, ...params}：
+//   请求：双通道投递（document CustomEvent + window.postMessage——「隔离世界 → 主世界」
+//         反向通道仓库无先例可依，双保险）；主世界侧按 requestId 去重，动作只会执行一次；
+//   回复：双通道都收，按 requestId 只消费第一份（重复份被丢弃）；带超时兜底。
+// paste_dispatch 超时/失败与「派发后内容没落地」同路：paste_rich 走回退直插，旧行为不回归。
+const MAIN_ACTION_EVT = "__cda_main_action__";
+const MAIN_ACTION_REPLY_EVT = "__cda_main_action_reply__";
+
+type MainWorldReply = { ok: boolean; error?: string } & Record<string, unknown>;
+
+const mainPending = new Map<number, { resolve: (r: MainWorldReply) => void; timer: number }>();
+let mainSeq = 0;
+
+function onMainActionReply(detail: unknown): void {
+  const d = detail as Record<string, unknown> | null;
+  // 形状校验：只收 requestId 能对上自己请求的回复
+  if (!d || typeof d !== "object" || typeof d.requestId !== "number") return;
+  const p = mainPending.get(d.requestId);
+  if (!p) return;
+  mainPending.delete(d.requestId);
+  window.clearTimeout(p.timer);
+  const { requestId, ...rest } = d;
+  p.resolve({ ...rest, ok: rest.ok === true } as MainWorldReply);
+}
+
+// 主世界双通道回复（CustomEvent + postMessage）：第一份消费掉 pending，重复份被丢弃
+document.addEventListener(MAIN_ACTION_REPLY_EVT, (ev: Event) =>
+  onMainActionReply((ev as CustomEvent).detail),
+);
+window.addEventListener("message", (ev: MessageEvent) => {
+  const m = ev.data as { __cdaMain?: string; detail?: unknown } | undefined;
+  if (m && typeof m === "object" && m.__cdaMain === MAIN_ACTION_REPLY_EVT) {
+    onMainActionReply(m.detail);
+  }
+});
+
+// 请求主世界执行一次动作；主世界无应答（脚本未注入/执行异常）即按失败返回。
+// 双通道投递保证到达；有副作用的动作由主世界按 requestId 去重只执行一次，这里绝不补发
+function requestMainWorld(action: string, params: Record<string, unknown>, timeoutMs = 500): Promise<MainWorldReply> {
+  const requestId = ++mainSeq;
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => {
+      mainPending.delete(requestId);
+      resolve({ ok: false, error: "主世界无应答（主世界脚本未注入或执行异常）" });
+    }, timeoutMs);
+    mainPending.set(requestId, { resolve, timer });
+    const detail = { requestId, action, ...params };
+    try {
+      document.dispatchEvent(new CustomEvent(MAIN_ACTION_EVT, { detail }));
+    } catch {
+      // 页面劫持 dispatchEvent 等极端情况：postMessage 通道兜底
+    }
+    try {
+      window.postMessage({ __cdaMain: MAIN_ACTION_EVT, detail }, "*");
+    } catch {
+      // 忽略：postMessage 不可用时 CustomEvent 通道兜底
+    }
+  });
+}
+
 // list_elements 返回的单个元素条目（service worker 聚合时给非顶层 frame 补 frame 字段）
 interface ElementInfo {
   tag: string;
@@ -656,7 +724,10 @@ async function handleCommand(
         // 拖入文件：构造带 File 的 DataTransfer，派发 dragenter → dragover → drop。
         // 与 upload_file 互补：有 input[type=file] 用 upload_file，只有 drop 区域用本命令。
         // 注意合成 drop 是页面内拖拽模拟（isTrusted=false）：能触发页面 JS 的 drop 处理器，
-        // 但无法模拟从系统文件管理器拖入的真实拖拽（浏览器原生 DnD），校验 isTrusted 的站点无效。
+        // 但无法模拟从系统文件管理器拖入的真实拖拽（浏览器原生 DnD），校验 isTrusted 的
+        // 站点（如微信媒体库）无效——这类站点用 trusted:true：SW 拦截走 CDP 真实拖放
+        // （Input.dispatchDragEvent，data.path 为 Chrome 本机绝对路径），见
+        // service-worker.ts 的 handleTrustedDrop。
         const selector = params.selector as string;
         const data = params.data as Record<string, unknown> | undefined;
         if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
@@ -716,7 +787,10 @@ async function handleCommand(
 
         const dt = new DataTransfer();
         dt.items.add(file);
-        for (const type of ["dragenter", "dragover", "drop"] as const) {
+        // 完整序列 dragenter → dragover → drop → dragleave：真实拖入结束时目标同样收到
+        // dragleave——只靠 leave 清理亮灯态的组件（dragenter 亮、drop 不清）才不会残留
+        // 「松开鼠标」高亮。leave 在 drop 处理器同步跑完后派发，不影响 drop 侧异步上传。
+        for (const type of ["dragenter", "dragover", "drop", "dragleave"] as const) {
           el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
         }
         // 等影响落地：drop 处理器可能异步渲染预览 / 发起上传，落地后再返回
@@ -790,32 +864,17 @@ async function handleCommand(
             }
           }
         }
-        // —— 模拟粘贴 ——
-        // DataTransfer 带上 text/html（主体）+ text/plain（HTML 渲染取文本，供只读纯文本的
-        // 粘贴处理兜底）。ClipboardEvent 构造器不接收 clipboardData，只能派发前用
-        // defineProperty 挂到实例上（合成事件 isTrusted=false 无法伪造，编辑器处理器不校验）
-        const toPlainText = (markup: string): string => {
-          const probe = document.createElement("div");
-          probe.style.cssText = "position:fixed;left:-9999px;top:0"; // 不可见但参与渲染，innerText 才能取到块级换行
-          probe.innerHTML = markup;
-          document.body.appendChild(probe);
-          const text = probe.innerText;
-          probe.remove();
-          return text;
-        };
-        const dt = new DataTransfer();
-        dt.setData("text/plain", toPlainText(html));
-        dt.setData("text/html", html);
-        const pasteEvt = new ClipboardEvent("paste", { bubbles: true, cancelable: true, composed: true });
-        Object.defineProperty(pasteEvt, "clipboardData", { value: dt });
-        // dispatch 前记录基线：派发后内容可能经编辑器处理器或浏览器默认行为两条路径落地，
+        // —— 模拟粘贴（dispatch 在主世界执行，通道见文件顶部「主世界页面动作总线」节）——
+        // 派发前记录基线：派发后内容可能经编辑器处理器或浏览器默认行为两条路径落地，
         // 先等 DOM 稳定再比对 textContent，判定"是否真的什么都没落地"——避免拿不准时重复插入
         const before = (el.textContent || "").length;
-        el.dispatchEvent(pasteEvt);
+        // 粘贴目标跟随光标：上面 replace/append/insert 已把光标置入目标编辑区，选区是帧级
+        // 共享状态，主世界直接读 document.getSelection() 即可定位编辑宿主，元素无需跨世界传
+        const pasteResult = await requestMainWorld("paste_dispatch", { html });
         await waitForSettled(3000); // 默认行为落地可能是异步的，等稳定后再测
         const changed = el.textContent !== null && el.textContent.length !== before;
         let pipeline: "editor_paste" | "default_paste" | "insertHTML_fallback";
-        if (pasteEvt.defaultPrevented) {
+        if (pasteResult.ok && pasteResult.defaultPrevented) {
           // 编辑器接管：pasteModule 已读 clipboardData、按块插入自身模型，自会触发自己的
           // change 通知——不再补 input（与真实粘贴语义一致，补发反而可能让状态监听收到
           // "二次编辑"信号）
@@ -824,7 +883,8 @@ async function handleCommand(
           // 浏览器默认行为已把内容落地（多走 text/plain 纯文本行）——已落地就不再插 html
           pipeline = "default_paste";
         } else {
-          // 真没落地才兜底：无人接管且默认行为未生效，回退浏览器原生编辑命令直插
+          // 真没落地才兜底：无人接管、默认行为未生效或主世界派发失败（超时/定位不到宿主），
+          // 回退浏览器原生编辑命令直插
           pipeline = "insertHTML_fallback";
           document.execCommand("insertHTML", false, html);
           el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -950,29 +1010,97 @@ async function handleCommand(
         return { success: true, data: el.textContent ?? "" };
       }
 
-      case "get_css": {
+      case "set_cursor": {
+        // 把光标精确落到编辑器正文某段文本的指定位置（{selector,text[,occurrence][,position]}）：
+        //   定位与落点都在主世界执行（编辑器只认主世界放置的 DOM 光标/选区，隔离世界放置
+        //   编辑器模型不同步——实证见文件顶部「主世界页面动作总线」节）；本 case 只做：
+        //     ① selector 归属校验（元素不在本 frame 时 notFound，让 service worker 换帧搜索）
+        //     ② 请求主世界落点 → 等编辑器归整/重排落地 → 读回实际光标
+        // 回复以读回为准：编辑器可能把光标挪到归整位置（如实上报，不谎报目标坐标）。
+        // 全程不派发任何合成事件：真实 focus + 选区变更由编辑器自身监听同步。
+        const known = ["selector", "text", "occurrence", "position", "frame", "waitFor"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown set_cursor parameter(s): ${unknown.join(", ")} (expected selector, text, occurrence, position, waitFor)` };
+        }
+        const selector = params.selector as string;
+        const text = params.text as string;
+        const occurrence = params.occurrence === undefined ? 1 : params.occurrence;
+        const position = params.position === undefined ? "after" : params.position;
+        if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
+        if (typeof text !== "string" || !text) return { success: false, error: 'Need "text" parameter (a string)' };
+        if (typeof occurrence !== "number" || !Number.isInteger(occurrence) || occurrence < 1) {
+          return { success: false, error: `"occurrence" must be a positive integer (got ${JSON.stringify(params.occurrence)})` };
+        }
+        if (position !== "before" && position !== "after" && position !== "start" && position !== "end") {
+          return { success: false, error: `Invalid position: ${JSON.stringify(params.position)} (expected before|after|start|end)` };
+        }
+        const el = findElement(selector) as HTMLElement | null;
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+        if (!el.isContentEditable) {
+          return { success: false, error: `Element is not contenteditable: ${selector} (tag=${el.tagName})` };
+        }
+        // 主世界落点：定位参数全量透传；失败消息与主世界侧校验同文，直接透传给用户
+        const placed = await requestMainWorld("caret_set", { selector, text, occurrence, position });
+        if (!placed.ok) {
+          return { success: false, error: typeof placed.error === "string" ? placed.error : "caret_set failed" };
+        }
+        // 等编辑器落地：光标落点可能触发归整/重排，稳定后再读回，保证读的是最终状态
+        const stable = await waitForSettled(3000);
+        const waitForResult = params.waitFor
+          ? await waitForCondition(params.waitFor as { selector?: string; text?: string }, 3000)
+          : null;
+        const readback = await requestMainWorld("caret_get", { selector });
+        if (!readback.ok) {
+          return { success: false, error: typeof readback.error === "string" ? readback.error : "caret_get failed" };
+        }
+        if (readback.inEditor !== true) {
+          // 落点后光标不在编辑器内：焦点被拒/选区被页面接管/编辑器切了只读——如实失败
+          return { success: false, error: "光标未被编辑器保持：落点后光标不在编辑器内（焦点被拒或选区被页面接管）" };
+        }
+        const cursorData: Record<string, unknown> = {
+          selector,
+          position, // 请求的相对位置（落点是否被编辑器归整看 row/col）
+          row: readback.row, // 0 基行号：编辑器归整后的实际光标所在行
+          col: readback.col, // 行内 JS UTF-16 偏移（可直接对下方 text 做 slice(0,col) 对账）
+          text: readback.text, // 光标所在行逻辑全文（含定位目标的上下文）
+          settledMs: stable.waited,
+        };
+        if (waitForResult) cursorData.waitFor = waitForResult;
+        return { success: true, data: cursorData };
+      }
+
+      case "get_cursor": {
+        // 读编辑器当前逻辑光标（{selector}）：所在行文本/行号/行内字符偏移。
+        // 校验闭环用：set_cursor 后对账实际落点；或手动点过编辑器后读当前位置。
+        // 光标不在该编辑器内（焦点在页面其他位置/选区被清空）不是错误：
+        // inEditor:false + row/col/text 为 null，由调用方决定（如先 set_cursor 再读）。
         const known = ["selector", "frame"];
         const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
         if (unknown.length) {
-          return { success: false, error: `Unknown get_css parameter(s): ${unknown.join(", ")} (expected selector)` };
+          return { success: false, error: `Unknown get_cursor parameter(s): ${unknown.join(", ")} (expected selector)` };
         }
         const selector = params.selector as string;
         if (typeof selector !== "string" || !selector) return { success: false, error: 'Need "selector" parameter (a string)' };
-        const isCss = selector.startsWith("css:");
-        const query = isCss ? selector.slice(4) : selector;
-        // css: 前缀命中全部匹配；其余走 findElement（两者都穿透 open shadow root）
-        const nodes = isCss ? findAllPierced(query) : [findElement(selector)].filter(Boolean) as Element[];
-        if (nodes.length === 0) return { success: false, notFound: true, error: `Element not found: ${selector}` };
-        const results = Array.from(nodes).map((el, i) => {
-          const computed = window.getComputedStyle(el);
-          const css: Record<string, string> = {};
-          for (let j = 0; j < computed.length; j++) {
-            const prop = computed[j];
-            css[prop] = computed.getPropertyValue(prop);
-          }
-          return { index: i, css };
-        });
-        return { success: true, data: { selector, count: nodes.length, results } };
+        const el = findElement(selector) as HTMLElement | null;
+        if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
+        if (!el.isContentEditable) {
+          return { success: false, error: `Element is not contenteditable: ${selector} (tag=${el.tagName})` };
+        }
+        const read = await requestMainWorld("caret_get", { selector });
+        if (!read.ok) {
+          return { success: false, error: typeof read.error === "string" ? read.error : "caret_get failed" };
+        }
+        return {
+          success: true,
+          data: {
+            selector,
+            inEditor: read.inEditor === true, // 光标是否在该编辑器内；false 时下方三项为 null
+            row: read.row, // 0 基行号
+            col: read.col, // 行内 JS UTF-16 偏移
+            text: read.text, // 光标所在行逻辑全文
+          },
+        };
       }
 
       case "frame_info": {
@@ -1742,7 +1870,7 @@ function findCssPierced(css: string): Element | null {
   return null;
 }
 
-// 返回全部匹配（show / get_css 的 css: 分支用）；与 findElement 同为「light DOM 优先、shadow 兜底」
+// 返回全部匹配（show 的 css: 分支用）；与 findElement 同为「light DOM 优先、shadow 兜底」
 function findAllPierced(selector: string): Element[] {
   const css = selector.startsWith("css:") ? selector.slice(4) : selector;
   if (hasShadowToken(css)) {

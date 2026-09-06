@@ -132,6 +132,14 @@ wsClient.onMessage("command", (msg: Message) => {
     handleRealClick(cmd);
     return;
   }
+
+  // upload_dragdrop（trusted:true）：合成 drop 骗不过校验 isTrusted 的上传组件
+  // （微信媒体库等）——拦截走 CDP 真实拖放（浏览器级输入），不进页面合成路径。
+  if (cmd.payload.command === "upload_dragdrop" && cmd.payload.params?.trusted === true) {
+    handleTrustedDrop(cmd);
+    return;
+  }
+
   // Page-level command: forward to target tab (or active tab if not specified)
   const tabId = cmd.payload.params?.tabId as number | undefined;
   const params = { ...cmd.payload.params };
@@ -702,7 +710,7 @@ async function sendToTab(
   // settle，portclosed 可能是执行中导航走——重发 = 双执行。读命令无副作用，missing 可安全
   // 换下一个 frame / 注入重试。写命令 CS 侧最坏 ≈ settle 3s + wait_for 3s（后台 tab 节流更久），
   // 超时放宽到 10s：1200ms 会把慢响应误判为 missing → 导航误报 / 重复执行
-  const destructive = new Set(["click", "type", "keyboard", "trigger", "upload_file", "upload_dragdrop", "paste_rich"]);
+  const destructive = new Set(["click", "type", "keyboard", "trigger", "upload_file", "upload_dragdrop", "paste_rich", "set_cursor"]);
   const isSlow = destructive.has(command);
 
   let response: { success: boolean; data?: unknown; error?: string; notFound?: boolean; navigated?: boolean } | undefined;
@@ -741,7 +749,7 @@ async function sendToTab(
           matchedFrame = f;
           return;
         }
-        // 读命令（get_text/get_css/get_rect/show）：无副作用，换下一个 frame
+        // 读命令（get_text/get_rect/get_cursor/show）：无副作用，换下一个 frame
         continue;
       }
       hadResponse = true;
@@ -976,7 +984,7 @@ interface FullPageInfo {
 }
 
 // 需要在每个 frame 中查找元素的命令（首个命中即返回；坐标 click 只在顶层——elementFromPoint 语义）
-const ELEMENT_SEARCH_COMMANDS = new Set(["click", "type", "keyboard", "get_text", "get_css", "show", "upload_file", "upload_dragdrop", "paste_rich", "get_rect", "get_prop", "trigger"]);
+const ELEMENT_SEARCH_COMMANDS = new Set(["click", "type", "keyboard", "get_text", "show", "upload_file", "upload_dragdrop", "paste_rich", "get_rect", "get_prop", "trigger", "set_cursor", "get_cursor"]);
 
 interface SearchFrame {
   frameId: number;
@@ -1853,6 +1861,215 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     sendResult({ success: false, error: `Unexpected error while running "${cmd.payload.command}": ${detail} (please report this to cda)` });
+  }
+}
+
+/**
+ * upload_dragdrop（trusted:true）：CDP 真实拖放，isTrusted=true。
+ * 合成 drop（页面内派发 dragenter/dragover/drop）isTrusted=false——微信媒体库这类上传组件
+ * 校验「真实受信任的放置」（防页面恶意 JS 伪造上传同一条防线），合成事件永远过不去；
+ * trusted 模式走浏览器级 Input.dispatchDragEvent，语义等同从系统文件管理器拖入真实文件
+ * （Chrome 按 data.path 从磁盘读文件构造 File，页面收到 isTrusted=true 的真实文件 drop）。
+ * 流程：content script 定位元素中心（同 real_click：同源 get_rect / 跨域 CDP 定位）
+ *      -> debugger 附加 -> 激活窗口/tab -> 鼠标渐进到位 -> dragEnter -> dragOver -> drop
+ *      -> 等影响落地（settle 收尾与 real_click 同款，含导航/失联判断）。
+ * 前提：data.path 必须是 Chrome 所在机器上的绝对路径（CDP files 由 Chrome 进程读盘，
+ * 调用方与 Chrome 同机才成立）；文件在 drop 时被读取。SW 无 fs，无法预检存在性——
+ * 路径不存在时页面收到的 File 为空/读盘失败，由页面表现暴露。
+ * debugger attach 会显示"正在调试此浏览器"提示条——与 real_click 一致的已知表现。
+ */
+async function handleTrustedDrop(cmd: CommandMessage): Promise<void> {
+  const params = cmd.payload.params || {};
+  let tabId = params.tabId as number | undefined;
+  const selector = params.selector as string | undefined;
+  const fieldFilter = ((params as Record<string, unknown>)._field as string[] | undefined) || [];
+
+  function sendResult(payload: { success: boolean; data?: unknown; error?: string }): void {
+    wsClient.send({
+      type: "command_result",
+      payload: { commandId: cmd.id!, ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data },
+    });
+  }
+
+  // —— 参数校验：trusted 模式只收本机绝对路径 ——
+  const data = params.data as Record<string, unknown> | undefined;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    sendResult({ success: false, error: 'upload_dragdrop (trusted mode) needs "data": {"path": "/abs/path"}' });
+    return;
+  }
+  const path = data.path as string | undefined;
+  if (typeof path !== "string" || !path) {
+    sendResult({
+      success: false,
+      error:
+        'upload_dragdrop (trusted mode) needs "data.path" — an absolute path to a file on the machine running Chrome. base64/url payloads belong to the synthetic (non-trusted) path: omit trusted:true for those',
+    });
+    return;
+  }
+  if (!(path.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(path) || path.startsWith("\\\\"))) {
+    sendResult({ success: false, error: `data.path must be absolute (got: ${path})` });
+    return;
+  }
+  if (data.base64 !== undefined || data.url !== undefined) {
+    sendResult({
+      success: false,
+      error: 'trusted mode only accepts "data.path"; "base64"/"url" go through the synthetic (non-trusted) path — drop trusted:true for those',
+    });
+    return;
+  }
+  // 文件名取自路径 basename（真实文件拖入的语义；Windows 盘符路径按 / 和 \ 都切）
+  const filename = path.split(/[\\/]/).filter(Boolean).pop() || path;
+
+  try {
+    // tabId 为空时回退到当前激活 tab（server 对 "current" 不传 tabId），与页面级命令一致
+    if (tabId == null) {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tid = tabs[0]?.id;
+      if (tid == null) {
+        sendResult({ success: false, error: "No active tab" });
+        return;
+      }
+      tabId = tid;
+    }
+
+    // 1. 确定放置目标坐标：优先直接 x/y；否则按 frame 搜索定位元素（与 real_click 相同：
+    //    同源 get_rect 已换算顶层视口坐标；跨域记 frameId，attach 后用 CDP 精确定位）
+    let x = params.x as number | undefined;
+    let y = params.y as number | undefined;
+    let cdpFrameId: number | undefined;
+    let hitFrame: SearchFrame | undefined;
+    if (x == null || y == null) {
+      if (!selector && !params.text) {
+        sendResult({ success: false, error: 'upload_dragdrop (trusted mode) needs "selector", "text", or {x, y}' });
+        return;
+      }
+      const frames = await resolveSearchFrames(tabId, params.frame);
+      for (const f of frames) {
+        const r = await sendToFrame(tabId, f.frameId, {
+          type: "execute_command",
+          payload: { command: "get_rect", params: { selector, text: params.text, scroll: true } },
+        }, 8000);
+        if (r.missing || r.response?.notFound) continue;
+        const d = r.response?.data as { x?: number; y?: number; crossOrigin?: boolean } | undefined;
+        if (d?.crossOrigin) {
+          cdpFrameId = f.frameId;
+          hitFrame = f;
+          break;
+        }
+        x = d?.x;
+        y = d?.y;
+        hitFrame = f;
+        break;
+      }
+    }
+    if (x == null || y == null) {
+      sendResult({ success: false, error: `Could not locate element: ${selector || params.text || "unknown"}` });
+      return;
+    }
+
+    // 2. 附加 debugger（显示"正在调试此浏览器"提示条——与 real_click 相同的已知表现）
+    await chrome.debugger.attach({ tabId }, "1.3");
+    try {
+      // 2.1 跨域 iframe：CDP 在目标 frame 上下文里定位元素中心（顶层视口坐标）
+      if (cdpFrameId != null) {
+        const point = await getElementCenterViaCdp(tabId, cdpFrameId, params);
+        if (!point) {
+          sendResult({ success: false, error: `Could not locate element in iframe via CDP: ${selector}` });
+          return;
+        }
+        x = point.x;
+        y = point.y;
+      }
+      // 2.2 激活窗口和标签页（CDP 拖放需要窗口在前台才触发页面交互）
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.windowId != null) {
+          await chrome.windows.update(tab.windowId, { focused: true });
+        }
+        await chrome.tabs.update(tabId, { active: true });
+      } catch {
+        // 窗口激活失败不阻断，继续尝试拖放
+      }
+      // 3. 发送 CDP 真实拖放序列
+      //    真实拖入：鼠标先到目标点（渐进移动触发 hover 链），dragEnter 后页面放置层
+      //    （微信媒体库的全屏放置层等）随事件挂载——事件间留间隙，drop 落在哪由页面
+      //    hit-test 决定，与真人拖入同构。dragData.files = 磁盘绝对路径（items 空数组），
+      //    浏览器在 drop 时按路径构造 File，事件 isTrusted=true。
+      await moveMouseInSteps(tabId, x, y);
+      await new Promise((r) => setTimeout(r, 120));
+      const dragData = { files: [path], items: [], dragOperationsMask: 1 }; // 1 = copy
+      await cdpSend(tabId, "Input.dispatchDragEvent", { type: "dragEnter", x, y, data: dragData });
+      await new Promise((r) => setTimeout(r, 120));
+      await cdpSend(tabId, "Input.dispatchDragEvent", { type: "dragOver", x, y, data: dragData });
+      await new Promise((r) => setTimeout(r, 80));
+      await cdpSend(tabId, "Input.dispatchDragEvent", { type: "drop", x, y, data: dragData });
+    } finally {
+      await chrome.debugger.detach({ tabId }).catch(() => {});
+    }
+
+    // 4. 等影响落地：向命中 frame 发事件驱动的稳定检测（DOM/长任务静默），可选 waitFor 谓词。
+    //    与 real_click 相同：settle 目标 = 命中 frame ?? 顶层 frame（坐标放置同样有影响）
+    const settleFrameId = hitFrame ? hitFrame.frameId : 0;
+    const tabBefore = await chrome.tabs.get(tabId).catch(() => null);
+    const beforeUrl = tabBefore?.url || "";
+    const { response: settleResp, missing } = await sendToFrame(tabId, settleFrameId, {
+      type: "execute_command",
+      payload: { command: "wait_for_settle", params: { timeout: 3000, wait_for: params.waitFor } },
+    }, 8000);
+    const settleInfo = settleResp?.data as
+      | { settled: boolean; settledMs: number; waitFor?: { settled: boolean; waited: number } }
+      | undefined;
+
+    if (missing) {
+      // settle 阶段与 CS 失联：拖放本身（CDP trusted）已确定执行，失联只影响 settle/waitFor
+      // 确认——核实 tab/frame 状态，按证实过的给结论，不编造 settle 结果
+      const tabNow = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tabNow) {
+        sendResult({ success: false, error: "Tab was closed during the real drop — outcome unknown" });
+        return;
+      }
+      const frames = await getFrameTree(tabId);
+      const now = frames.find((f) => f.frameId === settleFrameId);
+      // frame 级导航判断（空 URL 不比较，避免 about:blank 假阳性）
+      const navigatedNow =
+        (!!beforeUrl && !!tabNow.url && tabNow.url !== beforeUrl) ||
+        (settleFrameId !== 0 && !now) ||
+        (!!now && !!hitFrame?.url && !!now.url && now.url !== hitFrame.url);
+      if (navigatedNow) {
+        // 拖放触发了导航：settle 无法继续，waitFor 条件不评估——如实放行（拖放已生效）
+        sendResult({
+          success: true,
+          data: {
+            selector,
+            filename,
+            x, y, trusted: true, settleLost: true,
+            ...(params.waitFor ? { waitFor: { settled: false, skipped: "page navigated after the drop — condition not evaluated" } } : {}),
+          },
+        });
+        return;
+      }
+      if (params.waitFor) {
+        // 页面没导航但 CS 无响应：waitFor 确认确实丢失——拖放已执行，但「条件满足」无法声称
+        sendResult({ success: false, error: "waitFor could not be verified: content script unresponsive after the real drop (the drop itself was dispatched)" });
+        return;
+      }
+      sendResult({ success: true, data: { selector, filename, x, y, trusted: true, settleLost: true } });
+      return;
+    }
+
+    // CS 正常响应：settle 结果（含 waitFor 谓词结果）如实透传
+    sendResult({
+      success: true,
+      data: {
+        selector,
+        filename,
+        x, y, trusted: true,
+        ...(settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...(settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {}) } : {}),
+      },
+    });
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    sendResult({ success: false, error: `Unexpected error while running "upload_dragdrop" (trusted mode): ${detail} (please report this to cda)` });
   }
 }
 

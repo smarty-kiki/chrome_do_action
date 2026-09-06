@@ -245,10 +245,11 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | `keyboard` | `send <id> keyboard <tab> <params>` | Send a key press to an element (`{selector,key}`; selector optional, defaults to the focused element); optional `ctrl`/`shift`/`alt`/`meta` modifiers |
 | `trigger` | `send <id> trigger <tab> <params>` | Dispatch an event on an element (`{selector,event}`): `blur` for form validation, `change`+`value` to pick a `<select>` option (React controlled components included), custom events; `focus`/`blur` move real focus (form validation works); settle + waitFor semantics |
 | `upload_file` | `send <id> upload_file <tab> <params>` | Inject a base64 image into a file input and trigger upload |
-| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | Drag a file into an upload area with no file input that only accepts drops: `{selector,data}` where data is `{base64,filename,mime}` or `{url}` |
+| `upload_dragdrop` | `send <id> upload_dragdrop <tab> <params>` | Drag a file into an upload area with no file input that only accepts drops: `{selector,data}` where data is `{base64,filename,mime}`, `{url}`, or — with `trusted:true` — `{path}` (absolute path on this machine) for a real browser-level drag (isTrusted:true) that passes uploaders validating trusted drops, e.g. WeChat's media library |
 | `paste_rich` | `send <id> paste_rich <tab> <params>` | Paste styled HTML into a rich-text editor |
+| `set_cursor` | `send <id> set_cursor <tab> <params>` | Place the caret **precisely before/after a text fragment** inside an editor (`{selector,text[,occurrence][,position]}`): after/before the match / start/end of the matching line, occurrence picks the Nth match; reads back the actual caret `{row,col,text}` (the editor may normalize it — the read-back is authoritative) |
+| `get_cursor` | `send <id> get_cursor <tab> <params>` | Read the caret position inside an editor (`{selector}`): `{inEditor,row,col,text}` — 0-based row, col offset within the line text, text = the line containing the caret; caret not in the editor → inEditor:false + nulls |
 | `get_text` | `send <id> get_text <tab> [selector]` | Get an element's / the page's text |
-| `get_css` | `send <id> get_css <tab> <selector>` | Get computed styles of all matching elements |
 | `get_prop` | `send <id> get_prop <tab> <params>` | Read an element property's exact raw value (`{selector\|text, prop}`); read-only, never calls methods; scalars returned as-is; non-JSON-safe object values error loudly instead of silently turning empty |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | Get page info (url / title / iframes) |
 | `list_elements` | `send <id> list_elements <tab> <params>` | Page element map: list interactive elements (generated selector / visibility / coordinates / accept) with filter/text/max/visible; pierces shadow DOM, aggregates all frames by default — run it first when you can't find an element |
@@ -285,6 +286,13 @@ All element commands automatically pierce **open shadow roots**: if a bare selec
 // paste_rich — paste styled HTML (mode like type: default replace clears the editor first)
 {"selector": ".rich-editor", "html": "<section><span>hi</span></section>"}
 
+// set_cursor — put the caret right before/after a text fragment in the editor (e.g. to trigger an @/# mention popup)
+{"selector": ".rich-editor", "text": "#topic", "position": "after"}   // position: after|before|start|end — start/end = line start/end
+{"selector": ".rich-editor", "text": "#topic", "occurrence": 2}       // occurrence: which match to target (default 1)
+
+// get_cursor — read the caret position (line text / row / offset)
+{"selector": ".rich-editor"}
+
 // scroll — vertical / horizontal
 {"y": 500}                       // or {"x": 300, "y": 500}
 ```
@@ -307,7 +315,7 @@ Many admin backends ignore synthesized clicks (the click looks successful but ne
 - **`type`**: regular inputs get their value written plus `input`/`change` events; rich-text editing areas get the text inserted **verbatim in one piece — no trimming, no newline splitting, no rewriting**; how it ends up formatted is the editor's own behaviour — cda adapts to no editor (send one paragraph per call for exact structure, appending with `mode:"append"`)
 - **`paste_rich`**: pastes HTML with inline styles into a rich-text editor, preserving font size / color / bold / spacing; `mode` matches `type` (default `replace` is equivalent to "select all, delete, paste a formatted document"; `append`/`insert` available). The paste is handed to the editor's own paste handling — **block-level HTML (paragraphs/headings/lists) is split into blocks by the editor itself**, not pasted as one blob; the result's `pipeline` field tells whether the editor took over the content. No editor sniffing or adaptation
 - **`upload_file`**: injects a base64 image into `input[type=file]` and fires `change`, so the page uploads it — no native file dialog needed (works even without accessibility permission, e.g. uploading article covers)
-- **`upload_dragdrop`**: when there is no file input — only a drag-drop zone — dispatches dragenter/dragover/drop carrying the file at the target area, and the page's drop handler uploads it; complements `upload_file`
+- **`upload_dragdrop`**: when there is no file input — only a drag-drop zone — dispatches dragenter/dragover/drop carrying the file at the target area, and the page's drop handler uploads it; complements `upload_file`. For uploaders that validate real trusted drops (e.g. WeChat's media library; synthetic events have isTrusted:false and get rejected), add `trusted:true` + `data.path` (an absolute path on the machine running Chrome) to perform a browser-level drag instead — trusted events with a real File in `dataTransfer.files`
 
 ### 3. `--field` selective collection
 
@@ -320,7 +328,7 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-Supported by **every command returning an object**: `click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`scroll`/`show`/`hide`/`get_css`/`get_prop`/`get_page_info`/`list_elements`/`get_js_errors`/`real_click`/`open` (for `get_prop`, when the value is a plain object). Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and `get_prop` scalar values pass through as-is — neither has fields to filter.
+Supported by **every command returning an object**: `click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`set_cursor`/`get_cursor`/`scroll`/`show`/`hide`/`get_prop`/`get_page_info`/`list_elements`/`get_js_errors`/`real_click`/`open` (for `get_prop`, when the value is a plain object). Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and `get_prop` scalar values pass through as-is — neither has fields to filter.
 
 ### 4. State awareness — commands return the world after the action
 
@@ -383,11 +391,12 @@ Cross-origin iframes expose only `src` and `sameOrigin: false`; same-origin ones
 | Command | Returns |
 |---|---|
 | `get_text` | a string, e.g. `"Login"` |
-| `get_css` | `{ selector, count, results: [{index, css: {display, …}}] }` |
+| `set_cursor` | `{ selector, position, row, col, text, settledMs }` (row 0-based; col offset within the line text; text = the line containing the caret — read-back is authoritative) |
+| `get_cursor` | `{ selector, inEditor, row, col, text }` (caret not in the editor → `inEditor:false` + nulls, not an error) |
 | `get_prop` | the exact property value (string/number/boolean as-is; plain objects returned with the matched frame; values that can't survive JSON error loudly) |
 | `list_elements` | `{ count, truncated, elements: [{tag, text, visible, x, y, w, h, selector, …}] }` |
 | `type` / `clear_js_errors` | `{ success: true }` |
-| `upload_file` / `upload_dragdrop` | `{ success: true, data: { filename, size, mime } }` |
+| `upload_file` / `upload_dragdrop` | `{ success: true, data: { filename, size, mime } }` (`upload_dragdrop` with `trusted:true`: `{ filename, x, y, trusted, settledMs }` — no size/mime) |
 | `scroll` | `{ success: true, data: { scrollX, scrollY } }` |
 | `get_js_errors` | `{ errors: [{message, source, lineno}], count }` |
 | `close_tab` | `{ success: true, data: { tabId } }` |
