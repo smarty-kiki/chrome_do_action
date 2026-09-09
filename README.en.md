@@ -230,7 +230,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 
 | Command | Usage | Description |
 |---|---|---|
-| `open <url>` | `send <id> open <url>` | Open a URL in a new tab (auto-grouped), waits for load, returns page info |
+| `open <url>` | `send <id> open <url>` | Open a URL in a new tab (auto-grouped), waits for load, returns page info. `<url>` is a **bare URL string, not JSON params** (JSON params are only for page commands) |
 | `list_tabs` | `send <id> list_tabs` | List all tabs |
 | `close_tab <id>` | `send <id> close_tab current` | Close a tab (`current` or numeric tabId) |
 | `refresh <id>` | `send <id> refresh current` | Reload a tab, waits for load |

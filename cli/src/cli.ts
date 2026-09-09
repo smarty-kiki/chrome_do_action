@@ -19,6 +19,9 @@ Options:
 
 Browser commands (no tab):
   open <url>              Open URL in new tab (supports --field)
+                          <url> is a BARE URL string — not a JSON object.
+                          Passing '{"url": ...}' is rejected with an error
+                          (JSON params are only for page commands)
   list_tabs               List all tabs
   close_tab <id>          Close tab ("current" for active, or numeric tabId)
   refresh <id>            Reload tab ("current" for active, or numeric tabId)
@@ -244,6 +247,20 @@ function stripQuotes(s: string): string {
   return s;
 }
 
+// open/show 收裸字符串参数（URL / selector），而页面命令收 JSON params——agent 常
+// 按页面命令习惯传 '{"url":...}' / '{"selector":...}'。原样塞给扩展只会开垃圾 tab
+// 或找不到元素且无提示，这里检测 JSON 对象形态，让调用方报纠正错误而非静默失败
+function jsonObjectArg(raw: string): Record<string, unknown> | null {
+  const s = stripQuotes(raw).trim();
+  if (!s.startsWith("{")) return null;
+  try {
+    const v = JSON.parse(s);
+    return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 const BROWSER_CMDS = new Set(["open", "list_tabs", "close_tab", "refresh"]);
 
 // --- build CLI message ---
@@ -271,15 +288,26 @@ function buildMessage(action: string, args: string[]): Record<string, unknown> {
       let params: Record<string, unknown> = {};
       const raw = args[2] || "";
       switch (command) {
-        case "open":
+        case "open": {
           // open 缺 url 不再静默开 about:blank——报 usage 错误
           if (!raw) {
             console.error("Error: open requires a URL argument.");
             console.error(`Usage: cda --server <url> send <nodeId> open <url>`);
             process.exit(1);
           }
+          // open 的参数是裸 URL 字符串，不是页面命令那种 JSON params——检测到 JSON
+          // 对象就报纠正错误（附解析出的 url，告诉对方直接传它），不开垃圾 tab
+          const openJson = jsonObjectArg(raw);
+          if (openJson) {
+            const u = typeof openJson.url === "string" ? openJson.url : "";
+            console.error("Error: open takes a bare URL string, not JSON params (JSON params are only for page commands).");
+            if (u) console.error(`The url inside your JSON is: ${u} — pass it directly:`);
+            console.error(`Usage: cda --server <url> send <nodeId> open <url>`);
+            process.exit(1);
+          }
           params = { url: raw };
           break;
+        }
         case "close_tab":
         case "refresh":
           if (raw !== "current" && !/^\d+$/.test(raw)) {
@@ -315,6 +343,15 @@ function buildMessage(action: string, args: string[]): Record<string, unknown> {
       const selector = args[3];
       if (!selector) {
         console.error(`Error: "${command}" requires a selector argument.`);
+        console.error(`Usage: cda --server <url> send ${nodeId} ${command} <tabId> <selector>`);
+        process.exit(1);
+      }
+      // show 与 open 同型：selector 是裸字符串而非 JSON params，检测到即报纠正错误
+      const showJson = jsonObjectArg(selector);
+      if (showJson) {
+        const sel = typeof showJson.selector === "string" ? showJson.selector : "";
+        console.error(`Error: "${command}" takes a bare selector string, not JSON params (JSON params are only for page commands).`);
+        if (sel) console.error(`The selector inside your JSON is: ${sel} — pass it directly:`);
         console.error(`Usage: cda --server <url> send ${nodeId} ${command} <tabId> <selector>`);
         process.exit(1);
       }

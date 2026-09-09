@@ -237,7 +237,7 @@ cda send OfficePC clear_js_errors current               # 清空后重新统计
 
 | 命令 | 用法 | 说明 |
 |---|---|---|
-| `open <url>` | `send <id> open <url>` | 打开新标签页（自动加入标签群组），等待加载完成后返回页面信息 |
+| `open <url>` | `send <id> open <url>` | 打开新标签页（自动加入标签群组），等待加载完成后返回页面信息。`<url>` 是**裸 URL 字符串，不是 JSON params**（JSON 只用于页面命令） |
 | `list_tabs` | `send <id> list_tabs` | 列出所有标签页 |
 | `close_tab <id>` | `send <id> close_tab current` | 关闭标签页（`current` 或数字 tabId） |
 | `refresh <id>` | `send <id> refresh current` | 刷新标签页，等待加载完成 |

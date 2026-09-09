@@ -1,7 +1,7 @@
 ---
 name: cda-chrome-control
 description: 通过 cda CLI 控制本机 Chrome 浏览器执行页面操作：打开网页、点击、输入文本、触发事件、富文本排版、上传文件、截图、显示隐藏元素、提取内容、监听 JS 错误、管理标签页。通用浏览器自动化工具，适用于网页后台、CMS、电商、建站、抓取等各种场景。当用户要求"用 Chrome 打开某网页"、"控制浏览器做 XX"、"在网页上填表/发布内容"、"编辑排版网页内容"、"抓取网页内容"、"上传文件"等场景时使用。前置条件：Node.js 18+、本机 Chrome，按"安装"章节完成一次配置。
-version: 1.5.2
+version: 1.5.4
 display_name: cda Chrome 控制
 display_name_en: cda Chrome Control
 description_zh: 用命令行控制本机 Chrome 浏览器执行通用网页操作（打开/点击/输入/富文本排版/上传/截图/抓取/管理标签页）
@@ -60,6 +60,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
    ```
    - `<tab>`：`current`（当前活跃标签页）或数字 tabId；**所有页面级命令（含 real_click/screenshot）均支持 `current`**，tabId 为空时自动回退当前激活 tab
    - 浏览器命令（open/list_tabs/close_tab/refresh）不需要 tab
+   - **`open` 的参数是裸 URL 字符串，不是 JSON params**（JSON 只用于页面命令的 `[params]`）：`send <id> open https://example.com` ✅；`send <id> open '{"url":"https://example.com"}'` ❌ 会被 CLI 明确拒绝
 
 ## 命令参考
 
@@ -68,7 +69,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | 命令 | 用法 | 说明 |
 |------|------|------|
 | `list` | `cda list` | 列出在线浏览器节点，拿节点 ID |
-| `open` | `send <id> open <url>` | 打开 URL（新标签激活），返回 url/title |
+| `open` | `send <id> open <url>` | 打开 URL（新标签激活），返回 url/title。**`<url>` 为裸 URL 字符串，非 JSON params**（❌ `send <id> open '{"url":"..."}'`） |
 | `list_tabs` | `send <id> list_tabs` | 列出所有标签页 |
 | `close_tab` | `send <id> close_tab current\|456` | 关闭标签页 |
 | `refresh` | `send <id> refresh current` | 刷新页面 |
@@ -89,7 +90,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | `upload_dragdrop` | `send <id> upload_dragdrop <tab> '{"selector":".upload-area","data":{"base64":"...","filename":"a.jpg","mime":"image/jpeg"}}'` | 向无 file input、只认拖拽的上传区拖入文件，派发 dragenter/dragover/drop；`data` 支持 base64 或 `{url}`；校验真实拖放的站点（微信媒体库）加 `"trusted":true` + `data.path`（本机绝对路径）走浏览器级真实拖放 |
 | `show` | `send <id> show <tab> '.toolbar-menu'` | 强制显示隐藏元素（仅改 CSS：visibility/opacity/display），让 hover 菜单常驻可见后可点击 |
 | `hide` | `send <id> hide <tab>` | 还原所有被 show 的元素（清 inline style 回 CSS 控制） |
-| `get_text` | `send <id> get_text <tab> [selector]` | 获取文本（无 selector 取整页；带 selector 自动搜索 iframe） |
+| `get_text` | `send <id> get_text <tab> '{"selector":"..."}'` | 获取文本（无 params 取整页；带 selector 自动搜索 iframe） |
 | `get_prop` | `send <id> get_prop <tab> '{"selector":"#title","prop":"value"}'` | 读取元素属性的**真实原值**（只读，从不调用方法）：`value` 校验输入写入、`checked` 看勾选态、`innerHTML`/`src`/`className` 等任意属性；标量原样返回，无法无损转 JSON 的对象明确报错而非静默变空 |
 | `get_page_info` | `send <id> get_page_info <tab>` | 页面信息（url/title/iframes），支持 --field；iframes 对**跨域也补全 url/html** |
 | `list_elements` | `send <id> list_elements <tab> '{"filter":"upload","visible":true}'` | **页面元素地图**：列出可交互元素（生成好的 selector/可见性/坐标/accept 等），支持 filter/text/max/visible；穿透 shadow DOM，缺省聚合所有 frame（元素带 frame url）；找不到元素先查它 |

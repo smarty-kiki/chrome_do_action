@@ -410,13 +410,13 @@ cda send OfficePC get_text current '{"selector":"table"}'
 
 ## 命令速查
 
-所有页面命令都需要指定标签页（`current` 或数字 tabId），浏览器命令不需要。
+所有页面命令都需要指定标签页（`current` 或数字 tabId），浏览器命令不需要。JSON params 只用于页面命令——浏览器命令里 `open` 的参数是**裸 URL 字符串**：`send <id> open https://example.com` ✅，`send <id> open '{"url":"https://example.com"}'` ❌（CLI 会拒绝并提示）。
 
 ### 浏览器命令
 
 | 命令 | 用法 | 说明 |
 |------|------|------|
-| `open <url>` | `send <id> open <url>` | 打开新标签页，等待加载完成 |
+| `open <url>` | `send <id> open <url>` | 打开新标签页，等待加载完成。参数是 URL 字符串，不是 JSON params |
 | `list_tabs` | `send <id> list_tabs` | 列出所有标签页 |
 | `close_tab <id>` | `send <id> close_tab current` | 关闭标签页 |
 | `refresh <id>` | `send <id> refresh current` | 刷新标签页，等待加载完成 |
