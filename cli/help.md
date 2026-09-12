@@ -71,9 +71,9 @@ cda list
 
 `click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`scroll`/`real_click` 返回前会**等动作的影响落地**——事件驱动（DOM 变化 + 长任务检测），不是固定 sleep：
 
-- **无影响动作**（点击无副作用元素）：约 0.6s 返回（600ms 活动窗口 + 静默确认）
-- **有影响动作**（异步渲染、debounce 重排）：等到 DOM 安静 250ms 后返回，`settledMs` 如实反映等待耗时
-- **影响落地晚于检测窗口**（服务端请求响应后才渲染、长 debounce）→ 传 `waitFor` 谓词：
+- **无影响动作**（点击无副作用元素）：约 1s 返回（1s 活动窗口内没有任何动静，窗口耗尽即放行）
+- **有影响动作**（异步渲染、debounce 重排）：活动窗口内一有动静就继续等，等 DOM 安静 250ms 后返回，`settledMs` 如实反映等待耗时
+- **影响落地晚于约 1 秒的活动窗口**（服务端请求响应后才渲染、长 debounce、纯网络等待）→ 传 `waitFor` 谓词：
 
 ```json
 {"selector": "#toast", "waitFor": {"selector": "#success-toast"}}
@@ -120,8 +120,9 @@ cda list
 
 - `--field a` → `{a: 完整值}`
 - `--field a.b` → `{a: {b: 值}}`（脚本 `res.a.b` 恒可读）
-- `--field arr.k`（arr 为数组）→ `{arr: [k1, k2, ...]}`
-- 不存在的路径忽略，不报错；无 `--field` 时返回全量
+- `--field arr.k`（arr 为数组）→ `{arr: [k1, k2, ...]}`；返回本身就是数组时同样逐项裁剪（如 `list_tabs --field url` → `[{url}, ...]`）
+- **拼错的字段不会被静默吞掉**：请求了但结果里根本没有的字段名，CLI 会在 stderr 明确提示「这个字段没匹配到」，其余字段照常返回——`--field` 打错字时不必再靠"怎么是空的"来猜
+- 无 `--field` 时返回全量
 - `get_text` 返回纯文本字符串；`get_prop` 的值是标量（字符串/数字/布尔）时原样返回——均无字段可滤（`get_prop` 拿到普通对象值时同样支持 `--field` 裁剪）
 
 ### 常用字段路径
@@ -209,14 +210,27 @@ Web Components 站点（小红书创作后台等）把按钮/编辑器包在 sha
    {"text": "发布"}
    ```
 
-- **closed shadow root 走 CDP 通道**（v0.28 起）：`attachShadow({mode:"closed"})` 造的子树对**页面内的一切**都不可见——不只 cda，`exec` 注入的任意 JS（`document.querySelector`）同样看不见它（这正是不该用 `exec` 当常规解法的原因之一：它在主世界跑，一样穿不进闭包）。cda 改为在协议层重查：
-  - `list_elements {"closed": true}` —— 枚举闭包内的可交互元素（带 `backendNodeId`，无 `selector`）
-  - `get_rect` —— 页面内通道全 frame 都报 notFound 时**自动**走 CDP 重查，命中即返回真值（无需开关）
-  - `click` / `real_click` / `get_rect` / `get_prop` / `get_text` —— 接受 `{"backendNodeId": N}` 直接操作闭包内元素
-  - `real_click` 的 `hit` 回执同样走 CDP 命中测试，闭包内**不会被 retarget 成宿主**
-  - **不接受的命令会明确报错，不会静默兜底**：`type` / `keyboard` / `trigger` / `upload_*` 这类**需要选择器**的命令拿到 `backendNodeId` 会直接返回错误并列出可用命令——闭包内拿不到选择器，这些动作对闭包节点本来就无从下手，宁可报错也不给一份看着正常、其实什么都没做的返回。要输入闭包内的输入框：open shadow root 用 `>>>` 选择器；真闭包暂不支持输入
-- **边界（已知且明确）**：穿透覆盖顶层 frame 与**同源** iframe；跨域 OOPIF 内的闭包需要目标进程单独附加，当前未覆盖——真遇到时按 `not-found` 处理，用坐标兜底并在脚本里断言 `hit`
-- `get_page_info --field html` 的 html **默认包含 shadow DOM 内容**：open shadow root 以内联 `<template shadowrootmode="open">` 形式出现在宿主元素里；无 shadow 的页面输出与之前完全一致。**closed shadow root 不在 html 里**（浏览器不暴露其内容）
+- **封闭型 shadow 子树（closed shadow root）另走一条通道**（v0.28 起）：这类子树是页面主动封起来的，对**一切常规查询**都不可见——不只 cda 的选择器，页面里注入的任意 JS 同样看不见它（这正是不该用 `exec` 当常规解法的原因之一：它照样穿不进这类子树）。cda 换一条路子重新查一遍：
+  - `list_elements {"closed": true}` —— 枚举其中的可交互元素（带 `backendNodeId`，无 `selector`）
+  - `get_rect` —— 常规查询全 frame 都报「没有」时**自动**重查一遍，命中即返回真值（无需开关）
+  - `click` / `real_click` / `get_rect` / `get_prop` / `get_text` —— 接受 `{"backendNodeId": N}` 直接操作其中的元素
+  - `real_click` 的 `hit` 回执在这类元素上同样真实：报出的是真正会收到点击的那个按钮，而不是它外面那层壳
+  - **不支持的命令会明确报错，不会静默兜底**：`type` / `keyboard` / `trigger` / `upload_*` 这类**需要选择器**的命令拿到 `backendNodeId` 会直接返回错误并列出可用命令——这类元素给不出选择器，这些动作本来就无从下手，宁可报错也不给一份看着正常、其实什么都没做的返回。要输入其中的输入框：open shadow root 用 `>>>` 选择器；封闭子树暂不支持输入
+- **边界（已知且明确）**：覆盖顶层页面与**同源** iframe；跨域 iframe 里再套封闭型子树的组合当前未覆盖——真遇到时报 `not-found`，改用坐标兜底并在脚本里核对 `hit`
+- `get_page_info --field html` 的 html **默认包含 shadow DOM 内容**：open shadow root 以内联 `<template shadowrootmode="open">` 形式出现在宿主元素里；无 shadow 的页面输出与之前完全一致。**封闭型子树不在 html 里**（浏览器不提供其内容）
+
+## 文字口径：读到的就是页面上的
+
+cda **不改写、不加工、不截断**任何读回来的文字。凡是返回里带文字的地方（`get_text` 的整页/元素文本、`get_rect.text` 与 `allMatches[].text`、`list_elements[].text`、`clickDesc` 里描述元素的文字、`real_click.hit.text`），都是页面上的**原样值**——首尾空格、换行、连续空格全部保留，不 trim、不折叠、不截断。拿去和页面比对时，拿到的就是页面上的字面量。
+
+查询侧（`{"text":"..."}` 定位、`list_elements {"text":"..."}` 过滤）放宽一些，两种写法**任一成立即命中**：
+
+1. 页面文字**原样包含**你给的串
+2. 页面文字**折叠空白后**包含折叠后的串
+
+于是从 `get_text`/`get_rect` 里原样复制一段文字（哪怕它带着首尾空格或换行）直接当查询串用，命中不了的概率很低；页面上多打几个空格也不影响命中。要精确定位、排除子串误命中时用 `{"exact":true}`（整段相等）。
+
+> 两侧的差别是有意为之：**放宽的是匹配，收紧的是报告**——匹配宽松是为了好用，报告原样是为了可信。
 
 ## 常用场景
 
@@ -351,7 +365,7 @@ cda send OfficePC get_rect current '{"text":"发布","all":true}' --field "match
 cda send OfficePC real_click current '{"x":214,"y":1008}' --field "hit,navigated"
 ```
 
-目标在 closed shadow root 里时改走 backendNodeId 闭环，全程不碰坐标、不看截图：
+目标在封闭型 shadow 子树里时改走 backendNodeId 闭环，全程不碰坐标、不看截图：
 
 ```bash
 cda send OfficePC list_elements current '{"closed":true}' --field "elements.backendNodeId,elements.text,elements.inClosedShadowRoot"
@@ -471,12 +485,12 @@ cda send OfficePC get_text current '{"selector":"table"}'
 | `get_rect` | `send <id> get_rect <tab> <params>` | **元素几何真值**：`{selector\|text\|xpath}/{selectors:[...]}/{backendNodeId}` → rectCss + centerCss + 可见性 + 遮挡（covered/hitTest）+ 歧义（matchCount/allMatches）+ `waitStableMs` 等稳定。**坐标口径与 real_click {x,y} 完全一致**：取到 centerCss 直接喂给 real_click 即命中同一元素 |
 | `get_viewport` | `send <id> get_viewport <tab>` | **视口真值**：`{viewportCss:{w,h}, dpr, scrollCss:{x,y}, screenCss:{w,h}}`。截图换算的权威来源；dpr 与 screenshot 的 `imagePx.w / viewportCss.w` 一致 |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | 获取页面信息 |
-| `list_elements` | `send <id> list_elements <tab> <params>` | 列出可交互元素（带生成好的 selector、可见性、坐标、关键属性），支持 filter/text/max/visible 过滤；`{closed:true}` 连 **closed shadow root** 内的元素一起列（这类条目只有 backendNodeId，没有 selector）；找不到元素时先查它 |
+| `list_elements` | `send <id> list_elements <tab> <params>` | 列出可交互元素（带生成好的 selector、可见性、坐标、关键属性），支持 filter/text/max/visible 过滤；`{closed:true}` 连**封闭型 shadow 子树**内的元素一起列（这类条目只有 backendNodeId，没有 selector）；找不到元素时先查它 |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取 JS 错误 |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空 JS 错误 |
 | `screenshot` | `send <id> screenshot <tab> <params>` | 截图当前页面（只读，不注入代码）；`{"path":"/tmp/shot.png"}` 保存到本地。CLI 打印 JSON：`{path, bytes, imagePx, viewportCss, dpr, scale, chromeInsetCss, scrollCss, mapping}`——换算元数据与图一起回，坐标不再靠猜 |
 | `scroll` | `send <id> scroll <tab> <params>` | 滚动页面 |
-| `exec` | `send <id> exec <tab> <params>` | ⚠ **仅排查问题**：在页面主世界执行任意 JS 并返回结果（{code}）。高风险，默认关闭——必须先到插件配置页勾选「允许 exec 命令（仅排查问题）」，见下方「排查问题：exec」 |
+| `exec` | `send <id> exec <tab> <params>` | ⚠ **仅排查问题**：在页面里执行任意 JS 并返回结果（{code}）。高风险，默认关闭——必须先到插件配置页勾选「允许 exec 命令（仅排查问题）」，见下方「排查问题：exec」 |
 
 ### click 定位方式
 
@@ -501,9 +515,9 @@ cda send OfficePC get_text current '{"selector":"table"}'
   ```
 - **iframe 支持**：自动搜索所有 iframe（含跨域），也可用 `frame` 参数指定目标
 - 适用：对合成事件免疫的站点（合成 click 提示成功却不触发）、hover 才显示的工具条元素
-- 副作用：attach 瞬间 Chrome 顶部会出现"正在调试此浏览器"横幅，随即消失
+- 副作用：执行瞬间 Chrome 顶部会闪过一条提示条（正常现象），随即消失
 - 使用：`send <id> real_click <tab> '{"selector":"#submit"}'` 或 `'{"x":100,"y":200}'`，iframe 内加 `frame` 参数
-- **`{backendNodeId: N}` 定位**：点击 closed shadow root 内、任何选择器都寻址不到的元素（N 从 `list_elements {"closed":true}` 或 `get_rect` 的返回里拿）
+- **`{backendNodeId: N}` 定位**：点击封闭型 shadow 子树内、任何选择器都寻址不到的元素（N 从 `list_elements {"closed":true}` 或 `get_rect` 的返回里拿）
 
 **命中回执 `hit`（坐标点击的"假成功"终结者）**
 
@@ -518,8 +532,9 @@ cda send OfficePC get_text current '{"selector":"table"}'
 ```
 
 - `hit` 在**鼠标渐进到位、按下之前**采样：既保证"我即将点到谁"是真的，又不受点击后果（页面跳转/元素消失）干扰
-- 命中测试走 CDP 协议层，**在 shadow root 内依然真实**——页面内 `elementFromPoint` 遇到 shadow 只会返回宿主元素，问不出闭包里的按钮
+- 命中判定在封闭型 shadow 子树里**同样真实**：拿到的是真正会收到点击的那个按钮，而不是它外面那层壳
 - 于是脚本可以这样自保：点到「暂存离开」= 坐标算错 → **立即中止**，不再糊里糊涂中断发布流程
+- **两个显式的拒收**（坐标给错就当场报错，不会"看起来成功"）：只给了一半坐标（`{"y":300}`）会提示必须 `{x, y}` 成对传；坐标落在页面可视区之外（如 `y:-400`、超过视口高）会明确说"那里什么都收不到，所以没有派发"，并提示先滚进可视区（`get_rect {"scroll":true}`）或改用 selector/text/backendNodeId 让命令自己滚
 - `hitUnavailable` 字段说明 `hit` 缺失的原因（如命中点不在任何可描述节点上）
 - `warning?` 只在链路里**非致命但没按预期完成**的步骤出现（窗口不可聚焦导致激活挂起被放弃、鼠标轨迹没走完）——点击照常派发，但"点了却没反应"时先看这里，它把原因写明了（`upload_dragdrop trusted` 同样有这个字段）
 - `navigated` 由点击前后的真实 URL 对比得出（click/real_click 都报），`settledMs` 是等页面稳定实际花掉的毫秒数
@@ -543,7 +558,8 @@ cda send OfficePC real_click current '{"x":214,"y":1008}' --field "hit.text"    
 {"all": true}                            // 强制带出全部候选明细（有歧义时默认也会带）
 {"waitStableMs": 300}                    // 等矩形连续 300ms 不变再返回
 {"selectors": [".a", ".b", ".c"]}        // 批量：一次往返拿多个矩形
-{"backendNodeId": 4211}                  // closed shadow root 内的元素（来自 list_elements {"closed":true}）
+{"scroll": true}                         // 先把元素滚进可视区再量（量到的坐标保证可点）
+{"backendNodeId": 4211}                  // 封闭型 shadow 子树内的元素（来自 list_elements {"closed":true}）
 ```
 
 返回（均为增补字段，`x/y/width/height` 语义与取值不变）：
@@ -562,23 +578,23 @@ cda send OfficePC real_click current '{"x":214,"y":1008}' --field "hit.text"    
 ```
 
 - **坐标口径 = 顶层视口 CSS 像素**：`centerCss` 即顶层 `getBoundingClientRect()` 的中心；iframe 内元素的坐标**已加好 frame 偏移**，不需要手工换算（见「坐标口径」）
-- **`covered` / `hitTest` 回答「会不会点歪」**：`hitTest` 是中心点实际命中的元素，语义与 `click` 返回的 `clickDesc.coveredBy` 一致。命中测试走 **CDP 协议层**，因此**在 shadow root 内依然真实**——页面内 `elementFromPoint` 遇到 shadow 只会把结果 retarget 成宿主，问不出闭包里的真实元素。`covered:true` 表示中心被别的元素压住，照这个坐标点会点到压住它的那个
+- **`covered` / `hitTest` 回答「会不会点歪」**：`hitTest` 是中心点实际命中的元素，语义与 `click` 返回的 `clickDesc.coveredBy` 一致；在封闭型 shadow 子树里同样真实。`covered:true` 表示中心被别的元素压住，照这个坐标点会点到压住它的那个
 - **`matchCount` / `allMatches` 回答「是不是点错了兄弟」**：`{"text":"发布"}` 是**子串**匹配，页面上「发布笔记」「发布」可能同时命中。`matchCount > 1` 时返回明细，每项带 `rectCss`/`visible`/`priority`——**`priority: 0` 就是 `click {"text":...}` 会点的那个**（只在可见候选间排序），其余是此前被静默忽略的兄弟。只报告、不改变既有选择行为；要精确指定用 `{"exact":true}`
-- **`{"all":true}` 会把闭包内的同名命中也算进来**：页面内通道看不见 closed shadow root，只报它自己那份会把歧义报成 `matchCount:1`（实测：「发布笔记」+ 页脚闭包里的「发布」被报成只剩前者）。显式要全貌时补一次 CDP 通道，闭包内的命中**追加**进 `allMatches`（带 `inClosedShadowRoot:true` + `backendNodeId`，`priority` 顺延），并附 `matchCountNote` 说明两半各来自哪条通道——`priority:0` 的语义不变，仍是 `click {"text":...}` 会选中的那个
+- **`{"all":true}` 会把封闭子树里的同名命中也算进来**：常规查询看不见这类子树，只报它自己那份会把歧义报成 `matchCount:1`（实测：「发布笔记」+ 页脚闭包里的「发布」被报成只剩前者）。显式要全貌时会多查一遍，把其中的命中**追加**进 `allMatches`（带 `inClosedShadowRoot:true` + `backendNodeId`，`priority` 顺延），并附 `matchCountNote` 说明两半各来自哪一步——`priority:0` 的语义不变，仍是 `click {"text":...}` 会选中的那个
 - **`waitStableMs`**：矩形连续 N 毫秒不变才算定稿（懒加载、动画、字体回流都会让矩形漂移），返回 `waitStable: {waited, stable}`；`stable:false` 表示等到超时仍在动
 - **批量 `{selectors:[...]}`**：一次返回 `{count, items:[{selector, 各矩形字段...}]}`；每项**自带 `code`**，单条失败不中断整批（`found:false` + `code`），跨 frame / 跨闭包的项各自解析
-- **closed shadow root 自动穿透**：页面内通道全 frame 都报「没有」时自动走 CDP 重查，命中即返回带 `backendNodeId` + `inClosedShadowRoot:true` 的真值（无需开关）。这也是本命令存在的一半理由——详见「shadow DOM 定位」
-- 走 CDP 通道的结果（`source: "cdp-pierced"`）额外带 `viewportCss`：那是**量这份几何时所处的附加态视口**（见「坐标口径」）。它与 `get_viewport` 报的可能差一条 debugger 信息条的高度，用它来判断这份坐标该配哪条通道的动作。若这一次会话里信息条压根没出现（两个空间重合），返回里会带 `viewportNote` 明说——那种情况下这份坐标与 `get_viewport` 一致，`real_click {x,y}` 和 `click {x,y}` 都配得上
+- **封闭型 shadow 子树自动兜底**：常规查询全 frame 都报「没有」时会自动再查一遍这类子树，命中即返回带 `backendNodeId` + `inClosedShadowRoot:true` 的真值（无需开关）。详见「shadow DOM 定位」
+- 走封闭子树通道的结果另带 `viewportCss`（量这份几何时的视口尺寸）和 `source`（来源标记）：用途只有一个——**提醒这份坐标与别的命令报的可能不是同一个视口口径**（见「坐标口径」）。两者口径一致时返回里会带 `viewportNote` 说明，那种情况下 `real_click {x,y}` 和 `click {x,y}` 都配得上
 - **错误码可区分**（不再统一 `no match`）：
   - `not-found` —— **真的不存在**
-  - `unreachable-subtree` —— **存在但不可寻址**：CDP 树里找到了，却没有可用几何（不可见 / 无布局盒 / 选择器无法在闭包内寻址 / 节点已失效）
-  - `cdp-unavailable` —— debugger 附加失败（如 DevTools 正开着占用）
+  - `unreachable-subtree` —— **存在但不可寻址**：找到了，却没有可用几何（不可见 / 没有布局盒 / 给不出选择器 / 节点已失效）
+  - `cdp-unavailable` —— 调试通道被占用（最常见的原因：DevTools 正开着），关掉 DevTools 重试
   - 被遮挡**不是**错误，是返回里的 `covered` / `hitTest`
 
 ### get_viewport
 
 ```
-send <id> get_viewport <tab>        # 只读，不开 debugger
+send <id> get_viewport <tab>        # 只读
 ```
 
 **视口真值**——截图换算与坐标校验的权威来源：
@@ -597,7 +613,7 @@ send <id> get_viewport <tab>        # 只读，不开 debugger
 - 读的是**被路由到的那个 frame**（缺省顶层）；`frame` 指到 iframe 时 `isTop: false` 如实上报，避免拿子 frame 的数字去换算顶层截图
 - 不缓存：改窗口尺寸 / 缩放后重新调用即得新值
 - 另带 `visualViewportCss`（缩放、软键盘下的可视视口）
-- **这条命令不开 debugger**：它报的是「没有 debugger 时」的视口。走 CDP 通道的命令（下一条）看到的会矮一条「正在调试此浏览器」信息条——两者都要用，别混用
+- **这条命令报的是「页面上没有提示条时」的视口**。`real_click`/`screenshot`/传 `backendNodeId` 的命令因为执行期间会浮出提示条，看到的会矮一条——两者都要用，别混用（见「坐标口径」）
 
 ### 坐标口径（一句话承诺）
 
@@ -605,21 +621,18 @@ send <id> get_viewport <tab>        # 只读，不开 debugger
 
 从别处来的偏移量必须先换算再喂进去：截图里的原始像素要 `/ dpr`，页面绝对坐标要先减掉 `scrollCss`。按这个口径取坐标，永远不需要手工加 iframe 偏移。
 
-#### ⚠️ 两个视口空间：debugger 信息条会让视口变矮
+#### ⚠️ 两个视口空间：别跨命令搬运坐标
 
-`chrome.debugger` 一附加，Chrome 就在页面顶部浮出「扩展正在调试此浏览器」信息条，**页面视口随之变矮**（实测：1440×749 的页面，附加后稳定在 1440×693，差 56px；信息条还有一段动画，动画期间数值还在变）。于是同一页面有两个视口：
+部分命令执行期间，Chrome 会在页面顶部浮出一条提示条，**可视区域随之变矮一条**（实测：1440×749 的页面，浮出后稳定在 1440×693，差 56px；提示条还有一段展开动画，动画期间数值还在变）。于是同一页面存在两个视口：
 
-| 空间 | 谁在这个空间里 | 谁的量法 |
-| --- | --- | --- |
-| **附加态**（矮一条信息条） | `real_click` / `click {backendNodeId}` / `screenshot` 的图 / `get_rect` 兜底通道（`source:"cdp-pierced"`）/ `list_elements {closed:true}` 的闭包条目 | 测量与动作都在 debugger 附加期间发生，**量的和点的是同一个视口** |
-| **页面内态**（完整高度） | `get_viewport` / `list_elements` 的普通条目 / `click {x,y}` / `get_rect` 页面内通道 | 不附加 debugger，页面自己的 `innerHeight` |
+| 空间 | 谁在这个空间里 |
+| --- | --- |
+| **有提示条**（矮一条） | `real_click`、传 `backendNodeId` 的命令、`screenshot` 拍到的图、`get_rect` 的兜底通道、`list_elements {closed:true}` 的闭包条目 |
+| **无提示条**（完整高度） | `get_viewport`、`list_elements` 的普通条目、`click {"x","y"}`、`get_rect` 的常规通道 |
 
-- **顶部锚定的静态内容在两个空间里坐标相同**（不重排）；**底部锚定（页脚 fixed）/ 垂直居中 / `vh` 计量的元素会差一个信息条的高度**。页脚按钮正是这一类——`get_rect` 量到的 y 与页面内量到的 y 相差 56px 属于正常，不是谁算错了
-- **配对规则**：坐标从哪条通道来，就配哪条通道的动作。CDP 通道的坐标配 `real_click {x,y}`（或直接用 `backendNodeId` 让命令自己量）；页面内通道的坐标配 `click {x,y}`
-- 每条 CDP 通道结果都带 `viewportCss`（量这份几何时所处的视口）；拿它和 `get_viewport` 的对比即可发现当前是哪一种情况
-- **跨通道比较才会遇到这条差异**（比如拿 `get_viewport` 去校验 `screenshot.viewportCss`）；**同一条命令内部的「量」与「点」永远在同一空间**，不需要使用者补偿
-- 命令内部已处理这层：`get_rect` 兜底、`real_click`、`upload_dragdrop trusted`、`screenshot` 在附加后会**先等信息条真的出现（视口比页面内态矮下去）再测量/派发**。判据特意不是「数值不动」——信息条的出现比 attach 慢半拍（同一浏览器会话里第一次附加最明显），先稳住的往往正是还没变矮的那个瞬时值；所以内部拿页面内态的视口高度当对照，等不到变矮就一直等到超时，等到了再等 300ms 确认稳定。真有会话始终不弹信息条（对照高度没变矮），就照实测量并在结果里带 `viewportNote` 说明「这份坐标与 `get_viewport` 同空间」
-- `real_click {selector|text}` 更会把页面内量到的坐标在附加态重新量一次，所以「底部锚定的目标点歪」这个坑已被堵住
+- **顶部锚定的静态内容两个空间坐标相同**（不重排）；**底部锚定（页脚 fixed）/ 垂直居中 / `vh` 计量的元素会差一条的高度**。页脚按钮正是这一类——量到的 y 相差 56px 属于正常，不是谁算错了
+- **使用者只需守一条规则：坐标别跨命令搬运。** 别拿 `get_viewport` 去校验或补偿 `screenshot`，反之亦然，也别用其中一个去补偿自己手算的坐标。要动手就二选一：① 用 `get_rect` 取 `centerCss`，紧接着 `real_click` 用同一份坐标（这两者同一口径）；② 更稳的是直接给 `selector`/`text`/`backendNodeId`，让命令自己量自己点
+- **同一条命令内部的「量」与「点」永远在同一空间**，不需要使用者补偿：命令会等提示条真的出现再测量/派发，`real_click {selector|text}` 还会把页面里量到的坐标在那一空间重新量一次——「底部锚定的目标点歪」这个坑已堵住。真有某次会话提示条始终没浮出来，就照实测量并在结果里带 `viewportNote` 说明
 
 ### type 参数
 
@@ -774,10 +787,10 @@ send <id> get_viewport <tab>        # 只读，不开 debugger
 ```
 
 - **元素范围**：可点击/可输入的常见元素（button/a/select/textarea/input/label、富文本编辑区、tabindex、常见交互 role），**穿透 open shadow DOM**；被 CSS 隐藏的（如 display:none 的 tab 页里的 file input）也会列出（`visible: false`）
-- **`{closed:true}` 列出 closed shadow root 内的元素**（**默认关闭，不开时输出与之前逐字一致**）：这类元素对**所有页面内通道都是「不存在」**的——`document.querySelector`、open-shadow 穿透、in-page 枚举全都看不到它们，但这不等于元素不在。开启后走 CDP 协议层枚举，条目**排在列表最前**（防止 `max` 把整块能力静默截掉），带 `backendNodeId` + `inClosedShadowRoot: true` 但**没有 `selector`**（闭包内拼不出稳定选择器，这是浏览器的设计而非 cda 的偷懒）
+- **`{closed:true}` 列出封闭型 shadow 子树内的元素**（**默认关闭，不开时输出与之前逐字一致**）：这类元素对**一切常规查询都是「不存在」**的——选择器、open-shadow 穿透、整页枚举全都看不到它们，但这不等于元素不在。开启后会专门查一遍，条目**排在列表最前**（防止 `max` 把整块能力静默截掉），带 `backendNodeId` + `inClosedShadowRoot: true` 但**没有 `selector`**（这类元素给不出稳定选择器，是页面的封装方式使然，不是 cda 偷懒）
 - **怎么用这类条目**：把 `backendNodeId` 直接喂给 `click` / `real_click` / `get_rect` / `get_prop` / `get_text`，形成「枚举 → 核对 → 量矩形 → 下手」的闭环，全程不碰坐标也不碰截图
 - **边界**：能用 `backendNodeId` 的就是上面这五个命令。**`type` / `keyboard` / `trigger` / `upload_*` 拿到 `backendNodeId` 会明确报错**（不是静默忽略参数，也不是退化成量矩形）——它们要靠选择器才能定位到输入对象，闭包节点没有选择器，所以闭包内的输入框/上传控件暂不支持；这类元素若在 **open** shadow root 里，用 `>>>` 选择器即可
-- 闭包条目的 `x/y` 是在**附加态视口**（多一条 debugger 信息条，见「坐标口径」）里量的，与同一份返回里页面内条目的 `x/y` 不是同一空间——底部锚定的元素会差一条信息条的高度。**要动手就用 `backendNodeId`**（命令自己会在动手时重新量），别把这类坐标跨界喂给 `click {x,y}`
+- 闭包条目的 `x/y` 是在**有提示条的视口**（见「坐标口径」）里量的，与同一份返回里普通条目的 `x/y` 不是同一空间——底部锚定的元素会差一条的高度。**要动手就用 `backendNodeId`**（命令会在动手时重新量），别把这类坐标跨界喂给 `click {"x","y"}`
 - 返回 `closedCount`（闭包内元素条数）；闭包那一趟没跑成时 `closedError` 说明原因——**不会静默报 0**；若截断丢掉了闭包条目，`warning` 会写明丢了几条
 - **`selector` 由 cda 自动生成**，**可直接喂给 click/type/upload_file 等任何命令**；shadow 内的元素会带 `>>>` 连接符
 - **input 附加属性**：`type`/`accept`/`multiple`/`name`/`placeholder`；通用附加 `role`/`ariaLabel`/`title`/`text`（截断 80 字符）
@@ -853,7 +866,7 @@ CLI 打印的不再只有路径，而是**图 + 换算元数据**（base64 写�
 
 - **`imagePx.w / dpr === viewportCss.w` 恒成立**——截图与视口严格 1:1（不含浏览器 UI、不含标签栏）。因此 `chromeInsetCss` 由构造即为 `{top:0,left:0}`：它不是「不确定的偏移」，而是每次运行都断言的不变量。断言若不成立，返回里带 `warning` 如实说明，**绝不给出错误的 mapping**
 - `viewportCss` **是从图本身反推的**（`imagePx / dpr`）：图是这次拍到的既成事实，用它自己的尺寸描述它，`imagePx.w / dpr === viewportCss.w` 便由构造成立、不受拍照瞬间页面在动的影响。另附 `viewportSource` 说明这是**附加态视口**（见「坐标口径」）——它可能比 `get_viewport` 报的矮一条信息条的高度
-- 拍照时会**先等 debugger 信息条动画结束**再按快门；拍完再量一次视口做交叉校验，两者对不上（差 > 1 CSS px）就在 `warning` 里如实说明是哪一轴差了、为什么，而不是把不一致咽下去
+- 拍照前会**等提示条展开动画结束**再按快门；拍完再量一次视口做交叉校验，两者对不上（差 > 1 CSS px）就在 `warning` 里如实说明是哪一轴差了、为什么，而不是把不一致咽下去
 - **图像像素 → CSS 坐标**：`css = imagePx / dpr`，得到的正是 `real_click {x,y}` 吃的那个坐标（见「坐标口径」）
 - `--field` 裁剪不影响写盘：base64 是 CLI 写盘用的原料，会被强制保留并在打印前剔掉。若扩展返回里没有图像数据，命令**报错退出**（绝不"成功返回 + 磁盘上没图"）
 - 截取当前标签页（PNG），只读能力（等同 DevTools 截图），不注入代码、不修改页面
@@ -862,7 +875,7 @@ CLI 打印的不再只有路径，而是**图 + 换算元数据**（base64 写�
 
 ### 排查问题：exec（高风险，仅排查问题使用）
 
-> ⚠ **exec 只在排查问题时临时使用**。它把一段**任意 JavaScript 注入页面主世界执行**——可以读取、修改页面乃至浏览器内的一切数据。日常流程不要用 exec：需要做什么动作请用上面的具体命令（click/type/get_prop 等）。排查完毕后请关闭开关。
+> ⚠ **exec 只在排查问题时临时使用**。它把一段**任意 JavaScript 注入页面执行**——可以读取、修改页面乃至浏览器内的一切数据。日常流程不要用 exec：需要做什么动作请用上面的具体命令（click/type/get_prop 等）。排查完毕后请关闭开关。
 
 用法（与页面命令同形，tab 必填）：
 
@@ -876,7 +889,7 @@ cda send OfficePC exec current '{"code":"document.querySelector(\"#price\").text
 
 执行位置与语义：
 
-- **主世界（MAIN world）**：与 DevTools console 同权限，**能读到页面自身的 JS 全局变量与内部状态**（`window.__INITIAL_STATE__`、Vue/React 内部对象等）——这正是普通元素命令（隔离世界）读不到、需要 exec 的原因
+- **与 DevTools console 同权限**：**能读到页面自身的 JS 全局变量与内部状态**（`window.__INITIAL_STATE__`、Vue/React 内部对象等）——这正是普通元素命令读不到、需要 exec 的原因
 - **代码语义 = console 求值**：整体间接求值，在全局作用域运行，返回**最后一个语句/表达式的完成值**；末尾是 `return` 的函数表达式等都能求值。`var` 声明会进全局，但 `let`/`const` 不暴露给后续调用——需要共享状态请挂到 `window` 上
 - **Promise 自动 await**：完成值是 Promise 时命令等它落定再返回结果（reject 则报错）
 - **结果必须 JSON 可序列化**：对象/数组/标量正常返回；循环引用、`BigInt`、`undefined`（转 `null`）等会明确报错——要拿这类内容先在自己代码里转成字符串（如 `JSON.stringify(...)`）
@@ -900,12 +913,13 @@ cda send OfficePC exec current '{"code":"document.querySelector(\"#price\").text
 - **找不到元素先 `list_elements`**：别再猜 selector 或挖整页 HTML——先拿元素地图（含生成好的 selector/可见性/accept 等），再挑目标操作。**先看不带 `closed` 的默认结果**（绝大多数元素在里面），仍找不到再加 `{"closed":true}` 查闭包
 - **要坐标用 `get_rect`，不要从截图像素反推**：截图 + 找色块 + 猜缩放/偏移的路线依赖「页面上恰好有个位置固定的参照物」这类假设，一处改版就整体失效；`get_rect` 给的是权威几何，且与 `real_click` 同一坐标口径
 - **坐标点击后读 `hit` 断言**：`real_click` 返回它实际点到的元素。给坐标的脚本应当核对 `hit.text`/`hit.class` 是否为目标，不符立即中止——静默点到「暂存离开」这类破坏性按钮是真实事故
-- **错误码是给脚本看的**：`not-found`（不存在）/ `unreachable-subtree`（存在但不可寻址）/ `cdp-unavailable`（debugger 被占）语义不同，别把它们都当成「再试一次」；CLI 打印为 `Error [code]: message`
+- **错误码是给脚本看的**：`not-found`（不存在）/ `unreachable-subtree`（存在但不可寻址）/ `cdp-unavailable`（调试通道被占用，多为 DevTools 开着）语义不同，别把它们都当成「再试一次」；CLI 打印为 `Error [code]: message`，并尽量带上「下一步该做什么」
 - `upload_file` 会预检 `accept`：文件类型与 input 的 accept 不匹配（如 PNG 注入 `accept="video/*"` 的 input）直接报错，不会静默失败
 - `text` 定位会跳过 `<script>`、`<style>`、`<noscript>` 等不可见元素，优先匹配 `<button>`、`<a>`、`<input>`；自动搜索 iframe，返回带命中 frame 的 `url`
 - `--field` 对所有返回对象的命令有效（点路径投影，见「_field 过滤」章节），在浏览器端按需采集、出口统一裁剪
 - `--field html`（如 `--field "currentTab.html"`）返回该 frame 的**完整 HTML 内容**（服务端与 CLI 原样转发，不会剥离），需抓页面源码时直接用它
-- 同一标签页的命令串行执行，前一条完成后下一条才执行，不需要手动等待
+- 同一标签页的命令串行执行，前一条完成后下一条才执行，不需要手动等待；**每条命令返回时它的影响已经落地**（见「等影响落地」），不会出现"命令返回了、页面还在变"——脚本顺序写即可，不需要插 sleep
+- **读到的文字就是页面上的文字**：不 trim、不折叠、不截断（见「文字口径」）；匹配时放宽为「原样包含 或 折叠空白后包含」
 - 点击后如果页面跳转，会自动等待新页面加载完成再返回结果
 - `get_text` 对 textarea 返回空（textContent 不含 value），验证 textarea 输入用 `get_page_info --field "currentTab.html"` 抓 HTML 检查
 - `get_js_errors` / `clear_js_errors` 聚合所有 frame（含 iframe）的错误，每条带 `source` 定位到具体 frame

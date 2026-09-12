@@ -200,6 +200,17 @@ function normalizeSpace(s: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * 文本匹配：**原样**包含 或 **折叠空白后**包含，任一成立即命中（空查询 = 不过滤）。
+ * 与 content script 的 textMatches 同规则——用户抄回来的文字可能是原样（含换行/连续空格），
+ * 也可能是手写的折叠形式，两种都得能命中。
+ */
+function textContains(haystack: string, needle: string): boolean {
+  if (!needle) return true;
+  if (haystack.includes(needle)) return true;
+  return normalizeSpace(haystack).includes(normalizeSpace(needle));
+}
+
 function attrsOf(raw: RawNode): Record<string, string> {
   const out: Record<string, string> = {};
   const a = raw.attributes || [];
@@ -366,7 +377,10 @@ export interface TextQuery {
 }
 
 function textMatches(value: string, q: TextQuery): boolean {
-  return q.exact ? normalizeSpace(value) === normalizeSpace(q.text) : value.includes(q.text);
+  // 与 content script 同规则：折叠口径 + 原样口径，两个都算（抄回来的原样文字要能命中）
+  return q.exact
+    ? normalizeSpace(value) === normalizeSpace(q.text) || value === q.text
+    : textContains(value, q.text);
 }
 
 /**
@@ -477,9 +491,9 @@ export interface ElementFacts {
   tag: string;
   /** class 列表前 3 个用 "." 连接（与 click 的 coveredBy.class 同口径），无 class 则省略 */
   class?: string;
-  /** innerText 折叠空白（与 list_elements 的 text 同口径） */
+  /** innerText 折叠空白后的文本：**匹配/过滤**用（判定口径与 content script 一致），不作为报告文字给用户 */
   text: string;
-  /** textContent 原样（与 click 的 coveredBy.text 同口径：不 trim 不截断） */
+  /** textContent 原样：**报告给用户**的文字（hit.text / coveredBy.text / list_elements[].text 都是它）。不 trim、不折叠、不截断 */
   rawText: string;
   rectCss: { x: number; y: number; w: number; h: number } | null;
   centerCss: { x: number; y: number } | null;
@@ -1000,8 +1014,9 @@ export async function listClosedInteractive(
   for (const f of facts) {
     if (filter.visibleOnly && !f.visible) continue;
     if (filter.hiddenOnly && f.visible) continue;
-    // 文本过滤零加工：给什么匹配什么（与 content script list_elements 一致）
-    if (textFilter && !f.text.includes(textFilter)) continue;
+    // 文本过滤零加工：查询串不 trim，匹配按「原样 或 折叠空白后」取并集
+    // （与 content script list_elements 同规则：抄回来的原样文字也要能命中）
+    if (!textContains(f.rawText, textFilter)) continue;
     if (filters.length > 0) {
       const hit = filters.some((name) => {
         switch (name) {
@@ -1040,7 +1055,8 @@ export async function listClosedInteractive(
     if (f.multiple) item.multiple = true;
     if (f.name) item.name = f.name;
     if (f.placeholder) item.placeholder = f.placeholder;
-    if (f.text) item.text = f.text;
+    // 与内容脚本 list_elements 同口径：报告文字 = 元素里的文字原样
+    if (f.rawText) item.text = f.rawText;
     out.push(item);
   }
   return out;

@@ -105,6 +105,12 @@ const ERR_NOT_FOUND = "not-found";                 // 页面里确实没有这�
 const ERR_UNREACHABLE = "unreachable-subtree";     // 存在且可见可点，但对本通道不可寻址/无几何
 const ERR_CDP = "cdp-unavailable";                 // debugger 用不了（DevTools 占用、受限页面）
 
+/** 附加态视口比页面内视口矮一条调试信息条（实测 56px）；底部容差取 64 留余量 */
+const INFOBAR_SLACK_CSS = 64;
+
+/** 「没找到」的下一步提示：报错要能自己走下一步，不是只说"没有" */
+const NOT_FOUND_HINT = " — run list_elements to see what is actually on the page; elements inside closed shadow roots only appear with list_elements {\"closed\":true} and are then addressed by backendNodeId";
+
 /** 把 CDP 层的异常映射成错误码；返回 undefined 表示不是CDP 类问题（按原样冒泡） */
 function cdpErrorCode(err: unknown): string | undefined {
   if (err instanceof CdpUnavailableError) return ERR_CDP;
@@ -435,7 +441,7 @@ async function resolveRectsViaCdp(tabId: number, queries: { key: string; params:
           continue;
         }
         if (located.hits.length === 0) {
-          out.set(q.key, { ok: false, code: ERR_NOT_FOUND, error: `Element not found: ${q.params.text || q.params.selector}` });
+          out.set(q.key, { ok: false, code: ERR_NOT_FOUND, error: `Element not found: ${q.params.text || q.params.selector}${NOT_FOUND_HINT}` });
           continue;
         }
         const described = located.hits.slice(0, describeLimit);
@@ -949,18 +955,33 @@ async function ensureAlarm(): Promise<void> {
 }
 
 /**
- * 统一字段过滤（--field 点路径投影，作用于所有页面命令的对象型返回）。
- * 无 _field → 原样返回；标量/数组原样返回（无字段可滤）。
+ * 统一字段过滤（--field 点路径投影，作用于所有页面命令的返回）。
+ * 无 _field → 原样返回；标量返回原样（无字段可滤）。
  * 路径 a.b.c 逐段取值并重建嵌套形状，输出保留完整路径
  * （--field currentTab.url → {currentTab: {url}}，脚本 res.currentTab.url 恒可读）。
  * 路径段遇数组时对每项投影同段路径：叶子段返回标量数组
  * （--field newTabs.url → {newTabs: [url1, url2]}），深层段保留嵌套
  * （--field newTabs.title.iframes 之类 → [{title: {...}}]）；缺字段的项丢弃。
- * 不存在的路径忽略（不报错）。
+ * 根是数组的命令（list_tabs / list）逐项投影，返回同形状的数组
+ * （--field url → [{url}, {url}, …]）——数组根不是"无字段可滤"，静默不筛是坏行为。
+ * 不存在的路径忽略（不报错；CLI 侧对"请求的字段一个都没匹配上"给提示）。
  */
 function applyFieldFilter(data: unknown, fields: string[]): unknown {
   if (fields.length === 0) return data;
-  if (data === null || typeof data !== "object" || Array.isArray(data)) return data;
+  if (data === null || typeof data !== "object") return data;
+  if (Array.isArray(data)) {
+    const out: unknown[] = [];
+    for (const item of data) {
+      if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+      const obj: Record<string, unknown> = {};
+      for (const f of fields) {
+        const picked = pickPath(item as Record<string, unknown>, f.split(".").filter(Boolean));
+        if (picked !== undefined) Object.assign(obj, picked);
+      }
+      if (Object.keys(obj).length > 0) out.push(obj);
+    }
+    return out;
+  }
   const src = data as Record<string, unknown>;
   const out: Record<string, unknown> = {};
   // 按根字段分组：同一根的多路径必须合并（数组根逐项合成对象、对象根浅合并），
@@ -1526,12 +1547,17 @@ async function sendToTab(
         ? `text: ${searchParams.text}`
         : "";
     const targetSuffix = targetDesc ? ` (${targetDesc})` : "";
+    // 「没找到」也要能自己走下去：告诉调用方下一步查什么（可读报错原则）。
+    // 不在这里自动穿闭包——notFound 是常规路径，穿一次要附一次 debugger；
+    // 调用方按提示再跑 list_elements {closed:true} 才付这个代价。
     response = {
       success: false,
+      // 错误码：与「元素存在但不可达」区分开，脚本能按类别分支，不必去猜文案
+      code: !tabAlive ? undefined : hadResponse ? ERR_NOT_FOUND : undefined,
       error: !tabAlive
         ? `Tab ${tabId} not found — was it closed?`
         : hadResponse
-          ? `Element not found: no match in any frame${targetSuffix}`
+          ? `Element not found: no match in any frame${targetSuffix}${NOT_FOUND_HINT}`
           : !searchable
             ? "Click could not be delivered: no content script response (page still loading, frame navigated, or the page is restricted)"
             : injectError
@@ -2454,6 +2480,15 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       sendResult({ success: false, error: 'real_click needs "selector", "text", {x, y}, or {backendNodeId}' });
       return;
     }
+    // 只给一半坐标：x/y 必须成对（单给一个不是合法点击点，报出来而不是拿着 undefined 往下走）
+    if ((params.x == null) !== (params.y == null)) {
+      const given = params.x == null ? "y" : "x";
+      sendResult({
+        success: false,
+        error: `real_click needs both "x" and "y" — got only "${given}". Pass {x, y} together, or use selector/text/backendNodeId instead.`,
+      });
+      return;
+    }
 
     // 1. 确定点击目标坐标：优先直接 x/y；否则按 frame 搜索定位元素。
     //    同源 iframe：get_rect 已换算顶层视口坐标；跨域 iframe：get_rect 标记 crossOrigin，
@@ -2546,9 +2581,15 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         await withStepTimeout(`scroll backendNodeId ${backendNodeId} into view`, 12000, scrollIntoView(send, backendNodeId));
         const box = await withStepTimeout(`measure backendNodeId ${backendNodeId}`, 12000, boxOf(send, backendNodeId));
         if (!box) {
+          // 两种"量不到"必须分开报：编号过期（页面上没这个节点了）与节点在但没几何。
+          // 统一说成"存在但不可用"会把过期编号指到一条查不出结果的路上
+          const known = pierced.byBackendId.has(backendNodeId);
           sendResult({
-            success: false, code: ERR_UNREACHABLE,
-            error: `backendNodeId ${backendNodeId} exists in the pierced DOM but has no usable geometry (zero-size or hidden) — reachable in the tree, not usable as a click target`,
+            success: false,
+            code: known ? ERR_UNREACHABLE : ERR_NOT_FOUND,
+            error: known
+              ? `backendNodeId ${backendNodeId} is in the page but has no usable geometry (zero-size or hidden) — it cannot be used as a click target. Make it visible first (e.g. open the menu that renders it), then re-run list_elements {"closed":true} and use the fresh id.`
+              : `backendNodeId ${backendNodeId} is no longer in the page (ids change whenever the page re-renders, reloads, or the element is replaced) — re-run list_elements {"closed":true} and use a fresh id.`,
           });
           return;
         }
@@ -2576,6 +2617,21 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         sendResult({
           success: false, code: ERR_UNREACHABLE,
           error: `No usable click point for ${selector || params.text || `backendNodeId ${backendNodeId}`}`,
+        });
+        return;
+      }
+      // 视口外的坐标点不到任何东西：CDP 对越界坐标不报错，页面也收不到事件，
+      // 于是命令"成功"返回而什么都没发生（调用方以为点过了——假成功比失败更贵）。
+      // 判定用**附加态**视口（与这次点击同一坐标系）；底部留一条信息条高度的容差：
+      // 页面内量到的坐标（get_rect / list_elements）与附加态差一条信息条，底部锚定元素会顶上来。
+      const clickViewport = await viewportFacts(send);
+      const vw = clickViewport.viewportCss.w;
+      const vh = clickViewport.viewportCss.h;
+      // 量不到视口（0×0）时不做这个判定：宁可不拦，也不能凭一个空尺寸把正常点击全判成越界
+      if (vw > 0 && vh > 0 && (x < 0 || y < 0 || x > vw || y > vh + INFOBAR_SLACK_CSS)) {
+        sendResult({
+          success: false, code: ERR_NOT_FOUND,
+          error: `Click point (${Math.round(x)}, ${Math.round(y)}) is outside the page viewport (${clickViewport.viewportCss.w}×${clickViewport.viewportCss.h} CSS px here) — nothing can receive a click there, so it was NOT dispatched. Scroll it into view first (get_rect {"scroll":true} returns coordinates that are clickable), or click by selector/text/backendNodeId so cda scrolls for you.`,
         });
         return;
       }

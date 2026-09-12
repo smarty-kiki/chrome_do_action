@@ -18,6 +18,10 @@ Options:
                           (e.g. --field "clickDesc.selector,settledMs,currentTab.url"
                           -> {clickDesc:{selector},settledMs,currentTab:{url}};
                           --field newTabs.url -> {newTabs:[url,...]}).
+                          Arrays are projected per item, including responses that
+                          are arrays at the root (list_tabs --field url). A field
+                          that matches nothing is reported on stderr; the other
+                          requested fields come back as usual.
                           get_text returns a plain string and has nothing to filter.
 
 Browser commands (no tab):
@@ -52,13 +56,21 @@ Page commands (tab required):
                               inClosedShadowRoot} — sampled at the click point
                               after hover settles and BEFORE the button goes
                               down, so a wrong coordinate is reported instead
-                              of silently clicking something else. Because the
-                              hit test runs over CDP, it stays truthful inside
-                              shadow roots (in-page elementFromPoint would
-                              report the host). hitUnavailable explains why hit
-                              is missing if it is. Also returns {x, y, navigated,
-                              settledMs}; hit + x/y together let a script assert
-                              "I am about to click 暂存离开" and abort otherwise.
+                              of silently clicking something else. The hit test
+                              stays truthful inside closed shadow roots too — it
+                              names the button that will really receive the
+                              click, not the wrapper around it. hitUnavailable
+                              explains why hit is missing if it is. Also returns
+                              {x, y, navigated, settledMs}; hit + x/y together
+                              let a script assert "I am about to click 暂存离开"
+                              and abort otherwise. Bad coordinates are rejected
+                              outright instead of half-succeeding: passing only
+                              one of x/y errors (they must come as a pair), and
+                              a point outside the page viewport errors too —
+                              "nothing can receive a click there, so it was NOT
+                              dispatched" — with a hint to scroll it into view
+                              (get_rect {scroll:true}) or to click by
+                              selector/text/backendNodeId instead.
   type <tab> <params>         Insert text into input/textarea/contenteditable
                               ({selector,text[,mode][,waitFor]}); mode:
                               replace(default)/append/insert;
@@ -151,9 +163,10 @@ Page commands (tab required):
                               to top/one frame. Pierces open shadow DOM. Use this when
                               you cannot find an element - get a map first.
                               {closed:true} ALSO lists interactive elements inside
-                              CLOSED shadow roots (invisible to every in-page channel)
-                              — these come back with backendNodeId + inClosedShadowRoot
-                              and NO selector (a closed root has no stable path), and
+                              CLOSED shadow roots (invisible to every regular
+                              query) — these come back with backendNodeId +
+                              inClosedShadowRoot and NO selector (such elements
+                              have no stable path), and
                               are listed FIRST so a small max cannot silently drop
                               them; returns closedCount; if the closed pass could not
                               run, closedError says so (never a silent 0). Off by
@@ -164,22 +177,23 @@ Page commands (tab required):
                               reading centerCss here and feeding it to real_click
                               hits that same element. {selector|text|exact|all|
                               waitStableMs|scroll}[,frame]; or {selectors:[".a",".b"]}
-                              for a batch (one round trip, per-item code, one debugger
-                              attach for all fallbacks); or {backendNodeId} for elements
-                              inside a closed shadow root. Returns x/y/width/height
+                              for a batch (one round trip, per-item code); or
+                              {backendNodeId} for elements inside a closed shadow
+                              root. Returns x/y/width/height
                               (unchanged) plus rectCss, centerCss, tag, class, text,
                               visible, covered, hitTest (what the center point actually
-                              hits — CDP-based, so it is truthful inside shadow roots),
+                              hits — truthful inside closed shadow roots too),
                               matchCount, allMatches[] (ambiguous TEXT matches; each with
                               rectCss/visible/priority, priority 0 = the one plain
                               {text} would click), waitStable {waited,stable},
                               backendNodeId, inClosedShadowRoot, source.
-                              Closed shadow roots are pierced automatically when the
-                              in-page channels find nothing (no opt-in needed).
+                              Closed shadow roots are searched automatically when the
+                              regular channels find nothing (no opt-in needed).
                               Errors are distinguishable by code: not-found (really
                               absent) / unreachable-subtree (exists, but has no usable
-                              geometry) / cdp-unavailable (another debugger client is
-                              attached). Being covered is NOT an error: see covered.
+                              geometry) / cdp-unavailable (the debug channel is busy —
+                              usually DevTools is open). Being covered is NOT an
+                              error: see covered.
   get_viewport <tab>          Viewport truth for screenshot math: {viewportCss:{w,h},
                               dpr, scrollCss:{x,y}, screenCss:{w,h}, devicePixelRatio,
                               isTop, url}. dpr agrees with screenshot's (imagePx.w /
@@ -189,8 +203,8 @@ Page commands (tab required):
   clear_js_errors <tab>       Clear accumulated JS errors
 
 Troubleshooting only (enabled per session):
-  exec <tab> <params>         Execute arbitrary JavaScript in the page's MAIN
-                              world and return the result — for inspecting real
+  exec <tab> <params>         Execute arbitrary JavaScript in the page and
+                              return the result — for inspecting real
                               page state (page JS globals etc.) when no
                               built-in command fits. HIGH RISK: requires the
                               plugin option "允许 exec 命令（仅排查问题）" to be
@@ -240,13 +254,25 @@ Coordinates — ONE space, promised in four places:
   the SAME top-level space (frame offsets already added), so a coordinate
   never needs adjusting by hand.
 
+Text — what you read is what the page has:
+  Nothing is trimmed, collapsed or truncated on the way out: get_text, get_rect.text,
+  allMatches[].text, list_elements[].text, hit.text and the text in clickDesc are the
+  page's own strings, whitespace and all. Matching is the lenient side: a {"text":...}
+  locator (and the list_elements text filter) hits when the page text contains your
+  string verbatim OR contains it once whitespace is collapsed. So text copied straight
+  out of a result works as a query, and {"exact":true} pins a locator to a whole-string
+  match. Lenient matching, faithful reporting.
+
 Settle — impact-aware returns (click/type/keyboard/trigger/upload_file/
 upload_dragdrop/paste_rich/set_cursor/scroll/real_click):
-  Commands wait for the action's impact to land before returning. Event-driven
-  (DOM mutations + long tasks, no fixed sleep), returns {settledMs} (ms waited):
-  no-impact actions return ~0.6s; impacted actions return once the DOM is quiet
-  for 250ms after the last activity. Impact that arrives late (network round
-  trip, long debounce) is beyond settle — pass {waitFor: {selector|text}} to
+  Commands wait for the action's impact to land before returning — a command
+  returning means its effect has landed, never "dispatched, page still moving".
+  Event-driven (DOM mutations + long tasks, no fixed sleep), returns {settledMs}:
+  no-impact actions return in ~1s (the 1s activity window expires with no signal
+  and releases); impacted actions keep waiting while activity continues and
+  return once the DOM is quiet for 250ms. Impact that arrives later than that ~1s window (network
+  round trip, long debounce, plain waiting) is beyond settle — pass
+  {waitFor: {selector|text}} to
   poll (50ms, throttle-proof) until the condition holds; returns
   {waitFor: {settled, waited}}.
   Background tabs: Chrome throttles page activity while the tab is hidden
@@ -337,6 +363,42 @@ function jsonObjectArg(raw) {
     }
 }
 const BROWSER_CMDS = new Set(["open", "list_tabs", "close_tab", "refresh"]);
+// 返回里实际存在的顶层字段（根是数组的看第一项）——用来判断 --field 是否真的命中。
+// 标量返回（字符串/数字）没有字段可滤，返回 null（不参与判定）
+function returnedRootKeys(data) {
+    if (data === null || typeof data !== "object")
+        return null;
+    if (Array.isArray(data)) {
+        const first = data.find((x) => x !== null && typeof x === "object" && !Array.isArray(x));
+        return first ? Object.keys(first) : [];
+    }
+    return Object.keys(data);
+}
+// --field 写了返回里没有的字段：扩展侧按"不存在的路径忽略"处理（这是对的，
+// 同一字段名在不同命令上可能合法），但**一个都没匹配上**时必须说话——
+// 否则调用方拿到 {} 只能猜是命令坏了、字段拼错了、还是本来就是空
+function fieldMisses(data, fields) {
+    const keys = returnedRootKeys(data);
+    if (keys === null)
+        return [];
+    const have = new Set(keys);
+    return fields
+        .map((f) => f.split(".").filter(Boolean)[0])
+        .filter((root) => !!root && !have.has(root));
+}
+// 写盘失败的可读文案：Node 的 ENOENT/EACCES 原始堆栈对使用者没有意义
+function describeFsError(err) {
+    const e = err;
+    switch (e?.code) {
+        case "ENOENT": return "the directory does not exist";
+        case "EACCES":
+        case "EPERM": return "permission denied";
+        case "ENOSPC": return "no space left on the device";
+        case "EISDIR": return "that path is a directory, not a file";
+        case "EROFS": return "the filesystem is read-only";
+        default: return e?.message ? String(e.message) : String(err);
+    }
+}
 // --- build CLI message ---
 function buildMessage(action, args) {
     if (action === "list") {
@@ -435,7 +497,8 @@ function buildMessage(action, args) {
                     params = JSON.parse(stripQuotes(raw));
                 }
                 catch {
-                    console.error(`Invalid params JSON: ${raw}`);
+                    // 报出"该长什么样"，而不是只说解析失败（agent 按习惯传裸字符串时最常见的坑）
+                    console.error(`Error: params must be a JSON object (like {"selector":"#title"}), got: ${raw}`);
                     process.exit(1);
                 }
             }
@@ -509,6 +572,13 @@ ws.on("message", (raw) => {
         clearTimeout(hangTimer);
     if (res.payload.success) {
         const data = res.payload.data;
+        // --field 一个字段都没匹配上：如实提示（stdout 保持纯数据，提示走 stderr）
+        if (fields.length > 0) {
+            const missing = fieldMisses(data, fields);
+            if (missing.length > 0) {
+                console.error(`Warning: --field ${missing.join(", ")} matched nothing in the response — check the spelling against the command's help; other requested fields were returned as usual`);
+            }
+        }
         // screenshot：扩展回 {data:<base64 PNG>, imagePx, viewportCss, dpr, scale,
         // chromeInsetCss, scrollCss, mapping}（老版本扩展回裸 base64 字符串，两条都支持）。
         // 写盘后打印 JSON——含 path、**不含 base64**：调用方要的是 mapping（图像素→CSS px），
@@ -522,7 +592,16 @@ ws.on("message", (raw) => {
             const outPath = cmdParams.path || "screenshot.png";
             const fs = require("fs");
             const buf = Buffer.from(shotB64, "base64");
-            fs.writeFileSync(outPath, buf);
+            try {
+                fs.writeFileSync(outPath, buf);
+            }
+            catch (err) {
+                // 写盘失败（目录不存在/无权限/磁盘满）：原始 ENOENT 堆栈对使用者无意义，
+                // 而且**图确实没存下来**这件事必须说清（调用方以为存了，后面会拿旧文件跑）
+                console.error(`Error: screenshot was captured but could NOT be saved to ${outPath} — ${describeFsError(err)}`);
+                console.error("Nothing was written. Pass a path inside a directory that exists.");
+                process.exit(1);
+            }
             if (shotMeta) {
                 const meta = {};
                 for (const [k, v] of Object.entries(shotMeta))

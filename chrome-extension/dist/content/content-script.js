@@ -159,12 +159,23 @@
     });
     return iframes;
   }
+  function rawTextOf(el) {
+    return el.textContent || "";
+  }
+  function collapseWs(s) {
+    return s.trim().replace(/\s+/g, " ");
+  }
+  function textMatches(haystack, needle) {
+    if (!needle) return true;
+    if (haystack.includes(needle)) return true;
+    return collapseWs(haystack).includes(collapseWs(needle));
+  }
   function describeLayer(top) {
     const htmlTop = top;
     const desc = { tag: top.tagName.toLowerCase() };
     const cls = Array.from(htmlTop.classList).slice(0, 3).join(".");
     if (cls) desc.class = cls;
-    const txt = htmlTop.textContent || "";
+    const txt = rawTextOf(htmlTop);
     if (txt) desc.text = txt;
     return desc;
   }
@@ -401,7 +412,7 @@
                 allMatches.push({
                   tag: cand.tagName.toLowerCase(),
                   class: Array.from(hEl.classList).slice(0, 3).join("."),
-                  text: (hEl.textContent || "").trim().replace(/\s+/g, " "),
+                  text: rawTextOf(hEl),
                   rectCss: { x: r.left, y: r.top, w: r.width, h: r.height },
                   visible: vis,
                   // priority 只在可见候选间计数：0 = click {text} 会点的那个。
@@ -425,7 +436,7 @@
               centerCss,
               tag: el.tagName.toLowerCase(),
               class: Array.from(el.classList).slice(0, 3).join("."),
-              text: (el.textContent || "").trim().replace(/\s+/g, " "),
+              text: rawTextOf(el),
               visible: isVisible(el),
               covered,
               hitTest,
@@ -1044,11 +1055,11 @@
             const tag = el.tagName.toLowerCase();
             const role = el.getAttribute("role")?.toLowerCase() ?? void 0;
             const type = el instanceof HTMLInputElement ? el.type : void 0;
-            const text = (html.innerText ?? "").trim().replace(/\s+/g, " ");
+            const text = rawTextOf(html);
             const visible = isVisible(html);
             if (visibleOnly && !visible) continue;
             if (hiddenOnly && visible) continue;
-            if (textFilter && !text.includes(textFilter)) continue;
+            if (!textMatches(text, textFilter)) continue;
             if (filters.length > 0) {
               const hit = filters.some((f) => {
                 switch (f) {
@@ -1249,7 +1260,7 @@
   }
   function waitForSettled(maxWaitMs) {
     const QUIET_MS = 250;
-    const ACTIVITY_WINDOW_MS = 600;
+    const ACTIVITY_WINDOW_MS = 1e3;
     const start = Date.now();
     return new Promise((resolve) => {
       let quiet;
@@ -1363,9 +1374,10 @@
   }
   function buildTextXPath(text, exact) {
     const q = xpathStr(text);
+    const qFlat = xpathStr(collapseWs(text));
     const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
-    const cond = exact ? `normalize-space(.) = ${q}` : `contains(normalize-space(.), ${q})`;
-    const valCond = exact ? `@value = ${q}` : `contains(@value, ${q})`;
+    const cond = exact ? `(normalize-space(.) = ${qFlat} or . = ${q})` : `(contains(normalize-space(.), ${qFlat}) or contains(., ${q}))`;
+    const valCond = exact ? `(@value = ${q} or @value = ${qFlat})` : `(contains(@value, ${q}) or contains(@value, ${qFlat}))`;
     const bodyXpath = [
       `//body//button[${cond}]`,
       `//body//a[${cond}]`,

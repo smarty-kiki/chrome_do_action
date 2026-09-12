@@ -62,7 +62,7 @@ your command → server → Chrome extension → execute in the page → structu
 | 🔍 Read-only property (`get_prop`) | Read an element property's exact raw value (`value` / `checked` / `innerHTML` / …); read-only, never executes — verify a type really landed, check a checkbox state, compare raw content |
 | 🔎 State-aware | Detects page navigations, newly opened tabs, and iframe changes, so a command returns the world *after* the action, not a bare event |
 | 🌘 Shadow DOM support | Every element command transparently pierces open shadow roots (DevTools `#shadow-root` paths / `>>>` / bare-selector fallback); `get_page_info` html includes shadow content by default |
-| 🕳️ Closed shadow roots | A subtree created with `attachShadow({mode:"closed"})` is invisible to every in-page channel — `document.querySelector` can't see it, and neither can arbitrary injected JS. cda reaches it at the protocol level instead: `list_elements {"closed":true}` enumerates (each item carries a `backendNodeId`, no selector), and `get_rect` / `click` / `real_click` / `get_prop` / `get_text` accept `{"backendNodeId":N}` — geometry and hit testing stay truthful there |
+| 🕳️ Closed shadow roots | Buttons/inputs you can see on the page while every regular query reports them as absent — `document.querySelector` can't see them, and neither can arbitrary injected JS. cda takes a different route: `list_elements {"closed":true}` enumerates (each item carries a `backendNodeId`, no selector), and `get_rect` / `click` / `real_click` / `get_prop` / `get_text` accept `{"backendNodeId":N}` — geometry and hit testing stay truthful there |
 | 🔁 High availability | Auto-reconnect, per-tab serial command queue, automatic content-script re-injection |
 | 🌐 Multi-browser | One server connects to multiple browser clients; target any one by node name |
 
@@ -291,7 +291,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | Clear accumulated JS errors |
 | `screenshot` | `send <id> screenshot <tab> <params>` | Page screenshot; `{"path":"/tmp/s.png"}` saves locally. The CLI prints `{path, bytes, imagePx, viewportCss, dpr, scale, chromeInsetCss, scrollCss, mapping}` — image and conversion metadata together |
 | `scroll` | `send <id> scroll <tab> <params>` | Scroll: window/iframe (via `frame`) or `{"selector":...}` to an element (scrollable container / scrollIntoView, pierces shadow DOM); smooth, returns once the DOM settles |
-| `exec` | `send <id> exec <tab> <params>` | ⚠ **Troubleshooting only, high risk**: run arbitrary JS in the page's MAIN world (`{"code":"document.title"}`) — can read the page's own JS globals; console semantics (returns the last statement's value), Promises auto-awaited, only JSON-serializable values come back. Disabled by default — you must first tick the plugin option "允许 exec 命令（仅排查问题）" on the extension options page, otherwise the command is rejected with a clear error. Turn the option back off after troubleshooting; details in `cli/help.md` |
+| `exec` | `send <id> exec <tab> <params>` | ⚠ **Troubleshooting only, high risk**: run arbitrary JS in the page (`{"code":"document.title"}`) — can read the page's own JS globals; console semantics (returns the last statement's value), Promises auto-awaited, only JSON-serializable values come back. Disabled by default — you must first tick the plugin option "允许 exec 命令（仅排查问题）" on the extension options page, otherwise the command is rejected with a clear error. Turn the option back off after troubleshooting; details in `cli/help.md` |
 
 ### Locating an element for click / real_click
 
@@ -309,7 +309,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 
 All element commands automatically pierce **open shadow roots**: if a bare selector (or `xpath:` / `text`) misses in light DOM, cda searches every open shadow root in document order (nested included). `real_click` works on shadow-DOM elements too.
 
-**Closed shadow roots** (`attachShadow({mode:"closed"})`) are a different story: they are invisible to every in-page channel — not just `querySelector`, but any injected JS as well (which is why "just allow arbitrary JS execution" doesn't solve them). cda reaches them at the protocol level:
+**Closed shadow roots** are a different story: they are invisible to every regular query — not just `querySelector`, but any injected JS as well (which is why "just allow arbitrary JS execution" doesn't solve them). cda takes a different route:
 
 ```bash
 # 1. Enumerate interactive elements inside closed roots (opt-in via "closed":true;
@@ -360,7 +360,7 @@ Many admin backends ignore synthesized clicks (the click looks successful but ne
 - Mouse movement is **incremental** rather than teleported, so it genuinely fires the hover chain along the path
 - After the click the mouse **stays on the target**, keeping hover state for the next action
 - The `approach` param simulates "move to a trigger point first, then to the target" for multi-level hover scenarios (e.g. a hover toolbar over a cover image)
-- Side effect: Chrome briefly shows the "This browser is being debugged" banner while executing, then it disappears
+- Side effect: Chrome briefly floats a notice bar over the page while executing, then it disappears
 
 ### 2. Rich text & file uploads — bypassing the two hardest interactions
 
@@ -397,6 +397,8 @@ Supported by **every command returning an object**: `click`/`type`/`keyboard`/`t
 - **Content-script self-healing**: if the script is lost, it is re-injected automatically via `chrome.scripting.executeScript` and retried
 - **Tab grouping**: tabs opened with `open` are grouped under a grey `chrome_do_action` group, cleaned up automatically when empty
 - **Command timeout**: the server reports a timeout after 60s with no response; if the browser goes offline, the CLI is notified immediately
+- **A return means it already landed**: when a command returns, its effect has landed — never "dispatched, page still moving". Write your script sequentially, no sleeps needed (an action with no impact returns in ~1s; if activity continues it keeps waiting until the DOM is quiet for 250ms. Anything that happens more than ~1s after the action needs an explicit `waitFor` predicate)
+- **Text is never reworked on the way out**: `get_text`, `get_rect.text`, `list_elements[].text` and the text in `clickDesc` are the page's own strings — not trimmed, not whitespace-collapsed, not truncated, not rewritten. Matching is the lenient side: a `text` locator/filter hits when the page text contains your string verbatim **or** contains it once whitespace is collapsed, and `{"exact":true}` pins it to a whole-string match. Lenient matching, faithful reporting
 
 ### 6. JS error collection
 
@@ -424,20 +426,20 @@ cda send OfficePC real_click current '{"x":214,"y":1008}' --field "hit"   # rece
 - **Occlusion is measured**: `hitTest` is the element the centre point *actually* hits (same semantics as `click`'s `clickDesc.coveredBy`), so an overlay blocking your target is named rather than inferred
 - **Ambiguity is measured**: `{"text":"Publish"}` matches substrings, so it can hit both "Publish" and "Publish note"; `matchCount`/`allMatches` list every candidate, with `priority: 0` being the one `click` picks and the rest the silently ignored siblings. Use `{"exact":true}` to match the whole string
 - **A wrong click is no longer silent**: `real_click` samples the hit target *before* pressing the mouse down and returns it as `hit` — a script can assert "I am about to click Publish" and abort otherwise
-- **Errors are distinguishable**: `not-found` (genuinely absent) / `unreachable-subtree` (exists but unusable geometry) / `cdp-unavailable` (another debugger client holds the tab); the CLI prints `Error [code]: message` instead of flattening everything into "no match"
+- **Errors are distinguishable**: `not-found` (genuinely absent) / `unreachable-subtree` (exists but unusable geometry) / `cdp-unavailable` (the debug channel is busy — usually DevTools is open); the CLI prints `Error [code]: message`, with the next step spelled out, instead of flattening everything into "no match"
 
-#### ⚠️ Two viewport spaces: attaching the debugger makes the viewport shorter
+#### ⚠️ Two viewport spaces: never carry a coordinate across commands
 
-While `chrome.debugger` is attached, Chrome shows an "extension is debugging this browser" infobar, and the page's **layout viewport is one infobar shorter than without it** (measured: 1440×749 → 1440×693). Commands therefore fall into two viewport spaces:
+While some commands run, Chrome floats a notice bar over the page, and the **visible viewport becomes one bar shorter** (measured: 1440×749 → 1440×693). Commands therefore fall into two viewport spaces:
 
 | Channel | Viewport space |
 |---|---|
-| `get_viewport`, `list_elements` (default), `click {"x","y"}`, `get_rect`'s in-page channel | **in-page** (no debugger attached — full height) |
-| `real_click`, `screenshot`, any command taking `backendNodeId`, `get_rect`'s fallback channel | **attached** (debugger attached — one infobar shorter) |
+| `get_viewport`, `list_elements` (default), `click {"x","y"}`, `get_rect`'s regular channel | **no notice bar** (full height) |
+| `real_click`, `screenshot`, any command taking `backendNodeId`, `get_rect`'s fallback channel | **notice bar** (one bar shorter) |
 
-Content anchored to the top has the same coordinates in both spaces; `position:fixed` footers, vertically centred blocks and `vh`-sized elements differ by exactly that infobar's height — which is precisely the class of element a publish page's footer belongs to. The infobar animates in, so the difference keeps changing while it does; **this is one real cause of "the coordinate was right but the click landed nowhere"**.
+Content anchored to the top has the same coordinates in both spaces; `position:fixed` footers, vertically centred blocks and `vh`-sized elements differ by exactly that bar's height — which is precisely the class of element a publish page's footer belongs to. The bar also animates in, and **this is one real cause of "the coordinate was right but the click landed nowhere"**.
 
-At every attach point cda **waits for the infobar to actually appear — for the viewport to drop below its in-page height — before measuring or dispatching**, so **within one command the coordinate and the action always share a space**. The test is deliberately "did it get shorter", not "did the numbers stop moving": the infobar shows up a beat after the attach, so a reading can be perfectly stable and still be the pre-infobar one (most likely on the first attach of a browser session). cda therefore uses the in-page viewport height as the reference and waits for the drop until it times out; if a session never shows the infobar at all, it measures anyway and flags the result with `viewportNote` saying the coordinates belong to the in-page space. The only rule for callers: **never carry a coordinate across channels** — don't validate `screenshot` against `get_viewport` or vice versa, and don't use one to compensate coordinates you computed yourself.
+cda **waits for the bar to actually appear before measuring or dispatching**, so **within one command the coordinate and the action always share a space** and no caller-side compensation is ever needed. The only rule for callers: **never carry a coordinate across commands** — don't validate `screenshot` against `get_viewport` or vice versa, don't use one to compensate coordinates you computed yourself. To act on a coordinate: (1) read `centerCss` with `get_rect` and feed it straight to `real_click` (same space), or (2) just pass `selector`/`text`/`backendNodeId` and let the command measure and act itself. If a session's bar never shows up, the result carries a `viewportNote` stating the space it was measured in.
 
 ---
 

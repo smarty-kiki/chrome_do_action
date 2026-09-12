@@ -243,6 +243,11 @@
   function normalizeSpace(s) {
     return s.replace(/\s+/g, " ").trim();
   }
+  function textContains(haystack, needle) {
+    if (!needle) return true;
+    if (haystack.includes(needle)) return true;
+    return normalizeSpace(haystack).includes(normalizeSpace(needle));
+  }
   function attrsOf(raw) {
     const out = {};
     const a = raw.attributes || [];
@@ -364,7 +369,7 @@
     return `closed-shadow piercing does not cover ${tree.uncoveredIframes.length} iframe(s) whose document is not in this page's process (cross-origin frame, or not loaded yet): ${list}. Elements inside them are not reported; this is a boundary, not an empty result.`;
   }
   function textMatches(value, q) {
-    return q.exact ? normalizeSpace(value) === normalizeSpace(q.text) : value.includes(q.text);
+    return q.exact ? normalizeSpace(value) === normalizeSpace(q.text) || value === q.text : textContains(value, q.text);
   }
   function findByTextInTree(tree, q) {
     const collect = (basisOf) => {
@@ -766,7 +771,7 @@
     for (const f of facts) {
       if (filter.visibleOnly && !f.visible) continue;
       if (filter.hiddenOnly && f.visible) continue;
-      if (textFilter && !f.text.includes(textFilter)) continue;
+      if (!textContains(f.rawText, textFilter)) continue;
       if (filters.length > 0) {
         const hit = filters.some((name) => {
           switch (name) {
@@ -814,7 +819,7 @@
       if (f.multiple) item.multiple = true;
       if (f.name) item.name = f.name;
       if (f.placeholder) item.placeholder = f.placeholder;
-      if (f.text) item.text = f.text;
+      if (f.rawText) item.text = f.rawText;
       out.push(item);
     }
     return out;
@@ -858,6 +863,8 @@
   var ERR_NOT_FOUND = "not-found";
   var ERR_UNREACHABLE = "unreachable-subtree";
   var ERR_CDP = "cdp-unavailable";
+  var INFOBAR_SLACK_CSS = 64;
+  var NOT_FOUND_HINT = ' \u2014 run list_elements to see what is actually on the page; elements inside closed shadow roots only appear with list_elements {"closed":true} and are then addressed by backendNodeId';
   function cdpErrorCode(err) {
     if (err instanceof CdpUnavailableError) return ERR_CDP;
     if (err instanceof StaleNodeError) return ERR_UNREACHABLE;
@@ -1067,7 +1074,7 @@
             continue;
           }
           if (located.hits.length === 0) {
-            out.set(q.key, { ok: false, code: ERR_NOT_FOUND, error: `Element not found: ${q.params.text || q.params.selector}` });
+            out.set(q.key, { ok: false, code: ERR_NOT_FOUND, error: `Element not found: ${q.params.text || q.params.selector}${NOT_FOUND_HINT}` });
             continue;
           }
           const described = located.hits.slice(0, describeLimit);
@@ -1469,7 +1476,20 @@
   }
   function applyFieldFilter(data, fields) {
     if (fields.length === 0) return data;
-    if (data === null || typeof data !== "object" || Array.isArray(data)) return data;
+    if (data === null || typeof data !== "object") return data;
+    if (Array.isArray(data)) {
+      const out2 = [];
+      for (const item of data) {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+        const obj = {};
+        for (const f of fields) {
+          const picked = pickPath(item, f.split(".").filter(Boolean));
+          if (picked !== void 0) Object.assign(obj, picked);
+        }
+        if (Object.keys(obj).length > 0) out2.push(obj);
+      }
+      return out2;
+    }
     const src = data;
     const out = {};
     const groups = /* @__PURE__ */ new Map();
@@ -1916,7 +1936,9 @@
       const targetSuffix = targetDesc ? ` (${targetDesc})` : "";
       response = {
         success: false,
-        error: !tabAlive ? `Tab ${tabId} not found \u2014 was it closed?` : hadResponse ? `Element not found: no match in any frame${targetSuffix}` : !searchable ? "Click could not be delivered: no content script response (page still loading, frame navigated, or the page is restricted)" : injectError ? `No content script response from any frame; content script injection failed: ${injectError}` : "No content script response from any frame (page still loading or restricted)"
+        // 错误码：与「元素存在但不可达」区分开，脚本能按类别分支，不必去猜文案
+        code: !tabAlive ? void 0 : hadResponse ? ERR_NOT_FOUND : void 0,
+        error: !tabAlive ? `Tab ${tabId} not found \u2014 was it closed?` : hadResponse ? `Element not found: no match in any frame${targetSuffix}${NOT_FOUND_HINT}` : !searchable ? "Click could not be delivered: no content script response (page still loading, frame navigated, or the page is restricted)" : injectError ? `No content script response from any frame; content script injection failed: ${injectError}` : "No content script response from any frame (page still loading or restricted)"
       };
     }
     const frameAttribution = matchedFrame ? { frame: { frameId: matchedFrame.frameId, url: matchedFrame.url } } : {};
@@ -2600,6 +2622,14 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
         sendResult({ success: false, error: 'real_click needs "selector", "text", {x, y}, or {backendNodeId}' });
         return;
       }
+      if (params.x == null !== (params.y == null)) {
+        const given = params.x == null ? "y" : "x";
+        sendResult({
+          success: false,
+          error: `real_click needs both "x" and "y" \u2014 got only "${given}". Pass {x, y} together, or use selector/text/backendNodeId instead.`
+        });
+        return;
+      }
       let x = params.x;
       let y = params.y;
       let cdpFrameId;
@@ -2666,10 +2696,11 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           await withStepTimeout(`scroll backendNodeId ${backendNodeId} into view`, 12e3, scrollIntoView(send, backendNodeId));
           const box = await withStepTimeout(`measure backendNodeId ${backendNodeId}`, 12e3, boxOf(send, backendNodeId));
           if (!box) {
+            const known = pierced.byBackendId.has(backendNodeId);
             sendResult({
               success: false,
-              code: ERR_UNREACHABLE,
-              error: `backendNodeId ${backendNodeId} exists in the pierced DOM but has no usable geometry (zero-size or hidden) \u2014 reachable in the tree, not usable as a click target`
+              code: known ? ERR_UNREACHABLE : ERR_NOT_FOUND,
+              error: known ? `backendNodeId ${backendNodeId} is in the page but has no usable geometry (zero-size or hidden) \u2014 it cannot be used as a click target. Make it visible first (e.g. open the menu that renders it), then re-run list_elements {"closed":true} and use the fresh id.` : `backendNodeId ${backendNodeId} is no longer in the page (ids change whenever the page re-renders, reloads, or the element is replaced) \u2014 re-run list_elements {"closed":true} and use a fresh id.`
             });
             return;
           }
@@ -2694,6 +2725,17 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
             success: false,
             code: ERR_UNREACHABLE,
             error: `No usable click point for ${selector || params.text || `backendNodeId ${backendNodeId}`}`
+          });
+          return;
+        }
+        const clickViewport = await viewportFacts(send);
+        const vw = clickViewport.viewportCss.w;
+        const vh = clickViewport.viewportCss.h;
+        if (vw > 0 && vh > 0 && (x < 0 || y < 0 || x > vw || y > vh + INFOBAR_SLACK_CSS)) {
+          sendResult({
+            success: false,
+            code: ERR_NOT_FOUND,
+            error: `Click point (${Math.round(x)}, ${Math.round(y)}) is outside the page viewport (${clickViewport.viewportCss.w}\xD7${clickViewport.viewportCss.h} CSS px here) \u2014 nothing can receive a click there, so it was NOT dispatched. Scroll it into view first (get_rect {"scroll":true} returns coordinates that are clickable), or click by selector/text/backendNodeId so cda scrolls for you.`
           });
           return;
         }

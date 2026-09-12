@@ -256,6 +256,27 @@ async function collectIframes(fields: string[]): Promise<{ index: number; src: s
   return iframes;
 }
 
+// ─────────────────────────── 文字口径 ───────────────────────────
+// 报告里的 text 一律是**元素里的文字原样**（textContent：不 trim、不折叠空白、不截断）。
+// 报告也是用户拿到的文字，加工过就与页面上不一致了（读回来的和页面上的对不上，
+// 「按输出里的文字回点/回查」这条最自然的用法会莫名失败）。
+// 需要折叠只发生在**匹配**时，且是「原样 或 折叠后」两口径取并集：
+// 用户抄回来的可能是原样（含换行/连续空格），也可能是手写的折叠形式，两种都得能命中。
+function rawTextOf(el: Element): string {
+  return el.textContent || "";
+}
+
+function collapseWs(s: string): string {
+  return s.trim().replace(/\s+/g, " ");
+}
+
+/** 文本匹配：原样包含 或 折叠空白后包含，任一成立即命中（查询串为空 = 不过滤） */
+function textMatches(haystack: string, needle: string): boolean {
+  if (!needle) return true;
+  if (haystack.includes(needle)) return true;
+  return collapseWs(haystack).includes(collapseWs(needle));
+}
+
 // 覆盖层 / 顶部命中元素的可读描述。click 的 clickDesc.coveredBy 与 get_rect 的 hitTest
 // 共用这一处口径——同一份「谁盖在谁上面」的描述，不该有两个版本。
 // tag + 类（最多 3 个）+ 文本原样带出（不 trim 不截断）：报告也是文字，
@@ -265,7 +286,7 @@ function describeLayer(top: Element): Record<string, unknown> {
   const desc: Record<string, unknown> = { tag: top.tagName.toLowerCase() };
   const cls = Array.from(htmlTop.classList).slice(0, 3).join(".");
   if (cls) desc.class = cls;
-  const txt = htmlTop.textContent || "";
+  const txt = rawTextOf(htmlTop);
   if (txt) desc.text = txt;
   return desc;
 }
@@ -562,7 +583,7 @@ async function handleCommand(
               allMatches.push({
                 tag: cand.tagName.toLowerCase(),
                 class: Array.from(hEl.classList).slice(0, 3).join("."),
-                text: (hEl.textContent || "").trim().replace(/\s+/g, " "),
+                text: rawTextOf(hEl),
                 rectCss: { x: r.left, y: r.top, w: r.width, h: r.height },
                 visible: vis,
                 // priority 只在可见候选间计数：0 = click {text} 会点的那个。
@@ -587,7 +608,7 @@ async function handleCommand(
             centerCss,
             tag: el.tagName.toLowerCase(),
             class: Array.from(el.classList).slice(0, 3).join("."),
-            text: (el.textContent || "").trim().replace(/\s+/g, " "),
+            text: rawTextOf(el),
             visible: isVisible(el),
             covered,
             hitTest,
@@ -1309,7 +1330,7 @@ async function handleCommand(
             return { success: false, error: `Unknown list_elements filter: "${f}" (expected button|link|input|select|textarea|label|editable|upload)` };
           }
         }
-        // text 参数零加工：按原样做子串匹配（不做 trim——给什么匹配什么）
+        // text 参数零加工：给什么匹配什么（不 trim 查询串）——匹配按「原样 或 折叠空白后」取并集
         const textFilter = typeof params.text === "string" ? params.text : "";
         let max = typeof params.max === "number" && Number.isFinite(params.max) ? Math.max(1, Math.floor(params.max)) : 50;
         max = Math.min(max, 200);
@@ -1339,13 +1360,13 @@ async function handleCommand(
           const tag = el.tagName.toLowerCase();
           const role = el.getAttribute("role")?.toLowerCase() ?? undefined;
           const type = el instanceof HTMLInputElement ? el.type : undefined;
-          // 空白折叠与 click {text} 的按文本查找一致（XPath normalize-space 同样折叠）——
-          // 但绝不截断：截到 80 字符会让"按 list_elements 的 text 回点"匹配不上真实文本
-          const text = (html.innerText ?? "").trim().replace(/\s+/g, " ");
+          // 文字原样带出（与 get_text / get_rect.text 同一口径）——绝不截断：
+          // 截到 80 字符会让"按 list_elements 的 text 回点"匹配不上真实文本
+          const text = rawTextOf(html);
           const visible = isVisible(html);
           if (visibleOnly && !visible) continue;
           if (hiddenOnly && visible) continue;
-          if (textFilter && !text.includes(textFilter)) continue;
+          if (!textMatches(text, textFilter)) continue;
           if (filters.length > 0) {
             const hit = filters.some((f) => {
               switch (f) {
@@ -1560,7 +1581,7 @@ function throttleSafeTimer(ms: number): { promise: Promise<void>; cancel: () => 
 }
 
 // 动作后的稳定检测（事件驱动，非 sleep）。两阶段：
-//   阶段 1「活动窗口」（600ms）：等待动作影响的第一波信号（DOM 变化/长任务）——
+//   阶段 1「活动窗口」（1000ms）：等待动作影响的第一波信号（DOM 变化/长任务）——
 //     信号到达立即进入阶段 2；窗口耗尽仍无信号（动作无影响或影响超窗口）→ 放行。
 //     窗口是「等第一个信号的观察期」，不是固定等待：影响 100ms 到就 100ms 推进。
 //   阶段 2「静默判定」（250ms）：每次活动信号重启静默计时，真正安静 250ms
@@ -1569,10 +1590,16 @@ function throttleSafeTimer(ms: number): { promise: Promise<void>; cancel: () => 
 //         ② PerformanceObserver longtask（主线程繁忙）
 // 双 rAF 只作渲染 flush 锚点（动作后的第一帧），不视为活动信号。
 // maxWaitMs 只是防挂死保险，不是推进机制。返回等待耗时（≈maxWaitMs 说明超时兜底）。
-// 注意：纯网络等待（fetch 响应前无 DOM 活动）超出本检测的覆盖，用 wait_for 谓词等待。
+// 覆盖边界（如实说，不假装覆盖一切）：
+//   ① 纯网络等待（fetch 响应前无 DOM 活动）——响应到达后若引发渲染会被信号捕获，
+//      若压根不改页面则无「影响」可等
+//   ② 延迟超过活动窗口才发生的改动（页面自己 setTimeout 1s 以上再改 DOM）
+//   这两种都不在本检测的覆盖内，用 wait_for 谓词等待。
+// 窗口取 1000ms 是权衡：常见「点击后延迟渲染」（几百 ms 级 timer）能等到，
+// 代价是**没有可见影响**的动作要多等这段时间才放行（原来的 600ms 会漏掉 800ms 的延迟渲染）。
 function waitForSettled(maxWaitMs: number): Promise<{ waited: number }> {
   const QUIET_MS = 250;
-  const ACTIVITY_WINDOW_MS = 600;
+  const ACTIVITY_WINDOW_MS = 1000;
   const start = Date.now();
   return new Promise((resolve) => {
     let quiet: ReturnType<typeof throttleSafeTimer> | undefined;
@@ -1710,10 +1737,18 @@ function evalTextXPath(xpath: string, context: Document | ShadowRoot | Element):
 // 「折叠空白后的字符串值」，所以嵌套 <span> 的按钮整串仍然相等，这正是按文本点击要的语义。
 // shadow tree 内没有 body，用 bodyXpath 去掉 //body// 前缀的变体。
 function buildTextXPath(text: string, exact: boolean): { bodyXpath: string; shadowXpath: string } {
+  // 匹配用两个口径的并集：折叠空白后的文本值（历史语义，手写的查询串走这条）
+  // 与**原样**文本值（用户从 cda 输出里原样抄回来的文字走这条，含换行/制表/连续空格）。
+  // 查询串不含空白连续段时两者等价 → 这个并集对常规查询零行为变化。
   const q = xpathStr(text);
+  const qFlat = xpathStr(collapseWs(text));
   const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
-  const cond = exact ? `normalize-space(.) = ${q}` : `contains(normalize-space(.), ${q})`;
-  const valCond = exact ? `@value = ${q}` : `contains(@value, ${q})`;
+  const cond = exact
+    ? `(normalize-space(.) = ${qFlat} or . = ${q})`
+    : `(contains(normalize-space(.), ${qFlat}) or contains(., ${q}))`;
+  const valCond = exact
+    ? `(@value = ${q} or @value = ${qFlat})`
+    : `(contains(@value, ${q}) or contains(@value, ${qFlat}))`;
   const bodyXpath = [
     `//body//button[${cond}]`,
     `//body//a[${cond}]`,
