@@ -175,6 +175,7 @@ wss.on("connection", (ws, req) => {
                             success: result.payload.success,
                             data: result.payload.data,
                             error: result.payload.error,
+                            code: result.payload.code,
                         },
                     });
                 }

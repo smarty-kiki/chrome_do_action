@@ -28,7 +28,9 @@ interface RegisterMessage extends BaseMessage {
 
 interface CommandResultMessage extends BaseMessage {
   type: "command_result";
-  payload: { commandId: string; success: boolean; data?: unknown; error?: string };
+  // code：机器可读错误码（not-found / unreachable-subtree / cdp-unavailable …）。
+  // 缺了它 CLI 只能从人类可读文案里猜失败原因——「元素不存在」和「存在但不可达」就分不开了
+  payload: { commandId: string; success: boolean; data?: unknown; error?: string; code?: string };
 }
 
 interface CliMessage extends BaseMessage {
@@ -48,7 +50,7 @@ type AnyMessage =
   | { type: "command"; id?: string; payload: { command: string; params?: Record<string, unknown> } }
   | CommandResultMessage
   | CliMessage
-  | { type: "cli_result"; id?: string; payload: { success: boolean; data?: unknown; error?: string } }
+  | { type: "cli_result"; id?: string; payload: { success: boolean; data?: unknown; error?: string; code?: string } }
   | { type: "ping"; id?: string; payload: { timestamp: number } }
   | { type: "pong"; id?: string; payload: { timestamp: number } }
   | { type: "error"; id?: string; payload: { message: string } };
@@ -231,6 +233,7 @@ wss.on("connection", (ws: WebSocket, req) => {
               success: result.payload.success,
               data: result.payload.data,
               error: result.payload.error,
+              code: result.payload.code,
             },
           });
         }

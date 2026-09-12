@@ -159,16 +159,28 @@
     });
     return iframes;
   }
+  function describeLayer(top) {
+    const htmlTop = top;
+    const desc = { tag: top.tagName.toLowerCase() };
+    const cls = Array.from(htmlTop.classList).slice(0, 3).join(".");
+    if (cls) desc.class = cls;
+    const txt = htmlTop.textContent || "";
+    if (txt) desc.text = txt;
+    return desc;
+  }
   async function handleCommand(payload) {
     const { command, params = {} } = payload;
     const fields = getFieldFilter(params);
     try {
       switch (command) {
         case "click": {
-          const known = ["text", "selector", "x", "y", "frame", "waitFor"];
+          const known = ["text", "selector", "x", "y", "frame", "waitFor", "exact"];
           const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
           if (unknown.length) {
-            return { success: false, error: `Unknown click parameter(s): ${unknown.join(", ")} (expected text, selector, x, y, waitFor)` };
+            return { success: false, error: `Unknown click parameter(s): ${unknown.join(", ")} (expected text, selector, x, y, waitFor, exact)` };
+          }
+          if (params.exact !== void 0 && typeof params.exact !== "boolean") {
+            return { success: false, error: `"exact" must be a boolean (got ${JSON.stringify(params.exact)})` };
           }
           if (params.x !== void 0 && typeof params.x !== "number") {
             return { success: false, error: `"x" must be a number (got ${JSON.stringify(params.x)})` };
@@ -206,18 +218,9 @@
             }
             return { visible: true };
           };
-          const describeLayer = (top) => {
-            const htmlTop = top;
-            const desc = { tag: top.tagName.toLowerCase() };
-            const cls = Array.from(htmlTop.classList).slice(0, 3).join(".");
-            if (cls) desc.class = cls;
-            const txt = htmlTop.textContent || "";
-            if (txt) desc.text = txt;
-            return desc;
-          };
           if (params.text) {
             const text = params.text;
-            const found = findByText(text);
+            const found = findByText(text, params.exact === true);
             if (!found) return { success: false, notFound: true, error: `No element found with text: ${text}` };
             el = found;
             const { cx, cy } = dispatchFullClick(el);
@@ -257,10 +260,13 @@
           return { success: true, data };
         }
         case "get_prop": {
-          const known = ["selector", "text", "prop", "frame"];
+          const known = ["selector", "text", "prop", "frame", "exact"];
           const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
           if (unknown.length) {
-            return { success: false, error: `Unknown get_prop parameter(s): ${unknown.join(", ")} (expected selector, text, prop, frame)` };
+            return { success: false, error: `Unknown get_prop parameter(s): ${unknown.join(", ")} (expected selector, text, prop, frame, exact)` };
+          }
+          if (params.exact !== void 0 && typeof params.exact !== "boolean") {
+            return { success: false, error: `"exact" must be a boolean (got ${JSON.stringify(params.exact)})` };
           }
           const prop = params.prop;
           if (typeof prop !== "string" || !prop) {
@@ -275,7 +281,7 @@
           if (params.selector === void 0 && params.text === void 0) {
             return { success: false, error: 'Need "selector" or "text" parameter' };
           }
-          const el = params.text ? findByText(params.text) : findElement(params.selector);
+          const el = params.text ? findByText(params.text, params.exact === true) : findElement(params.selector);
           if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text ?? params.selector}` };
           const tag = el.tagName.toLowerCase();
           if (!(prop in el)) {
@@ -300,12 +306,49 @@
           return { success: true, data: val };
         }
         case "get_rect": {
+          const known = ["selector", "text", "frame", "scroll", "all", "waitStableMs", "exact"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown get_rect parameter(s): ${unknown.join(", ")} (expected selector, text, exact, all, waitStableMs, scroll)` };
+          }
           const selector = params.selector;
           if (!selector && !params.text) return { success: false, error: 'Need "selector" or "text" parameter' };
-          const el = params.text ? findByText(params.text) : findElement(selector);
+          if (params.exact !== void 0 && typeof params.exact !== "boolean") {
+            return { success: false, error: `"exact" must be a boolean (got ${JSON.stringify(params.exact)})` };
+          }
+          if (params.all !== void 0 && typeof params.all !== "boolean") {
+            return { success: false, error: `"all" must be a boolean (got ${JSON.stringify(params.all)})` };
+          }
+          if (params.waitStableMs !== void 0 && (typeof params.waitStableMs !== "number" || params.waitStableMs < 0)) {
+            return { success: false, error: `"waitStableMs" must be a non-negative number (got ${JSON.stringify(params.waitStableMs)})` };
+          }
+          const exact = params.exact === true;
+          const el = params.text ? findByText(params.text, exact) : findElement(selector);
           if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text || selector}` };
           if (params.scroll === true) {
             el.scrollIntoView({ block: "center", behavior: "instant" });
+          }
+          let stable = null;
+          if (typeof params.waitStableMs === "number" && params.waitStableMs > 0) {
+            const started = Date.now();
+            let last = el.getBoundingClientRect();
+            let unchangedSince = started;
+            const deadline = started + params.waitStableMs + 5e3;
+            stable = { waited: 0, stable: false };
+            while (Date.now() < deadline) {
+              await throttleSafeTimer(50).promise;
+              const now = el.getBoundingClientRect();
+              if (now.left !== last.left || now.top !== last.top || now.width !== last.width || now.height !== last.height) {
+                last = now;
+                unchangedSince = Date.now();
+                continue;
+              }
+              if (Date.now() - unchangedSince >= params.waitStableMs) {
+                stable = { waited: Date.now() - started, stable: true };
+                break;
+              }
+            }
+            if (!stable.stable) stable.waited = Date.now() - started;
           }
           const rect = el.getBoundingClientRect();
           const lx = rect.left + rect.width / 2;
@@ -325,6 +368,49 @@
             }
             win = win.parent;
           }
+          const rectCss = crossOrigin ? { x: rect.left, y: rect.top, w: rect.width, h: rect.height } : { x: rect.left + (x - lx), y: rect.top + (y - ly), w: rect.width, h: rect.height };
+          const centerCss = { x: rectCss.x + rectCss.w / 2, y: rectCss.y + rectCss.h / 2 };
+          const hostChain = [];
+          for (let n = el; n; ) {
+            const root = n.getRootNode();
+            if (root instanceof ShadowRoot) {
+              hostChain.push(root.host);
+              n = root.host;
+            } else break;
+          }
+          const top = document.elementFromPoint(lx, ly);
+          const hitTest = top ? { ...describeLayer(top), ...hostChain.length ? { shadowRetargeted: true } : {} } : null;
+          const covered = !!top && top !== el && !el.contains(top) && !hostChain.some((h) => h === top || h.contains(top));
+          const allMatches = [];
+          let matchCount = 1;
+          let truncated = false;
+          if (params.text) {
+            const candidates = findAllByText(params.text, exact);
+            matchCount = candidates.length;
+            if (params.all === true || matchCount > 1) {
+              const limit = params.all === true ? 100 : 20;
+              let priority = 0;
+              for (const cand of candidates) {
+                if (allMatches.length >= limit) {
+                  truncated = true;
+                  break;
+                }
+                const hEl = cand;
+                const vis = isVisible(hEl);
+                const r = hEl.getBoundingClientRect();
+                allMatches.push({
+                  tag: cand.tagName.toLowerCase(),
+                  class: Array.from(hEl.classList).slice(0, 3).join("."),
+                  text: (hEl.textContent || "").trim().replace(/\s+/g, " "),
+                  rectCss: { x: r.left, y: r.top, w: r.width, h: r.height },
+                  visible: vis,
+                  // priority 只在可见候选间计数：0 = click {text} 会点的那个。
+                  // 不可见的候选点不到，因此不给 priority（不是 0，也不是被跳过）
+                  ...vis ? { priority: priority++ } : {}
+                });
+              }
+            }
+          }
           return {
             success: true,
             data: {
@@ -333,7 +419,44 @@
               y: Math.round(y),
               width: Math.round(rect.width),
               height: Math.round(rect.height),
-              ...crossOrigin ? { crossOrigin: true, localX: Math.round(lx), localY: Math.round(ly) } : {}
+              ...crossOrigin ? { crossOrigin: true, localX: Math.round(lx), localY: Math.round(ly) } : {},
+              // 以下为增补字段（既有字段语义与取值未变：x/y = Math.round(centerCss)）
+              rectCss,
+              centerCss,
+              tag: el.tagName.toLowerCase(),
+              class: Array.from(el.classList).slice(0, 3).join("."),
+              text: (el.textContent || "").trim().replace(/\s+/g, " "),
+              visible: isVisible(el),
+              covered,
+              hitTest,
+              matchCount,
+              ...allMatches.length ? { allMatches } : {},
+              ...truncated ? { truncated: true } : {},
+              ...stable ? { waitStable: stable } : {}
+            }
+          };
+        }
+        case "get_viewport": {
+          const known = ["frame"];
+          const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+          if (unknown.length) {
+            return { success: false, error: `Unknown get_viewport parameter(s): ${unknown.join(", ")} (expected no parameters)` };
+          }
+          const vv = window.visualViewport;
+          return {
+            success: true,
+            data: {
+              viewportCss: { w: window.innerWidth, h: window.innerHeight },
+              scrollCss: {
+                x: Math.round(window.scrollX),
+                y: Math.round(window.scrollY)
+              },
+              dpr: window.devicePixelRatio,
+              screenCss: { w: window.screen.width, h: window.screen.height },
+              devicePixelRatio: window.devicePixelRatio,
+              isTop: window === window.top,
+              url: location.href,
+              ...vv ? { visualViewportCss: { w: vv.width, h: vv.height, scale: vv.scale, offsetLeft: vv.offsetLeft, offsetTop: vv.offsetTop } } : {}
             }
           };
         }
@@ -1238,16 +1361,21 @@
     }
     return null;
   }
-  function findByText(text) {
+  function buildTextXPath(text, exact) {
     const q = xpathStr(text);
     const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
+    const cond = exact ? `normalize-space(.) = ${q}` : `contains(normalize-space(.), ${q})`;
+    const valCond = exact ? `@value = ${q}` : `contains(@value, ${q})`;
     const bodyXpath = [
-      `//body//button[contains(normalize-space(.), ${q})]`,
-      `//body//a[contains(normalize-space(.), ${q})]`,
-      `//body//input[contains(@value, ${q})]`,
-      `//body//*[not(${hidden})][contains(normalize-space(.), ${q}) and not(./*[not(${hidden})][contains(normalize-space(.), ${q})])]`
+      `//body//button[${cond}]`,
+      `//body//a[${cond}]`,
+      `//body//input[${valCond}]`,
+      `//body//*[not(${hidden})][${cond} and not(./*[not(${hidden})][${cond}])]`
     ].join(" | ");
-    const shadowXpath = bodyXpath.split("//body//").join("//");
+    return { bodyXpath, shadowXpath: bodyXpath.split("//body//").join("//") };
+  }
+  function findByText(text, exact = false) {
+    const { bodyXpath, shadowXpath } = buildTextXPath(text, exact);
     const hit = evalTextXPath(bodyXpath, document);
     if (hit) return hit;
     for (const sr of openShadowRootsDeep(document)) {
@@ -1255,6 +1383,38 @@
       if (h) return h;
     }
     return null;
+  }
+  function evalTextXPathAll(xpath, context) {
+    if (context instanceof ShadowRoot) {
+      const out2 = [];
+      for (const child of Array.from(context.children)) out2.push(...evalTextXPathAll(xpath, child));
+      return out2;
+    }
+    const result = document.evaluate(xpath, context, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
+    const out = [];
+    let el = result.iterateNext();
+    while (el) {
+      out.push(el);
+      el = result.iterateNext();
+    }
+    return out;
+  }
+  function findAllByText(text, exact) {
+    const { bodyXpath, shadowXpath } = buildTextXPath(text, exact);
+    const seen = /* @__PURE__ */ new Set();
+    const out = [];
+    const push = (els) => {
+      for (const el of els) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+        out.push(el);
+      }
+    };
+    push(evalTextXPathAll(bodyXpath, document));
+    for (const sr of openShadowRootsDeep(document)) {
+      push(evalTextXPathAll(shadowXpath, sr));
+    }
+    return out;
   }
   function nonJsonableReason(val, seen = /* @__PURE__ */ new Set()) {
     if (typeof val === "function") return "is a function \u2014 JSON cannot carry it";

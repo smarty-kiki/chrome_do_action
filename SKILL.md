@@ -1,11 +1,11 @@
 ---
 name: cda-chrome-control
-description: 通过 cda CLI 控制本机 Chrome 浏览器执行页面操作：打开网页、点击、输入文本、触发事件、富文本排版、上传文件、截图、显示隐藏元素、提取内容、监听 JS 错误、管理标签页。通用浏览器自动化工具，适用于网页后台、CMS、电商、建站、抓取等各种场景。当用户要求"用 Chrome 打开某网页"、"控制浏览器做 XX"、"在网页上填表/发布内容"、"编辑排版网页内容"、"抓取网页内容"、"上传文件"等场景时使用。前置条件：Node.js 18+、本机 Chrome，按"安装"章节完成一次配置。
-version: 1.5.4
+description: 通过 cda CLI 控制本机 Chrome 浏览器执行页面操作：打开网页、点击、输入文本、触发事件、富文本排版、上传文件、读取元素几何坐标、截图、显示隐藏元素、提取内容、监听 JS 错误、管理标签页。通用浏览器自动化工具，适用于网页后台、CMS、电商、建站、抓取等各种场景。当用户要求"用 Chrome 打开某网页"、"控制浏览器做 XX"、"在网页上填表/发布内容"、"编辑排版网页内容"、"抓取网页内容"、"上传文件"、"获取元素坐标/位置"等场景时使用。前置条件：Node.js 18+、本机 Chrome，按"安装"章节完成一次配置。
+version: 1.6.1
 display_name: cda Chrome 控制
 display_name_en: cda Chrome Control
-description_zh: 用命令行控制本机 Chrome 浏览器执行通用网页操作（打开/点击/输入/富文本排版/上传/截图/抓取/管理标签页）
-description_en: Control local Chrome via CLI for general web operations (open/click/type/paste-rich-text/upload/screenshot/scrape/manage tabs)
+description_zh: 用命令行控制本机 Chrome 浏览器执行通用网页操作（打开/点击/输入/富文本排版/上传/读元素几何坐标/截图/抓取/管理标签页）
+description_en: Control local Chrome via CLI for general web operations (open/click/type/paste-rich-text/upload/read element geometry/screenshot/scrape/manage tabs)
 visibility: public
 ---
 
@@ -79,7 +79,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | 命令 | 用法 | 说明 |
 |------|------|------|
 | `click` | `send <id> click <tab> '{"selector":"#id"}'` 或 `'{"text":"登录"}'` 或 `'{"x":100,"y":200}'` | 点击元素（selector/CSS/XPath/text/坐标）；**自动搜索 iframe**（顶层优先，含跨域），可加 `frame` 指定 |
-| `real_click` | `send <id> real_click <tab> '{"selector":"#submit"}'` | 真实点击，对合成事件免疫的站点有效（click 提示"点到了"却没触发时用它）；iframe（含跨域）同样可点。可选 `approach`：渐进移动路径 `[[x,y],...]`，先移向触发点再点目标，模拟多级 hover（悬停才展开的嵌套菜单/工具条） |
+| `real_click` | `send <id> real_click <tab> '{"selector":"#submit"}'` 或 `'{"x":100,"y":200}'` | 真实点击，对合成事件免疫的站点有效（click 提示"点到了"却没触发时用它）；iframe（含跨域）同样可点。可选 `approach`：渐进移动路径 `[[x,y],...]`，先移向触发点再点目标，模拟多级 hover（悬停才展开的嵌套菜单/工具条）。**返回命中回执 `hit`**（实际点到的元素 tag/class/text/backendNodeId）——坐标点击后核对 `hit.text` 是否为目标，不符立即中止，别再"假成功"。也接受 `{"backendNodeId":N}` 点击 closed shadow root 内的元素 |
 | `type` | `send <id> type <tab> '{"selector":"#title","text":"标题"}'` | 输入文本：**文字原样插入，不加工不拆分**——input/textarea 直接写入，富文本编辑区整段原样插入（进去后怎么分段/排版由页面编辑器自己决定，cda 不做编辑器适配）。`mode` 可选：`replace`（默认，清空原内容）/`append`（追加到末尾）/`insert`（光标处插入，有选中则替换选区）；要分段就一段发一次 |
 | `keyboard` | `send <id> keyboard <tab> '{"selector":"#title","key":"Enter"}'` | 向元素发送按键（keydown/keypress/keyup，合成事件）；selector 省略用当前聚焦元素；支持 `ctrl`/`shift`/`alt`/`meta` 组合键 |
 | `trigger` | `send <id> trigger <tab> '{"selector":"#username","event":"blur"}'` | 触发元素事件：`blur` 触发表单校验、`change`+`value` 选下拉选项（React 受控组件同样生效）、自定义事件；`focus`/`blur` 触发真实焦点转移（表单校验生效）；带 settle + waitFor；`{options}` 透传事件属性 |
@@ -92,9 +92,11 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | `hide` | `send <id> hide <tab>` | 还原所有被 show 的元素（清 inline style 回 CSS 控制） |
 | `get_text` | `send <id> get_text <tab> '{"selector":"..."}'` | 获取文本（无 params 取整页；带 selector 自动搜索 iframe） |
 | `get_prop` | `send <id> get_prop <tab> '{"selector":"#title","prop":"value"}'` | 读取元素属性的**真实原值**（只读，从不调用方法）：`value` 校验输入写入、`checked` 看勾选态、`innerHTML`/`src`/`className` 等任意属性；标量原样返回，无法无损转 JSON 的对象明确报错而非静默变空 |
+| `get_rect` | `send <id> get_rect <tab> '{"text":"发布","exact":true}'` 或 `'{"selectors":[".a",".b"]}'` 或 `'{"backendNodeId":4211}'` | **元素几何真值**，返回 `centerCss` + `rectCss` + `covered`/`hitTest`（是否被遮挡）+ `matchCount`/`allMatches`（文本子串歧义：`priority:0` 就是 `click {text}` 会点的那个）+ `waitStableMs` 等稳定。**与 `real_click {x,y}` 同一坐标口径**（顶层视口 CSS px）——取 `centerCss` 直接喂 real_click 即命中同一元素，不再从截图像素反推。closed shadow root 自动穿透；错误码可区分 `not-found`（不存在）/`unreachable-subtree`（存在但不可寻址）/`cdp-unavailable` |
+| `get_viewport` | `send <id> get_viewport <tab>` | **视口真值**（只读）：`{viewportCss:{w,h}, dpr, scrollCss:{x,y}, screenCss:{w,h}}`。截图换算的权威来源，`imagePx.w / dpr === viewportCss.w` |
 | `get_page_info` | `send <id> get_page_info <tab>` | 页面信息（url/title/iframes），支持 --field；iframes 对**跨域也补全 url/html** |
-| `list_elements` | `send <id> list_elements <tab> '{"filter":"upload","visible":true}'` | **页面元素地图**：列出可交互元素（生成好的 selector/可见性/坐标/accept 等），支持 filter/text/max/visible；穿透 shadow DOM，缺省聚合所有 frame（元素带 frame url）；找不到元素先查它 |
-| `screenshot` | `send <id> screenshot <tab> '{"path":"/tmp/shot.png"}'` | 截图（只读），操作前确认页面真实状态 |
+| `list_elements` | `send <id> list_elements <tab> '{"filter":"upload","visible":true}'` | **页面元素地图**：列出可交互元素（生成好的 selector/可见性/坐标/accept 等），支持 filter/text/max/visible；穿透 shadow DOM，缺省聚合所有 frame（元素带 frame url）；找不到元素先查它。加 `{"closed":true}` 连 **closed shadow root** 内的元素一起列（带 `backendNodeId` 无 `selector`，排在列表最前） |
+| `screenshot` | `send <id> screenshot <tab> '{"path":"/tmp/shot.png"}'` | 截图（只读），操作前确认页面真实状态。CLI 打印 JSON：`{path, bytes, imagePx, viewportCss, dpr, scale, chromeInsetCss, scrollCss, mapping, viewportSource}`——图与换算元数据一起回。`viewportCss` 由图像尺寸反推（`imagePx / dpr`），故 `imagePx.w / dpr === viewportCss.w` 恒成立、`chromeInsetCss` 恒为 0（截图不含浏览器 UI）；两轴对不上会在 `warning` 里如实报告，图没拿到则 CLI 直接报错退出（不会静默什么都没写） |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取页面 JS 报错（跨所有 frame 聚合，每条带 `source` 定位来源 frame） |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空已收集的 JS 报错，配合 get_js_errors 重新计数 |
 | `scroll` | `send <id> scroll <tab> '{"y":500}'` | 滚动页面：无 selector 滚窗口/iframe（`frame` 参数指定）；`{"selector":"..."}` 滚到元素（可滚动容器内滚、普通元素 scrollIntoView，穿透 shadow） |
@@ -104,10 +106,13 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 
 1. **找不到元素先 `list_elements`**：别猜 selector、别挖 MB 级 HTML。先 `list_elements` 拿元素地图——返回每条元素带生成好的 `selector`（可直接喂给 click/type/upload_file）、可见性、坐标、`accept` 等关键属性。想找上传控件：`send <id> list_elements <tab> '{"filter":"upload"}'`（同时列出多个 file input 时用 accept 对比选目标，如抖音视频/图文两个 tab）；被 CSS 隐藏的输入框用 `'{"visible":false}'`；shadow DOM 内元素同样列出（selector 带 `>>>`）。多 file input 页面配 `--field "elements.accept,elements.selector"` 快速对比。
 2. **等影响落地（settle）**：click/type/keyboard/trigger/upload_file/upload_dragdrop/paste_rich/scroll/real_click 返回前会事件驱动地等影响落地（DOM 变化/长任务，非固定 sleep），返回 `settledMs`。影响落地晚（服务端请求后才渲染、长 debounce）时加 `waitFor` 谓词：`'{"selector":"#btn","waitFor":{"text":"发布成功"}}'`——50ms 轮询、条件满足瞬间返回 `{"settled":true,"waited":615}`。后台 tab 的 Chrome 定时器节流会让 settle 追加 ~1s 确认期，深度后台等不到就用 waitFor 或把 tab 切前台。**任何命令都有 60 秒硬超时**（服务端截断）——单条命令别做分钟级等待，大任务拆小。
-3. **坐标必须截图确认**：先 `screenshot` 看真实页面，再取坐标定位。
+3. **要坐标用 `get_rect`，不要从截图像素反推**：`get_rect '{"text":"发布","exact":true}'` 直接给权威 `centerCss`，与 `real_click {x,y}` 同一坐标口径（顶层视口 CSS px，iframe 内元素已加好 frame 偏移）。**别再从截图找色块、猜缩放/偏移反推坐标**——那种做法绑死"页面上恰好有个位置固定的参照物"，页面一改版就整体失效。`screenshot` 也返回换算元数据（`{imagePx, viewportCss, dpr, chromeInsetCss, scrollCss, mapping}`，`css = imagePx / dpr`），但它用于**看页面真实状态**，不是取坐标的手段。
+   - **`real_click` 坐标点击后核对 `hit`**：返回里的 `hit` 是它**实际点到**的元素（`{tag, class, text, backendNodeId}`，在按下鼠标之前采样）——`hit.text` 不是目标就立即中止。给坐标却静默点到旁边的按钮（如「暂存离开」这类中断流程的按钮）是真实事故，靠这个字段挡掉。同时返回 `navigated`（URL 是否变了）和 `settledMs`。
+   - **文本子串有歧义时先看清**：`'{"text":"发布"}'` 是**子串**匹配，页面上「发布笔记」「发布」可能同时命中，而 `click {text}` 只点**第一个可见的**。`get_rect '{"text":"发布","all":true}'` 返回 `matchCount` 与 `allMatches`，其中 `priority:0` 就是 `click` 会点的那个、其余是被静默忽略的兄弟。要精确指定用 `{"exact":true}`。
+   - **两个视口空间：debugger 信息条会让视口变矮**：走协议层的命令（`real_click`、`screenshot`、任何传 `backendNodeId` 的命令、`get_rect` 的兜底通道）执行时，Chrome 会顶出一条「扩展正在调试此浏览器」信息条，**布局视口因此比页面内命令看到的矮一条**（实测 1440×749 → 1440×693）。顶部锚定的静态内容两边坐标相同；`position:fixed` 贴底 / 垂直居中 / `vh` 尺寸的元素正好差这一条的高度，而且信息条有展开动画、差值在动画期间还在变（这正是"坐标算对了却点空"的一种真实成因）。cda 已在每个附加点**等信息条真的出现（视口比页面内态矮下去）再测量/派发**，所以**同一条命令里取的坐标和它点的动作永远在同一空间**——判据是「变矮」而不是「数值不动」，因为信息条出现得比 attach 慢半拍，先稳住的常是还没变矮的瞬时值（同一会话第一次附加最容易踩）。使用者只要守一条规则——**坐标别跨通道搬运**：`get_viewport` 报的是页面内态（它不开 debugger），`screenshot.viewportCss` 报的是附加态，两者高度可以不等，别拿一个去校验或补偿另一个（某次会话信息条始终不弹时，CDP 通道的结果里会带 `viewportNote` 挑明这份坐标与页面内态同空间）。
 4. **hover 菜单用 show 解决**：触发不了 hover 时别硬怼事件模拟，`show` 强制显示元素后普通 `click` 即可命中，操作完 `hide` 还原：`send <id> show <tab> '.toolbar-menu'` → `click` → `send <id> hide <tab>`。确需真实 hover 链（如悬停才展开的嵌套菜单）时，用 `real_click` 的 `approach` 渐进路径逐级触发。
 5. **iframe 自动搜索**：元素命令默认顶层优先搜遍所有 iframe（含跨域），返回带命中 `frame.url`。目标在 iframe 内且自动搜索未命中时，加 `frame` 参数固定：`{"selector":"...","frame":{"url":"子串"}}`（跨域最稳）或 `{"frame":0}`（第 N 个顶层 iframe）。
-6. **shadow DOM 自动穿透**：Web Components 站点（小红书后台等）的按钮/编辑器在 shadow root 里，普通选择器找不到。三种方式：① 直接粘贴 DevTools 元素路径（含 `#shadow-root` 标记）；② `selector: "xhs-publish-btn >>> button"`（`>>>` 穿透所有层）；③ 裸选择器/xpath/text 会自动兜底搜索 open shadow root。closed root 只能用坐标 `real_click {"x":..,"y":..}`。`get_page_info --field html` 默认含 shadow 内容（`<template shadowrootmode="open">` 内联）。
+6. **shadow DOM 自动穿透**：Web Components 站点（小红书后台等）的按钮/编辑器在 shadow root 里，普通选择器找不到。三种方式：① 直接粘贴 DevTools 元素路径（含 `#shadow-root` 标记）；② `selector: "xhs-publish-btn >>> button"`（`>>>` 穿透所有层）；③ 裸选择器/xpath/text 会自动兜底搜索 open shadow root。**closed shadow root**（`attachShadow({mode:"closed"})`）对页面内一切通道都不可见——`exec` 注入的 JS 同样看不见（所以放开 exec 解决不了这类问题），改用协议层通道：`list_elements '{"closed":true}'` 枚举（带 `backendNodeId`，无 `selector`）→ `get_rect '{"backendNodeId":N}'` 量矩形 → `click`/`real_click`/`get_prop`/`get_text` 传 `{"backendNodeId":N}` 操作；`get_rect` 对普通查询也会自动兜底到闭包内。`get_page_info --field html` 默认含 open shadow 内容（`<template shadowrootmode="open">` 内联），但**不含 closed**。
 7. **paste_rich 传参**：HTML 含英文引号时 shell 单引号会截断参数，用 Node `spawnSync`（参数数组，不经 shell）传参。
 8. **富文本输入**：用 `type` 输入纯文本时文字**原样插入、不自动分段**——要分段就逐段发（后续 `mode:"append"` 追加）；要带格式的排版直接用 `paste_rich` 粘贴排好版的 HTML——块级结构由编辑器自己解析分段。看返回值 `pipeline` 判断落地情况：`"editor_paste"` = 编辑器接管（预期值）；`"default_paste"` = 内容以纯文本进入；`"insertHTML_fallback"` = HTML 原样进入（富文本编辑器出现此值说明它没处理这次粘贴，可能不分段）。cda 不做任何编辑器适配，最终效果由编辑器自己决定，某种编辑器行不行由使用者自行验证。
 9. **登录态**：直接复用本机已登录浏览器，无需处理 cookie。
@@ -115,6 +120,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 11. **--field 精确取结果**：所有返回对象的命令都支持 `--field` 点路径裁剪：`--field "clickDesc.selector,settledMs,currentTab.url"` → `{clickDesc:{selector},settledMs,currentTab:{url}}`；`--field "newTabs.url"` → `{newTabs:[url,...]}`。只取需要字段，减少输出、加快响应（不采集未请求的页面信息）。`get_text` 返回纯文本、`get_prop` 标量值原样返回——均无字段可滤（`get_prop` 对象值可裁剪）。
 12. **点击要看可点性报告**：`click` 返回的 `clickDesc` 会报告"点不点得到"：`visible: false` = 元素隐藏/无尺寸；`coveredBy: {tag, class, text}` = 目标点被别的元素盖住（浮层/遮罩）；`offscreen: true` = 目标点在视口外。出现这些即说明**合成点击大概率没被页面真正收到**（命令仍返回成功，别被误导）——先 `screenshot` 看真实状态：隐藏的确认加载完或先 `show`，被盖的关掉浮层或配 `waitFor` 等它消失，仍不行用 `real_click` 坐标。
 13. **只读校验用 `get_prop`**：type/trigger 后确认真的写入：`get_prop '{"selector":"#title","prop":"value"}'` 看输入值、`'{"selector":"#agree","prop":"checked"}'` 看勾选态、`'{"selector":".rich-text","prop":"innerHTML"}'` 读原始内容。从不执行方法；无法无损转 JSON 的对象会明确报错——需要这类内容改读字符串属性或用 get_text。
+14. **错误码能区分失败类别**：CLI 打印 `Error [code]: message`。`not-found` = 真的不存在（换 selector 或先 list_elements）；`unreachable-subtree` = **存在但不可寻址**（多半在 closed shadow root 里，改用 `backendNodeId` 通道，见技巧 6）；`cdp-unavailable` = debugger 被占（如 DevTools 开着），关掉 DevTools 重试。不要把三者当成同一件事盲目重试。元素被遮挡**不是**错误，是 `get_rect`/`clickDesc` 返回里的 `covered`/`coveredBy`。
 
 ## 实战：通用页面操作流程（填表/发布/上传类任务通用）
 

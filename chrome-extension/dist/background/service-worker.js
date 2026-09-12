@@ -183,6 +183,643 @@
     }
   };
 
+  // src/background/cdp-elements.ts
+  var CdpUnavailableError = class extends Error {
+    constructor(detail) {
+      super(`debugger unavailable: ${detail}`);
+      this.name = "CdpUnavailableError";
+      this.detail = detail;
+    }
+  };
+  var StaleNodeError = class extends Error {
+    constructor(backendNodeId) {
+      super(
+        `backendNodeId ${backendNodeId} no longer resolves to a node (page changed \u2014 re-run list_elements / get_rect for a fresh id)`
+      );
+      this.name = "StaleNodeError";
+    }
+  };
+  async function resolveObjectId(send, backendNodeId) {
+    try {
+      const resolved = await send("DOM.resolveNode", { backendNodeId });
+      return resolved?.object?.objectId ?? null;
+    } catch {
+      return null;
+    }
+  }
+  async function attachDebugger(tabId) {
+    try {
+      await chrome.debugger.attach({ tabId }, "1.3");
+    } catch (err) {
+      throw new CdpUnavailableError(err instanceof Error ? err.message : String(err));
+    }
+  }
+  async function detachDebugger(tabId) {
+    await chrome.debugger.detach({ tabId }).catch(() => {
+    });
+  }
+  async function enableDomains(send) {
+    await send("DOM.enable");
+    await send("Runtime.enable");
+  }
+  var HIDDEN_TAGS = /* @__PURE__ */ new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "HEAD", "TITLE", "META", "SVG", "PATH"]);
+  var INTERACTIVE_TAGS = /* @__PURE__ */ new Set(["BUTTON", "A", "SELECT", "TEXTAREA", "INPUT", "LABEL"]);
+  var INTERACTIVE_ROLES = /* @__PURE__ */ new Set([
+    "button",
+    "link",
+    "checkbox",
+    "radio",
+    "switch",
+    "tab",
+    "menuitem",
+    "option",
+    "combobox",
+    "textbox",
+    "listbox",
+    "slider",
+    "spinbutton",
+    "searchbox"
+  ]);
+  function normalizeSpace(s) {
+    return s.replace(/\s+/g, " ").trim();
+  }
+  function attrsOf(raw) {
+    const out = {};
+    const a = raw.attributes || [];
+    for (let i = 0; i + 1 < a.length; i += 2) out[a[i]] = a[i + 1];
+    return out;
+  }
+  async function readPiercedTree(send) {
+    const doc = await send("DOM.getDocument", { depth: -1, pierce: true }, 15e3);
+    const root = doc?.root;
+    if (!root) throw new Error("DOM.getDocument returned no root node");
+    const roots = [];
+    const elements = [];
+    const byNodeId = /* @__PURE__ */ new Map();
+    const byBackendId = /* @__PURE__ */ new Map();
+    const uncoveredIframes = [];
+    let closedShadowRoots = 0;
+    let nodeCount = 0;
+    const walkContainer = (container, inClosed, inBody, frameUrl, shadowRootType) => {
+      for (const c of container.children || []) {
+        if (c.nodeType !== 1) continue;
+        visit(c, inClosed, inBody, frameUrl, shadowRootType);
+      }
+    };
+    const visit = (raw, inClosed, inBody, frameUrl, shadowRootType) => {
+      nodeCount++;
+      const el = {
+        nodeId: raw.nodeId,
+        backendNodeId: raw.backendNodeId,
+        tag: raw.nodeName.toLowerCase(),
+        nodeName: raw.nodeName,
+        attributes: attrsOf(raw),
+        inClosedShadowRoot: inClosed,
+        text: "",
+        visibleText: "",
+        ...frameUrl ? { frameUrl } : {},
+        ...shadowRootType ? { shadowRootType } : {},
+        inBody: inBody || raw.nodeName === "BODY",
+        children: []
+      };
+      elements.push(el);
+      byNodeId.set(el.nodeId, el);
+      byBackendId.set(el.backendNodeId, el);
+      let rawText = "";
+      for (const c of raw.children || []) {
+        if (c.nodeType === 3) rawText += (c.nodeValue || "") + " ";
+      }
+      for (const c of raw.children || []) {
+        if (c.nodeType !== 1) continue;
+        el.children.push(visit(c, inClosed, el.inBody, frameUrl, shadowRootType));
+      }
+      el.text = normalizeSpace(`${rawText} ${el.children.map((k) => k.text).filter(Boolean).join(" ")}`);
+      const own = HIDDEN_TAGS.has(raw.nodeName) ? "" : rawText;
+      const kids = HIDDEN_TAGS.has(raw.nodeName) ? [] : el.children.map((k) => k.visibleText).filter(Boolean);
+      el.visibleText = normalizeSpace(`${own} ${kids.join(" ")}`);
+      for (const sr of raw.shadowRoots || []) {
+        const srClosed = inClosed || sr.shadowRootType === "closed";
+        if (sr.shadowRootType === "closed") closedShadowRoots++;
+        roots.push({
+          kind: "shadow-root",
+          nodeId: sr.nodeId,
+          backendNodeId: sr.backendNodeId,
+          shadowRootType: sr.shadowRootType,
+          inClosedShadowRoot: srClosed
+        });
+        walkContainer(sr, srClosed, true, frameUrl, sr.shadowRootType);
+      }
+      if (raw.nodeName === "IFRAME") {
+        if (raw.contentDocument) {
+          const cd = raw.contentDocument;
+          roots.push({
+            kind: "iframe-document",
+            nodeId: cd.nodeId,
+            backendNodeId: cd.backendNodeId,
+            inClosedShadowRoot: inClosed,
+            url: cd.baseURL,
+            frameId: cd.frameId
+          });
+          walkContainer(cd, inClosed, false, cd.baseURL);
+        } else {
+          uncoveredIframes.push({
+            src: el.attributes.src || "",
+            ...frameUrl ? { inFrameUrl: frameUrl } : {}
+          });
+        }
+      }
+      return el;
+    };
+    roots.push({
+      kind: "document",
+      nodeId: root.nodeId,
+      backendNodeId: root.backendNodeId,
+      inClosedShadowRoot: false,
+      url: root.baseURL,
+      frameId: root.frameId
+    });
+    walkContainer(root, false, false, root.baseURL);
+    const metrics = await send("Page.getLayoutMetrics").catch(() => null);
+    const lv = metrics?.cssLayoutViewport;
+    const dprRes = await send("Runtime.evaluate", {
+      expression: "window.devicePixelRatio",
+      returnByValue: true
+    }).catch(() => null);
+    return {
+      roots,
+      elements,
+      byNodeId,
+      byBackendId,
+      closedShadowRoots,
+      uncoveredIframes,
+      scroll: { x: Math.round(lv?.pageX ?? 0), y: Math.round(lv?.pageY ?? 0) },
+      viewport: { w: Math.round(lv?.clientWidth ?? 0), h: Math.round(lv?.clientHeight ?? 0) },
+      dpr: typeof dprRes?.result?.value === "number" ? dprRes.result.value : 1,
+      nodeCount
+    };
+  }
+  function uncoveredIframeNote(tree) {
+    if (tree.uncoveredIframes.length === 0) return void 0;
+    const list = tree.uncoveredIframes.map((f) => f.src || "(no src)").join(", ");
+    return `closed-shadow piercing does not cover ${tree.uncoveredIframes.length} iframe(s) whose document is not in this page's process (cross-origin frame, or not loaded yet): ${list}. Elements inside them are not reported; this is a boundary, not an empty result.`;
+  }
+  function textMatches(value, q) {
+    return q.exact ? normalizeSpace(value) === normalizeSpace(q.text) : value.includes(q.text);
+  }
+  function findByTextInTree(tree, q) {
+    const collect = (basisOf) => {
+      const hits = [];
+      for (const el of tree.elements) {
+        if (!el.inBody) continue;
+        if (HIDDEN_TAGS.has(el.nodeName)) continue;
+        const own = basisOf(el);
+        if (!textMatches(own, q)) continue;
+        const isButtonOrLink = el.nodeName === "BUTTON" || el.nodeName === "A";
+        const isInput = el.nodeName === "INPUT" && textMatches(el.attributes.value || "", q);
+        if (isButtonOrLink || isInput) {
+          hits.push(el);
+          continue;
+        }
+        const childHit = el.children.some((c) => !HIDDEN_TAGS.has(c.nodeName) && textMatches(basisOf(c), q));
+        if (!childHit) hits.push(el);
+      }
+      return hits;
+    };
+    const visible = collect((el) => el.visibleText);
+    return visible.length > 0 ? visible : collect((el) => el.text);
+  }
+  function selectorKind(selector) {
+    if (selector.startsWith("xpath:")) return "xpath";
+    const css = selector.startsWith("css:") ? selector.slice(4) : selector;
+    let quote = null;
+    let depth = 0;
+    for (let i = 0; i < css.length; i++) {
+      const ch = css[i];
+      if (quote) {
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        continue;
+      }
+      if (ch === "(" || ch === "[") {
+        depth++;
+        continue;
+      }
+      if (ch === ")" || ch === "]") {
+        depth = Math.max(0, depth - 1);
+        continue;
+      }
+      if (depth > 0) continue;
+      if (ch === ">" && css[i + 1] === ">" && css[i + 2] === ">") return "path";
+      if (css.startsWith("#shadow-root", i)) return "path";
+    }
+    return "css";
+  }
+  async function querySelectorInTree(send, tree, selector) {
+    const css = selector.startsWith("css:") ? selector.slice(4) : selector;
+    const out = [];
+    const seen = /* @__PURE__ */ new Set();
+    let lastError;
+    for (const root of tree.roots) {
+      if (root.shadowRootType === "user-agent") continue;
+      let res = null;
+      try {
+        res = await send("DOM.querySelectorAll", { nodeId: root.nodeId, selector: css });
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        continue;
+      }
+      for (const nodeId of res?.nodeIds || []) {
+        const el = tree.byNodeId.get(nodeId);
+        if (!el || seen.has(el.backendNodeId)) continue;
+        seen.add(el.backendNodeId);
+        out.push(el);
+      }
+    }
+    if (out.length === 0 && lastError) return { hits: out, error: lastError };
+    return { hits: out };
+  }
+  var FACT_FN = `function(){
+  const el = this;
+  let display = null, visibility = null;
+  try { const cs = getComputedStyle(el); display = cs.display; visibility = cs.visibility; } catch (e) {}
+  const attr = function(n){ return el.getAttribute ? el.getAttribute(n) : null; };
+  const inner = el.innerText === undefined ? (el.textContent || "") : el.innerText;
+  const out = {
+    tag: el.tagName ? String(el.tagName).toLowerCase() : String(el.nodeName || "").toLowerCase(),
+    class: Array.from(el.classList || []).slice(0, 3).join("."),
+    text: String(inner).trim().replace(/\\s+/g, " "),
+    rawText: el.textContent === undefined ? "" : String(el.textContent),
+    display: display,
+    visibility: visibility
+  };
+  if (el.isContentEditable) out.editable = true;
+  const role = attr("role"); if (role) out.role = role.toLowerCase();
+  const ariaLabel = attr("aria-label"); if (ariaLabel) out.ariaLabel = ariaLabel;
+  const title = attr("title"); if (title) out.title = title;
+  if (out.tag === "input") {
+    if (el.type) out.type = el.type;
+    if (el.accept) out.accept = el.accept;
+    if (el.multiple) out.multiple = true;
+    if (el.name) out.name = el.name;
+    if (el.placeholder) out.placeholder = el.placeholder;
+  }
+  return out;
+}`;
+  async function factsOf(send, backendNodeId) {
+    try {
+      const resolved = await send("DOM.resolveNode", { backendNodeId });
+      const objectId = resolved?.object?.objectId;
+      if (!objectId) return {};
+      const res = await send("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: FACT_FN,
+        returnByValue: true
+      });
+      return res?.result?.value || {};
+    } catch {
+      return {};
+    }
+  }
+  async function boxOf(send, backendNodeId) {
+    const rect = await quadsBbox(send, backendNodeId);
+    if (!rect) return null;
+    return { rectCss: rect, centerCss: { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 } };
+  }
+  async function quadsBbox(send, backendNodeId) {
+    const bbox = (quads) => {
+      if (!quads || quads.length === 0) return null;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const q of quads) {
+        for (let i = 0; i + 1 < q.length; i += 2) {
+          minX = Math.min(minX, q[i]);
+          minY = Math.min(minY, q[i + 1]);
+          maxX = Math.max(maxX, q[i]);
+          maxY = Math.max(maxY, q[i + 1]);
+        }
+      }
+      if (!(maxX >= minX) || !(maxY >= minY)) return null;
+      return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+    };
+    try {
+      const res = await send("DOM.getBoxModel", { backendNodeId });
+      const hit = bbox(res?.model?.border ? [res.model.border] : void 0);
+      if (hit) return hit;
+    } catch {
+    }
+    try {
+      const res = await send("DOM.getContentQuads", { backendNodeId });
+      return bbox(res?.quads);
+    } catch {
+      return null;
+    }
+  }
+  async function describeElements(send, items) {
+    const out = [];
+    for (const el of items) {
+      const raw = await factsOf(send, el.backendNodeId);
+      const box = await boxOf(send, el.backendNodeId);
+      out.push({
+        tag: raw.tag || el.tag,
+        ...raw.class ? { class: raw.class } : {},
+        text: raw.text !== void 0 ? raw.text : el.text,
+        rawText: raw.rawText !== void 0 ? raw.rawText : el.text,
+        rectCss: box ? box.rectCss : null,
+        centerCss: box ? box.centerCss : null,
+        visible: !!box && box.rectCss.w > 0 && box.rectCss.h > 0 && raw.display !== "none" && raw.visibility !== "hidden",
+        backendNodeId: el.backendNodeId,
+        inClosedShadowRoot: el.inClosedShadowRoot,
+        ...raw.editable ? { editable: true } : {},
+        ...el.frameUrl ? { frameUrl: el.frameUrl } : {},
+        ...raw.role ? { role: raw.role } : {},
+        ...raw.ariaLabel ? { ariaLabel: raw.ariaLabel } : {},
+        ...raw.title ? { title: raw.title } : {},
+        ...raw.type ? { type: raw.type } : {},
+        ...raw.accept ? { accept: raw.accept } : {},
+        ...raw.multiple ? { multiple: true } : {},
+        ...raw.name ? { name: raw.name } : {},
+        ...raw.placeholder ? { placeholder: raw.placeholder } : {}
+      });
+    }
+    return out;
+  }
+  function syntheticElement(backendNodeId) {
+    return {
+      nodeId: 0,
+      backendNodeId,
+      tag: "",
+      nodeName: "",
+      attributes: {},
+      inClosedShadowRoot: false,
+      text: "",
+      visibleText: "",
+      inBody: true,
+      children: []
+    };
+  }
+  async function describeBackendNode(send, tree, backendNodeId) {
+    const known = tree.byBackendId.get(backendNodeId);
+    const [facts] = await describeElements(send, [known || syntheticElement(backendNodeId)]);
+    return facts ?? null;
+  }
+  async function isSelfOrDescendant(send, targetBackendNodeId, hitBackendNodeId) {
+    if (targetBackendNodeId === hitBackendNodeId) return true;
+    const targetObj = await resolveObjectId(send, targetBackendNodeId);
+    const hitObj = await resolveObjectId(send, hitBackendNodeId);
+    if (!targetObj || !hitObj) return false;
+    try {
+      const res = await send("Runtime.callFunctionOn", {
+        objectId: targetObj,
+        functionDeclaration: "function(other){ return !!(this.contains && this.contains(other)); }",
+        arguments: [{ objectId: hitObj }],
+        returnByValue: true
+      });
+      return res?.result?.value === true;
+    } catch {
+      return false;
+    }
+  }
+  async function hitTestAt(send, tree, x, y) {
+    const px = Math.round(x + tree.scroll.x);
+    const py = Math.round(y + tree.scroll.y);
+    let loc = null;
+    try {
+      loc = await send("DOM.getNodeForLocation", { x: px, y: py });
+    } catch {
+      return null;
+    }
+    const backendNodeId = loc?.backendNodeId;
+    if (backendNodeId == null) return null;
+    const known = tree.byBackendId.get(backendNodeId);
+    const [facts] = await describeElements(send, [known || syntheticElement(backendNodeId)]);
+    if (!facts) return null;
+    return { ...facts, ...loc?.frameId ? { frameId: loc.frameId } : {} };
+  }
+  function toHitDescription(facts) {
+    return {
+      tag: facts.tag,
+      ...facts.class ? { class: facts.class } : {},
+      ...facts.rawText ? { text: facts.rawText } : {},
+      backendNodeId: facts.backendNodeId,
+      inClosedShadowRoot: facts.inClosedShadowRoot
+    };
+  }
+  async function scrollIntoView(send, backendNodeId) {
+    await send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
+    });
+  }
+  var CLICK_FN = `function(){
+  const r = this.getBoundingClientRect();
+  const cx = r.left + r.width / 2;
+  const cy = r.top + r.height / 2;
+  const base = { bubbles: true, cancelable: true, composed: true, view: window, clientX: cx, clientY: cy, button: 0 };
+  this.dispatchEvent(new PointerEvent("pointerdown", Object.assign({}, base, { buttons: 1, pointerId: 1, pointerType: "mouse", isPrimary: true })));
+  this.dispatchEvent(new MouseEvent("mousedown", Object.assign({}, base, { buttons: 1 })));
+  this.dispatchEvent(new PointerEvent("pointerup", Object.assign({}, base, { buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true })));
+  this.dispatchEvent(new MouseEvent("mouseup", Object.assign({}, base, { buttons: 0 })));
+  this.dispatchEvent(new MouseEvent("click", Object.assign({}, base, { buttons: 0 })));
+  return { cx: cx, cy: cy };
+}`;
+  async function dispatchSyntheticClick(send, backendNodeId) {
+    const objectId = await resolveObjectId(send, backendNodeId);
+    if (!objectId) throw new StaleNodeError(backendNodeId);
+    const res = await send("Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: CLICK_FN,
+      returnByValue: true,
+      userGesture: true
+    });
+    const v = res?.result?.value;
+    if (!v || typeof v.cx !== "number" || typeof v.cy !== "number") return null;
+    return { cx: v.cx, cy: v.cy };
+  }
+  async function textOf(send, backendNodeId) {
+    const objectId = await resolveObjectId(send, backendNodeId);
+    if (!objectId) throw new StaleNodeError(backendNodeId);
+    const res = await send("Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: "function(){ return this.textContent === undefined ? null : this.textContent; }",
+      returnByValue: true
+    });
+    const text = res?.result?.value;
+    return typeof text === "string" ? text : null;
+  }
+  async function propertyOf(send, backendNodeId, prop) {
+    const objectId = await resolveObjectId(send, backendNodeId);
+    if (!objectId) return { ok: false, error: new StaleNodeError(backendNodeId).message };
+    const fn = `function(p){
+    const tag = this.tagName ? String(this.tagName).toLowerCase() : String(this.nodeName || "");
+    if (!p) return { err: "empty" };
+    if (!(p in this)) return { err: "absent", tag: tag };
+    const v = this[p];
+    if (typeof v === "function") return { err: "function", tag: tag };
+    if (v === undefined) return { err: "undefined", tag: tag };
+    if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+      const proto = Object.getPrototypeOf(v);
+      if (proto !== Object.prototype && proto !== null) {
+        return { err: "nonplain", tag: tag, ctor: (v.constructor && v.constructor.name) || "object" };
+      }
+    }
+    return { value: v };
+  }`;
+    try {
+      const res = await send("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: fn,
+        arguments: [{ value: prop }],
+        returnByValue: true
+      });
+      const out = res?.result?.value;
+      if (!out) return { ok: false, error: `Could not read property "${prop}" from the element` };
+      if (out.err === "absent") {
+        return { ok: false, error: `No property "${prop}" on <${out.tag}> \u2014 examples: "innerHTML", "textContent", "value", "className", "checked", "id", "src", "href", "dataset"` };
+      }
+      if (out.err === "function") return { ok: false, error: `"${prop}" is a method on <${out.tag}> \u2014 get_prop only reads properties, it never calls methods` };
+      if (out.err === "undefined") return { ok: false, error: `Property "${prop}" on <${out.tag}> is undefined (element found, but the property has no value)` };
+      if (out.err === "nonplain") {
+        return { ok: false, error: `Property "${prop}" on <${out.tag}> holds a ${out.ctor || "non-plain"} object \u2014 only plain data can be returned; read a string/number property like "innerHTML" or "value" instead` };
+      }
+      return { ok: true, value: out.value };
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: `Property "${prop}" could not be serialized: ${detail}` };
+    }
+  }
+  async function waitViewportStable(send, opts = {}) {
+    const intervalMs = opts.intervalMs ?? 120;
+    const settleMs = opts.settleMs ?? 300;
+    const baseline = typeof opts.inPageViewportH === "number" ? opts.inPageViewportH : null;
+    const maxMs = opts.maxMs ?? (baseline !== null ? 2500 : 1200);
+    const started = Date.now();
+    let prev = null;
+    let readings = 0;
+    let stableSince = 0;
+    let sawInfobar = false;
+    let last = { w: 0, h: 0 };
+    for (; ; ) {
+      const m = await send("Page.getLayoutMetrics").catch(() => null);
+      const lv = m?.cssLayoutViewport;
+      last = { w: Math.round(lv?.clientWidth ?? 0), h: Math.round(lv?.clientHeight ?? 0) };
+      readings++;
+      if (baseline !== null && last.h > 0 && last.h < baseline) sawInfobar = true;
+      const waitingForInfobar = baseline !== null && !sawInfobar;
+      if (prev && prev.w === last.w && prev.h === last.h) {
+        if (!stableSince) stableSince = Date.now();
+        if (!waitingForInfobar && Date.now() - stableSince >= settleMs) {
+          return {
+            viewportCss: last,
+            settled: true,
+            waitedMs: Date.now() - started,
+            readings,
+            ...baseline !== null ? { sawInfobar } : {}
+          };
+        }
+      } else {
+        stableSince = 0;
+      }
+      if (Date.now() - started >= maxMs) {
+        return {
+          viewportCss: last,
+          settled: false,
+          waitedMs: Date.now() - started,
+          readings,
+          ...baseline !== null ? { sawInfobar } : {}
+        };
+      }
+      prev = last;
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+  }
+  async function viewportFacts(send) {
+    const metrics = await send("Page.getLayoutMetrics");
+    const lv = metrics?.cssLayoutViewport;
+    const dprRes = await send("Runtime.evaluate", {
+      expression: "window.devicePixelRatio",
+      returnByValue: true
+    });
+    return {
+      viewportCss: { w: Math.round(lv?.clientWidth ?? 0), h: Math.round(lv?.clientHeight ?? 0) },
+      scrollCss: { x: Math.round(lv?.pageX ?? 0), y: Math.round(lv?.pageY ?? 0) },
+      dpr: typeof dprRes?.result?.value === "number" ? dprRes.result.value : 1
+    };
+  }
+  async function listClosedInteractive(send, tree, filter = {}) {
+    const candidates = tree.elements.filter((el) => {
+      if (!el.inClosedShadowRoot) return false;
+      if (el.shadowRootType === "user-agent") return false;
+      if (HIDDEN_TAGS.has(el.nodeName)) return false;
+      if (INTERACTIVE_TAGS.has(el.nodeName)) return true;
+      if ("contenteditable" in el.attributes) return true;
+      if ("tabindex" in el.attributes) return true;
+      if ("role" in el.attributes) {
+        return INTERACTIVE_ROLES.has((el.attributes.role || "").trim().toLowerCase());
+      }
+      return false;
+    });
+    if (candidates.length === 0) return [];
+    const facts = await describeElements(send, candidates);
+    const textFilter = filter.text ?? "";
+    const filters = filter.filters ?? [];
+    const out = [];
+    for (const f of facts) {
+      if (filter.visibleOnly && !f.visible) continue;
+      if (filter.hiddenOnly && f.visible) continue;
+      if (textFilter && !f.text.includes(textFilter)) continue;
+      if (filters.length > 0) {
+        const hit = filters.some((name) => {
+          switch (name) {
+            case "button":
+              return f.tag === "button" || f.role === "button";
+            case "link":
+              return f.tag === "a" || f.role === "link";
+            case "input":
+              return f.tag === "input";
+            case "select":
+              return f.tag === "select";
+            case "textarea":
+              return f.tag === "textarea";
+            case "label":
+              return f.tag === "label";
+            // 与 content script 的 `html.isContentEditable || …` 对齐：editable 这个事实
+            // 必须从活 DOM 取（继承的 contenteditable / designMode 在属性上看不出来）
+            case "editable":
+              return !!f.editable || f.tag === "textarea" || f.tag === "input" && !!f.type && /text|search|email|url|tel|number|password|date|time|datetime-local|month|week/.test(f.type);
+            case "upload":
+              return f.tag === "input" && f.type === "file" || /点击上传|上传|拖入|拖拽|拖到|upload|drop/i.test(f.text);
+            default:
+              return true;
+          }
+        });
+        if (!hit) continue;
+      }
+      const r = f.rectCss;
+      const item = {
+        tag: f.tag,
+        visible: f.visible,
+        // 坐标 = 顶层视口 CSS px（与 real_click / get_rect.centerCss 同口径）
+        x: r ? Math.round(r.x) : 0,
+        y: r ? Math.round(r.y) : 0,
+        w: r ? Math.round(r.w) : 0,
+        h: r ? Math.round(r.h) : 0,
+        backendNodeId: f.backendNodeId,
+        inClosedShadowRoot: true
+      };
+      if (f.role) item.role = f.role;
+      if (f.ariaLabel) item.ariaLabel = f.ariaLabel;
+      if (f.title) item.title = f.title;
+      if (f.type) item.type = f.type;
+      if (f.accept) item.accept = f.accept;
+      if (f.multiple) item.multiple = true;
+      if (f.name) item.name = f.name;
+      if (f.placeholder) item.placeholder = f.placeholder;
+      if (f.text) item.text = f.text;
+      out.push(item);
+    }
+    return out;
+  }
+
   // src/background/service-worker.ts
   var wsClient = new WsClient({
     maxRetries: 3,
@@ -209,6 +846,278 @@
         reject(err);
       }
     });
+  }
+  var ERR_NOT_FOUND = "not-found";
+  var ERR_UNREACHABLE = "unreachable-subtree";
+  var ERR_CDP = "cdp-unavailable";
+  function cdpErrorCode(err) {
+    if (err instanceof CdpUnavailableError) return ERR_CDP;
+    if (err instanceof StaleNodeError) return ERR_UNREACHABLE;
+    return void 0;
+  }
+  async function inPageViewportHeight(tabId) {
+    const { response } = await sendToFrame(
+      tabId,
+      0,
+      { type: "execute_command", payload: { command: "get_viewport", params: {} } },
+      1200
+    );
+    const d = response?.data;
+    const h = d?.viewportCss?.h;
+    return typeof h === "number" && h > 0 ? h : null;
+  }
+  var INFOBAR_SUPPRESSED_KEY = "debuggerInfobarSuppressed";
+  async function settleAttachedViewport(send, tabId) {
+    const flags = await chrome.storage.session.get(INFOBAR_SUPPRESSED_KEY).catch(() => ({}));
+    const suppressed = flags[INFOBAR_SUPPRESSED_KEY] === true;
+    const baseline = suppressed ? null : await inPageViewportHeight(tabId);
+    const wait = await waitViewportStable(send, { inPageViewportH: baseline });
+    if (baseline !== null && wait.sawInfobar === false) {
+      chrome.storage.session.set({ [INFOBAR_SUPPRESSED_KEY]: true }).catch(() => {
+      });
+    }
+    return wait;
+  }
+  async function withPiercedTree(tabId, fn) {
+    await attachDebugger(tabId);
+    try {
+      const send = (method, params, timeoutMs) => cdpSend(tabId, method, params, timeoutMs);
+      await enableDomains(send);
+      const wait = await settleAttachedViewport(send, tabId);
+      const tree = await readPiercedTree(send);
+      tree.viewportSettled = wait.settled;
+      tree.sawInfobar = wait.sawInfobar;
+      return await fn(send, tree);
+    } finally {
+      await detachDebugger(tabId);
+    }
+  }
+  async function rectPayloadFromFacts(send, tree, facts) {
+    const rectCss = facts.rectCss;
+    const centerCss = facts.centerCss;
+    const hit = centerCss ? await hitTestAt(send, tree, centerCss.x, centerCss.y) : null;
+    const covered = !!hit && hit.backendNodeId !== facts.backendNodeId && !await isSelfOrDescendant(send, facts.backendNodeId, hit.backendNodeId);
+    return {
+      x: centerCss ? Math.round(centerCss.x) : 0,
+      y: centerCss ? Math.round(centerCss.y) : 0,
+      width: rectCss ? Math.round(rectCss.w) : 0,
+      height: rectCss ? Math.round(rectCss.h) : 0,
+      rectCss,
+      centerCss,
+      tag: facts.tag,
+      class: facts.class ?? "",
+      text: facts.text,
+      visible: facts.visible,
+      covered,
+      hitTest: hit ? toHitDescription(hit) : null,
+      backendNodeId: facts.backendNodeId,
+      inClosedShadowRoot: facts.inClosedShadowRoot,
+      source: "cdp-pierced",
+      // 这份几何是在**附加了 debugger 的视口**里量的（信息条占掉顶部一条，见 waitViewportStable）。
+      // 带上它，调用方才能发现「这里的视口比 get_viewport 报的矮」并据此配对：
+      // CDP 通道的坐标配 real_click / click {backendNodeId} / screenshot 换算；
+      // 页面内通道（get_viewport / list_elements 普通条目 / click {x,y}）是另一个空间。
+      // 同一页面里两者对底部/垂直居中/vh 类元素会差一个信息条的高度（实测 56px）。
+      viewportCss: tree.viewport,
+      // 信息条**没**出现时（本会话它不会来了，多半被用户关掉），这份几何恰好与页面内通道同空间——
+      // 如实说出来，调用方才知道该拿它配谁（此时配 click {x,y} / get_viewport 是对的）。
+      ...tree.sawInfobar === false ? { viewportNote: "measured with NO debugger infobar (same space as get_viewport / click {x,y}) \u2014 the infobar did not appear in this browser session, so bottom-anchored coordinates here match the in-page channels" } : {},
+      ...facts.frameUrl ? { frameUrl: facts.frameUrl } : {}
+    };
+  }
+  async function locateInTree(send, tree, params) {
+    const backendNodeId = params.backendNodeId;
+    if (typeof backendNodeId === "number") {
+      const known = tree.byBackendId.get(backendNodeId);
+      return { hits: known ? [known] : [syntheticTarget(backendNodeId)], allMatches: void 0 };
+    }
+    const selector = typeof params.selector === "string" ? params.selector : "";
+    if (selector) {
+      const kind = selectorKind(selector);
+      if (kind !== "css") {
+        return { hits: [], note: `"${kind}"-style selectors (xpath: / >>> / #shadow-root) cannot address nodes inside a closed shadow root \u2014 closed shadow roots have no stable path. Use a plain CSS selector or a text query instead.` };
+      }
+      const { hits: hits2, error } = await querySelectorInTree(send, tree, selector);
+      if (error) return { hits: [], note: error };
+      return { hits: hits2, allMatches: void 0 };
+    }
+    const text = typeof params.text === "string" ? params.text : "";
+    if (!text) return { hits: [] };
+    const hits = findByTextInTree(tree, { text, exact: params.exact === true });
+    return { hits };
+  }
+  var MATCH_LIMIT = 20;
+  var MATCH_LIMIT_ALL = 100;
+  var DESCRIBE_LIMIT = 60;
+  var DESCRIBE_LIMIT_ALL = 100;
+  function identityOf(facts, backendNodeId) {
+    return {
+      backendNodeId,
+      inClosedShadowRoot: facts?.inClosedShadowRoot === true
+    };
+  }
+  async function byBackendNodeId(tabId, command, params) {
+    const backendNodeId = params.backendNodeId;
+    try {
+      return await withPiercedTree(tabId, async (send, tree) => {
+        const facts = await describeBackendNode(send, tree, backendNodeId);
+        if (command === "get_text") {
+          const text = await textOf(send, backendNodeId);
+          return { ok: true, data: { text, ...identityOf(facts, backendNodeId) } };
+        }
+        if (command === "get_prop") {
+          const prop = typeof params.prop === "string" ? params.prop : "";
+          if (!prop) return { ok: false, error: '"prop" is required with "backendNodeId"' };
+          const r = await propertyOf(send, backendNodeId, prop);
+          return r.ok ? { ok: true, data: { prop, value: r.value, ...identityOf(facts, backendNodeId) } } : { ok: false, error: r.error };
+        }
+        if (command === "click") {
+          const pt = await dispatchSyntheticClick(send, backendNodeId);
+          if (!pt) return { ok: false, code: ERR_UNREACHABLE, error: `backendNodeId ${backendNodeId} did not accept a synthetic click` };
+          const box = await boxOf(send, backendNodeId).catch(() => null);
+          const cx = box?.centerCss.x ?? pt.cx;
+          const cy = box?.centerCss.y ?? pt.cy;
+          const hitTest = await hitTestAt(send, tree, cx, cy).catch(() => null);
+          const covered = !!hitTest && !await isSelfOrDescendant(send, backendNodeId, hitTest.backendNodeId);
+          return {
+            ok: true,
+            data: {
+              clickDesc: {
+                x: Math.round(cx),
+                y: Math.round(cy),
+                tag: facts?.tag,
+                ...facts?.class ? { class: facts.class } : {},
+                backendNodeId,
+                inClosedShadowRoot: facts?.inClosedShadowRoot === true,
+                ...covered && hitTest ? { coveredBy: toHitDescription(hitTest) } : {}
+              }
+            }
+          };
+        }
+        if (!facts) return { ok: false, code: ERR_NOT_FOUND, error: `backendNodeId ${backendNodeId} does not exist in the pierced DOM (page changed \u2014 re-run list_elements for a fresh id)` };
+        if (!facts.visible) {
+          return {
+            ok: false,
+            code: ERR_UNREACHABLE,
+            error: `backendNodeId ${backendNodeId} (${facts.tag}) exists but has no usable geometry (zero-size or hidden) \u2014 reachable in the tree, not usable as a coordinate target`
+          };
+        }
+        return { ok: true, data: await rectPayloadFromFacts(send, tree, facts) };
+      });
+    } catch (err) {
+      const code = cdpErrorCode(err);
+      const detail = err instanceof Error ? err.message : String(err);
+      return { ok: false, code, error: code ? detail : `backendNodeId lookup failed: ${detail}` };
+    }
+  }
+  async function rectViaContentScript(tabId, params, timeoutMs = 5e3) {
+    const frames = await resolveSearchFrames(tabId, params.frame);
+    let responded = false;
+    for (const f of frames) {
+      const { response } = await sendToFrame(tabId, f.frameId, {
+        type: "execute_command",
+        payload: { command: "get_rect", params }
+      }, timeoutMs);
+      if (!response) continue;
+      responded = true;
+      if (response.notFound) continue;
+      return { data: response.data, responded };
+    }
+    return { responded };
+  }
+  async function resolveRectsViaCdp(tabId, queries) {
+    const out = /* @__PURE__ */ new Map();
+    const describeLimit = queries.some((q) => q.params.all === true) ? DESCRIBE_LIMIT_ALL : DESCRIBE_LIMIT;
+    try {
+      await withPiercedTree(tabId, async (send, tree) => {
+        const boundaryNote = uncoveredIframeNote(tree);
+        for (const q of queries) {
+          const located = await locateInTree(send, tree, q.params);
+          if (located.note) {
+            out.set(q.key, { ok: false, code: ERR_UNREACHABLE, error: located.note });
+            continue;
+          }
+          if (located.hits.length === 0) {
+            out.set(q.key, { ok: false, code: ERR_NOT_FOUND, error: `Element not found: ${q.params.text || q.params.selector}` });
+            continue;
+          }
+          const described = located.hits.slice(0, describeLimit);
+          const facts = await describeElements(send, described);
+          const primary = facts.find((f) => f.visible);
+          if (!primary) {
+            out.set(q.key, {
+              ok: false,
+              code: ERR_UNREACHABLE,
+              error: `Element exists in the pierced DOM (${located.hits.length} match(es)) but none of the first ${described.length} has usable geometry (zero-size or hidden) \u2014 reachable in the tree, not usable as a coordinate target`
+            });
+            continue;
+          }
+          const payload = await rectPayloadFromFacts(send, tree, primary);
+          const matchCount = located.hits.length;
+          const allMatches = [];
+          const limit = q.params.all === true ? MATCH_LIMIT_ALL : MATCH_LIMIT;
+          let truncated = located.hits.length > described.length;
+          if (q.params.text && (q.params.all === true || matchCount > 1)) {
+            let priority = 0;
+            for (const f of facts) {
+              if (allMatches.length >= limit) {
+                truncated = true;
+                break;
+              }
+              const r = f.rectCss;
+              allMatches.push({
+                tag: f.tag,
+                class: f.class ?? "",
+                text: f.text,
+                rectCss: r,
+                visible: f.visible,
+                // priority 只在可见候选间计数：0 = 文本定位会选中的那个（与页面内同口径）
+                ...f.visible ? { priority: priority++ } : {},
+                backendNodeId: f.backendNodeId,
+                inClosedShadowRoot: f.inClosedShadowRoot
+              });
+            }
+          }
+          out.set(q.key, {
+            ok: true,
+            data: {
+              ...typeof q.params.selector === "string" ? { selector: q.params.selector } : {},
+              ...payload,
+              matchCount,
+              ...allMatches.length ? { allMatches } : {},
+              ...truncated ? { truncated: true } : {},
+              ...boundaryNote ? { boundary: boundaryNote } : {}
+            }
+          });
+        }
+      });
+    } catch (err) {
+      const code = cdpErrorCode(err);
+      const detail = err instanceof Error ? err.message : String(err);
+      for (const q of queries) {
+        if (out.has(q.key)) continue;
+        out.set(q.key, {
+          ok: false,
+          code,
+          error: code ? detail : `CDP fallback failed: ${detail}`
+        });
+      }
+    }
+    return out;
+  }
+  function syntheticTarget(backendNodeId) {
+    return {
+      nodeId: 0,
+      backendNodeId,
+      tag: "",
+      nodeName: "",
+      attributes: {},
+      inClosedShadowRoot: false,
+      text: "",
+      visibleText: "",
+      inBody: true,
+      children: []
+    };
   }
   async function moveMouseInSteps(tabId, tx, ty) {
     const dx = tx - lastMouseX;
@@ -465,6 +1374,7 @@
           await chrome.tabs.update(tabId, { active: true });
         } catch {
         }
+        await settleAttachedViewport((method, p, timeoutMs) => cdpSend(tabId, method, p, timeoutMs), tabId);
         const clickPoint = { x, y, button: "left", clickCount: 1 };
         await moveMouseInSteps(tabId, x, y);
         await new Promise((r) => setTimeout(r, 120));
@@ -662,12 +1572,16 @@
     }
     if (command === "list_elements") {
       const max = typeof params.max === "number" && Number.isFinite(params.max) ? Math.min(Math.max(1, Math.floor(params.max)), 200) : 50;
+      const closed = params.closed === true;
+      const csParams = { ...params };
+      delete csParams.closed;
+      const csMsg = { type: "execute_command", id: cmd.id, payload: { command, params: csParams } };
       const doCollect = async () => {
         const frames = await resolveSearchFrames(tabId, params.frame);
         const elements2 = [];
         let responded2 = false;
         for (const f of frames) {
-          const { response: response2 } = await sendToFrame(tabId, f.frameId, msg, 5e3);
+          const { response: response2 } = await sendToFrame(tabId, f.frameId, csMsg, 5e3);
           if (response2) responded2 = true;
           const els = response2?.data?.elements;
           if (!Array.isArray(els)) continue;
@@ -685,16 +1599,39 @@
           injectError2 = e instanceof Error ? e.message : String(e);
         }
       }
-      const truncated = elements.length > max;
+      let closedItems = [];
+      let closedError;
+      if (closed) {
+        const filters = typeof params.filter === "string" ? params.filter.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
+        try {
+          closedItems = await withPiercedTree(tabId, (send, tree) => listClosedInteractive(send, tree, {
+            filters,
+            text: typeof params.text === "string" ? params.text : "",
+            visibleOnly: params.visible === true,
+            hiddenOnly: params.visible === false
+          }));
+        } catch (e) {
+          closedError = cdpErrorCode(e) ? `${cdpErrorCode(e)}: ${e instanceof Error ? e.message : String(e)}` : e instanceof Error ? e.message : String(e);
+        }
+      }
+      const all = closed ? [...closedItems, ...elements] : elements;
+      const truncated = all.length > max;
+      const kept = truncated ? all.slice(0, max) : all;
+      const droppedClosed = closedItems.filter((it) => !kept.includes(it)).length;
+      const warnings = [];
+      if (injectError2 && !responded) warnings.push(`content script injection failed: ${injectError2}`);
+      if (droppedClosed > 0) warnings.push(`${droppedClosed} closed-shadow element(s) were dropped by "max": ${max} \u2014 raise "max" to see them`);
       sendResult({
         commandId: cmd.id,
         success: true,
         data: {
-          count: truncated ? max : elements.length,
+          count: kept.length,
           truncated,
-          elements: truncated ? elements.slice(0, max) : elements,
-          // 仅注入失败且仍无响应时出现：提示是 CS 不可达而非页面确实无元素
-          ...injectError2 && !responded ? { warning: `content script injection failed: ${injectError2}` } : {}
+          total: all.length,
+          elements: kept,
+          ...warnings.length ? { warning: warnings.join("; ") } : {},
+          ...closed ? { closedCount: closedItems.length } : {},
+          ...closedError ? { closedError } : {}
         }
       });
       onDone?.();
@@ -714,7 +1651,25 @@
         onDone?.();
         return;
       }
-      sendResult({ commandId: cmd.id, success: response2?.success ?? false, data: response2?.data, error: response2?.error });
+      sendResult({ commandId: cmd.id, success: response2?.success ?? false, data: response2?.data, error: response2?.error, code: response2?.code });
+      onDone?.();
+      return;
+    }
+    if (command === "get_viewport") {
+      const frames = await resolveSearchFrames(tabId, params.frame);
+      const f = frames[0];
+      if (!f) {
+        sendResult({ commandId: cmd.id, success: false, error: "No matching frame for get_viewport" });
+        onDone?.();
+        return;
+      }
+      const { response: response2 } = await sendToFrame(tabId, f.frameId, msg, 5e3);
+      if (!response2) {
+        sendResult({ commandId: cmd.id, success: false, error: "get_viewport timed out: no response from the target frame" });
+        onDone?.();
+        return;
+      }
+      sendResult({ commandId: cmd.id, success: response2.success, data: response2.data, error: response2.error, code: response2.code });
       onDone?.();
       return;
     }
@@ -759,7 +1714,47 @@
         return;
       }
     }
-    await doSearch();
+    const backendNodeId = typeof params.backendNodeId === "number" ? params.backendNodeId : void 0;
+    if (backendNodeId !== void 0 && !isCoordinateClick) {
+      const outcome = await byBackendNodeId(tabId, command, params);
+      response = outcome.ok ? { success: true, data: outcome.data } : { success: false, error: outcome.error, code: outcome.code };
+    }
+    if (command === "get_rect" && params.selectors !== void 0 && backendNodeId === void 0) {
+      const selectors = params.selectors;
+      if (!Array.isArray(selectors) || selectors.some((s) => typeof s !== "string")) {
+        sendResult({ commandId: cmd.id, success: false, error: '"selectors" must be an array of strings' });
+        onDone?.();
+        return;
+      }
+      if (params.selector !== void 0 || params.text !== void 0) {
+        sendResult({ commandId: cmd.id, success: false, error: '"selectors" cannot be combined with "selector" or "text" \u2014 pass one or the other' });
+        onDone?.();
+        return;
+      }
+      const items = [];
+      const needCdp = [];
+      for (const [i, sel] of selectors.entries()) {
+        const oneParams = { ...params, selector: sel };
+        delete oneParams.selectors;
+        const viaCs = await rectViaContentScript(tabId, oneParams);
+        if (viaCs.data) items[i] = { selector: sel, ...viaCs.data };
+        else needCdp.push({ key: String(i), params: oneParams });
+      }
+      if (needCdp.length) {
+        const resolved = await resolveRectsViaCdp(tabId, needCdp);
+        for (const q of needCdp) {
+          const outcome = resolved.get(q.key);
+          const sel = q.params.selector;
+          items[Number(q.key)] = outcome?.ok ? { selector: sel, ...outcome.data } : { selector: sel, found: false, code: outcome?.code ?? ERR_NOT_FOUND, error: outcome?.error ?? `Element not found: ${sel}` };
+        }
+      }
+      sendResult({ commandId: cmd.id, success: true, data: { count: items.length, items } });
+      onDone?.();
+      return;
+    }
+    if (!response) {
+      await doSearch();
+    }
     if (!response && !lostContact && !hadResponse) {
       try {
         await injectContentScript(tabId);
@@ -767,6 +1762,44 @@
         injectError = e instanceof Error ? e.message : String(e);
       }
       await doSearch();
+    }
+    if (response?.success && command === "get_rect" && params.all === true && typeof params.text === "string") {
+      const alive = await chrome.tabs.get(tabId).then(() => true).catch(() => false);
+      if (alive) {
+        const outcome = (await resolveRectsViaCdp(tabId, [{ key: "0", params }])).get("0");
+        const closed = (outcome?.ok ? outcome.data.allMatches : void 0)?.filter((m) => m.inClosedShadowRoot === true) ?? [];
+        if (closed.length) {
+          const data = response.data;
+          const existing = Array.isArray(data.allMatches) ? data.allMatches : [];
+          let priority = existing.filter((m) => typeof m.priority === "number").length;
+          const merged = [
+            ...existing,
+            ...closed.map((m) => ({ ...m, ...m.visible ? { priority: priority++ } : {}, source: "cdp-pierced" }))
+          ];
+          const inPageCount = typeof data.matchCount === "number" ? data.matchCount : 0;
+          response = {
+            success: true,
+            data: {
+              ...data,
+              allMatches: merged,
+              matchCount: inPageCount + closed.length,
+              // 两半来源不同，说清楚：页面内通道看不见闭包，闭包条目只能用 backendNodeId 下手
+              matchCountNote: `${inPageCount} match(es) from the in-page channel + ${closed.length} from the CDP-pierced channel (closed shadow roots; use backendNodeId to act on those)`
+            }
+          };
+        }
+      }
+    }
+    if (!response && command === "get_rect" && hadResponse) {
+      const alive = await chrome.tabs.get(tabId).then(() => true).catch(() => false);
+      if (alive) {
+        const outcome = (await resolveRectsViaCdp(tabId, [{ key: "0", params }])).get("0");
+        if (outcome?.ok) {
+          response = { success: true, data: outcome.data };
+        } else if (outcome?.code) {
+          response = { success: false, error: outcome.error, code: outcome.code };
+        }
+      }
     }
     if (!response && lostContact) {
       const beforeUrl = tab?.url || "";
@@ -875,20 +1908,23 @@
           ...typeof response?.data === "object" && response?.data !== null ? response.data : {},
           ...frameAttribution
         };
+        if (result.navigated !== true && tab?.url && afterInfo?.url && afterInfo.url !== tab.url) {
+          result.navigated = true;
+        }
         if (needCurrent) result.currentTab = afterInfo;
         if (needIframe) {
           const iframeChanges = beforeFullInfo && afterInfo ? diffIframes(beforeFullInfo.iframes, afterInfo.iframes) : [];
           if (iframeChanges.length > 0) result.iframeChanges = iframeChanges;
         }
         if (needNewTabs && newTabInfos.length > 0) result.newTabs = newTabInfos;
-        sendResult({ commandId: cmd.id, success: response?.success ?? false, data: result, error: response?.error });
+        sendResult({ commandId: cmd.id, success: response?.success ?? false, data: result, error: response?.error, code: response?.code });
         onDone?.();
         return;
       }
       const dataIsPlainObj = typeof response?.data === "object" && response?.data !== null && !Array.isArray(response.data);
       const skipFrameMerge = command === "get_prop" && dataIsPlainObj && "frame" in response.data;
       const data = dataIsPlainObj ? { ...response.data, ...skipFrameMerge ? {} : frameAttribution } : response?.data;
-      sendResult({ commandId: cmd.id, success: response?.success ?? false, data, error: response?.error });
+      sendResult({ commandId: cmd.id, success: response?.success ?? false, data, error: response?.error, code: response?.code });
       onDone?.();
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -967,9 +2003,7 @@
             resolve({ missing: { reason } });
             return;
           }
-          resolve({
-            response: r
-          });
+          resolve({ response: r });
         });
       } catch {
         clearTimeout(timer);
@@ -1436,6 +2470,17 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
       wsClient.connect(config.serverUrl, config.nodeName);
     }
   }
+  function pngSize(base64) {
+    try {
+      const head = atob(base64.slice(0, 64));
+      if (head.slice(0, 8) !== "\x89PNG\r\n\n") return null;
+      if (head.slice(12, 16) !== "IHDR") return null;
+      const be32 = (o) => (head.charCodeAt(o) << 24 | head.charCodeAt(o + 1) << 16 | head.charCodeAt(o + 2) << 8 | head.charCodeAt(o + 3)) >>> 0;
+      return { w: be32(16), h: be32(20) };
+    } catch {
+      return null;
+    }
+  }
   async function handleRealClick(cmd) {
     const params = cmd.payload.params || {};
     let tabId = params.tabId;
@@ -1461,25 +2506,64 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
       if (cmd.payload.command === "screenshot") {
         await chrome.debugger.attach({ tabId }, "1.3");
         try {
+          const send2 = (method, p, timeoutMs) => cdpSend(tabId, method, p, timeoutMs);
+          await settleAttachedViewport(send2, tabId);
           const result = await cdpSend(tabId, "Page.captureScreenshot", {
             format: "png"
           });
-          sendResult({ success: true, data: result?.data ?? null });
+          const base64 = result?.data ?? "";
+          const measured = await viewportFacts(send2);
+          const imagePx = pngSize(base64);
+          const warnings = [];
+          if (!imagePx) warnings.push("could not read the PNG header \u2014 imagePx unknown, do NOT convert image coordinates to CSS");
+          const dpr = measured.dpr;
+          const viewportCss = imagePx ? { w: imagePx.w / dpr, h: imagePx.h / dpr } : measured.viewportCss;
+          if (imagePx) {
+            if (Math.abs(viewportCss.w - measured.viewportCss.w) > 1) {
+              warnings.push(`the captured image is ${viewportCss.w} CSS px wide but the viewport measured ${measured.viewportCss.w} \u2014 the page layout changed during capture, so the 1:1 image\u2194viewport mapping is NOT verified for this shot, do NOT use image\u2192CSS conversion here`);
+            }
+            if (Math.abs(viewportCss.h - measured.viewportCss.h) > 1) {
+              warnings.push(`the captured image is ${viewportCss.h} CSS px tall but the viewport measured ${measured.viewportCss.h} \u2014 the page layout changed during capture (the debugger infobar animates), re-capture if exact height matters`);
+            }
+          }
+          sendResult({
+            success: true,
+            data: {
+              data: base64,
+              // CLI 拆包写盘用，不打印（几 MB 的 base64 不该进终端）
+              ...imagePx ? { imagePx } : {},
+              viewportCss,
+              dpr,
+              // imagePx.w / dpr === viewportCss.w 由构造恒成立（viewportCss 就是从 imagePx 反推的）
+              scale: dpr,
+              chromeInsetCss: { top: 0, left: 0 },
+              scrollCss: measured.scrollCss,
+              // 这一条是本次拍照所依据的视口（附加态）。它与 get_viewport 报的（无 debugger 态）
+              // 可能差一个信息条的高度：底部锚定 / 垂直居中 / vh 类元素在两者里位置不同，
+              // 换算出来的坐标要配 real_click（同样附加 debugger）用，不要配页面内 click {x,y}
+              viewportSource: "measured while the debugger was attached (what this image covers); get_viewport reports the viewport without a debugger attached \u2014 the two differ by the debugger infobar height when they differ at all",
+              mapping: "css = image / dpr \u2014 image (0,0) is the viewport's top-left corner (the screenshot contains no browser UI: no infobar, no tabs)",
+              ...warnings.length ? { warning: warnings.join("; ") } : {}
+            }
+          });
         } finally {
           await chrome.debugger.detach({ tabId }).catch(() => {
           });
         }
         return;
       }
-      if (params.x == null && params.y == null && !selector && !params.text) {
-        sendResult({ success: false, error: 'real_click needs "selector", "text", or {x, y}' });
+      const backendNodeId = typeof params.backendNodeId === "number" ? params.backendNodeId : void 0;
+      if (params.x == null && params.y == null && !selector && !params.text && backendNodeId === void 0) {
+        sendResult({ success: false, error: 'real_click needs "selector", "text", {x, y}, or {backendNodeId}' });
         return;
       }
       let x = params.x;
       let y = params.y;
       let cdpFrameId;
       let hitFrame;
-      if (x == null || y == null) {
+      let coordsFromInPage = false;
+      if (backendNodeId !== void 0) {
+      } else if (x == null || y == null) {
         const frames = await resolveSearchFrames(tabId, params.frame);
         for (const f of frames) {
           const r = await sendToFrame(tabId, f.frameId, {
@@ -1495,6 +2579,7 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           }
           x = d?.x;
           y = d?.y;
+          coordsFromInPage = true;
           hitFrame = f;
           break;
         }
@@ -1504,8 +2589,54 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
         return;
       }
       await chrome.debugger.attach({ tabId }, "1.3");
+      const send = (method, p, timeoutMs) => cdpSend(tabId, method, p, timeoutMs);
+      let pierced;
+      let piercedError;
       try {
-        if (cdpFrameId != null) {
+        await enableDomains(send);
+        await settleAttachedViewport(send, tabId);
+        pierced = await readPiercedTree(send);
+      } catch (e) {
+        piercedError = e instanceof Error ? e.message : String(e);
+      }
+      if (coordsFromInPage && hitFrame) {
+        const r = await sendToFrame(tabId, hitFrame.frameId, {
+          type: "execute_command",
+          payload: { command: "get_rect", params: { selector, text: params.text, scroll: true } }
+        }, 8e3);
+        const d = r.response?.data;
+        if (typeof d?.x === "number" && typeof d?.y === "number") {
+          x = d.x;
+          y = d.y;
+        }
+      }
+      let hitDesc;
+      let hitUnavailable;
+      let urlBeforeClick = "";
+      try {
+        if (backendNodeId !== void 0) {
+          if (!pierced) {
+            sendResult({ success: false, code: ERR_CDP, error: `Cannot resolve backendNodeId ${backendNodeId}: the pierced DOM is unavailable (${piercedError || "unknown"})` });
+            return;
+          }
+          await scrollIntoView(send, backendNodeId);
+          const box = await boxOf(send, backendNodeId);
+          if (!box) {
+            sendResult({
+              success: false,
+              code: ERR_UNREACHABLE,
+              error: `backendNodeId ${backendNodeId} exists in the pierced DOM but has no usable geometry (zero-size or hidden) \u2014 reachable in the tree, not usable as a click target`
+            });
+            return;
+          }
+          x = box.centerCss.x;
+          y = box.centerCss.y;
+          const facts = await describeBackendNode(send, pierced, backendNodeId);
+          if (facts?.frameUrl) {
+            const frames = await resolveSearchFrames(tabId, void 0);
+            hitFrame = frames.find((f) => f.url === facts.frameUrl);
+          }
+        } else if (cdpFrameId != null) {
           const point = await getElementCenterViaCdp(tabId, cdpFrameId, params);
           if (!point) {
             sendResult({ success: false, error: `Could not locate element in iframe via CDP: ${selector}` });
@@ -1523,6 +2654,7 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
         } catch {
         }
         const clickPoint = { x, y, button: "left", clickCount: 1 };
+        urlBeforeClick = (await chrome.tabs.get(tabId).catch(() => null))?.url || "";
         if (approach && approach.length) {
           for (const [ax, ay] of approach) {
             await moveMouseInSteps(tabId, ax, ay);
@@ -1531,6 +2663,20 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
         }
         await moveMouseInSteps(tabId, x, y);
         await new Promise((r) => setTimeout(r, approach && approach.length ? 400 : 120));
+        if (pierced) {
+          try {
+            const hit = await hitTestAt(send, pierced, x, y);
+            if (hit) {
+              hitDesc = toHitDescription(hit);
+            } else {
+              hitUnavailable = "nothing at that point (the coordinate is outside the page, or over a native control CDP does not report)";
+            }
+          } catch (e) {
+            hitUnavailable = e instanceof Error ? e.message : String(e);
+          }
+        } else {
+          hitUnavailable = `pierced DOM unavailable (${piercedError || "unknown"})`;
+        }
         await cdpSend(tabId, "Input.dispatchMouseEvent", {
           type: "mousePressed",
           ...clickPoint
@@ -1544,8 +2690,7 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
         });
       }
       const settleFrameId = hitFrame ? hitFrame.frameId : 0;
-      const tabBefore = await chrome.tabs.get(tabId).catch(() => null);
-      const beforeUrl = tabBefore?.url || "";
+      const beforeUrl = urlBeforeClick;
       const { response: settleResp, missing } = await sendToFrame(tabId, settleFrameId, {
         type: "execute_command",
         payload: { command: "wait_for_settle", params: { timeout: 3e3, wait_for: params.waitFor } }
@@ -1568,6 +2713,8 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
               y,
               trusted: true,
               settleLost: true,
+              navigated: true,
+              ...hitDesc ? { hit: hitDesc } : {},
               ...params.waitFor ? { waitFor: { settled: false, skipped: "page navigated after the click \u2014 condition not evaluated" } } : {}
             }
           });
@@ -1577,15 +2724,23 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           sendResult({ success: false, error: "waitFor could not be verified: content script unresponsive after the real click (the click itself was dispatched)" });
           return;
         }
-        sendResult({ success: true, data: { x, y, trusted: true, settleLost: true } });
+        sendResult({ success: true, data: { x, y, trusted: true, settleLost: true, ...hitDesc ? { hit: hitDesc } : {} } });
         return;
       }
+      const urlAfter = (await chrome.tabs.get(tabId).catch(() => null))?.url || "";
+      const navigated = !!beforeUrl && !!urlAfter && urlAfter !== beforeUrl;
       sendResult({
         success: true,
         data: {
           x,
           y,
           trusted: true,
+          navigated,
+          // 命中回执：点到的到底是谁。给错坐标时调用方可以在**造成后果之前**断言并中止
+          ...hitDesc ? { hit: hitDesc } : {},
+          // 回执缺失如实上报（CDP 不可用 / 坐标处无节点），不静默省略成"看起来没这功能"
+          ...hitUnavailable ? { hitUnavailable } : {},
+          ...backendNodeId !== void 0 ? { backendNodeId } : {},
           ...settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {} } : {}
         }
       });
@@ -1644,6 +2799,7 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
       let y = params.y;
       let cdpFrameId;
       let hitFrame;
+      let coordsFromInPage = false;
       if (x == null || y == null) {
         if (!selector && !params.text) {
           sendResult({ success: false, error: 'upload_dragdrop (trusted mode) needs "selector", "text", or {x, y}' });
@@ -1664,6 +2820,7 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           }
           x = d?.x;
           y = d?.y;
+          coordsFromInPage = true;
           hitFrame = f;
           break;
         }
@@ -1674,6 +2831,18 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
       }
       await chrome.debugger.attach({ tabId }, "1.3");
       try {
+        await settleAttachedViewport((method, p, timeoutMs) => cdpSend(tabId, method, p, timeoutMs), tabId);
+        if (coordsFromInPage && hitFrame) {
+          const r = await sendToFrame(tabId, hitFrame.frameId, {
+            type: "execute_command",
+            payload: { command: "get_rect", params: { selector, text: params.text, scroll: true } }
+          }, 8e3);
+          const d = r.response?.data;
+          if (typeof d?.x === "number" && typeof d?.y === "number") {
+            x = d.x;
+            y = d.y;
+          }
+        }
         if (cdpFrameId != null) {
           const point = await getElementCenterViaCdp(tabId, cdpFrameId, params);
           if (!point) {

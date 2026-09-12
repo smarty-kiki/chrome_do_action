@@ -38,11 +38,24 @@ Page commands (tab required):
   real_click <tab> <params>   Genuine real click (works on sites that ignore
                               synthetic events — use it when click reports
                               success but nothing actually happens).
-                              Params: {selector} or {x,y}; optional {approach} =
-                              [[x,y],...] path to move through progressively,
-                              triggering hover chains before clicking.
+                              Params: {selector} / {x,y} / {backendNodeId};
+                              optional {approach} = [[x,y],...] path to move
+                              through progressively, triggering hover chains
+                              before clicking.
                               Works in iframes, including cross-origin.
-                              Same settle + waitFor semantics as click
+                              Same settle + waitFor semantics as click.
+                              Returns a RECEIPT of what it actually hit:
+                              hit {tag, class, text, backendNodeId,
+                              inClosedShadowRoot} — sampled at the click point
+                              after hover settles and BEFORE the button goes
+                              down, so a wrong coordinate is reported instead
+                              of silently clicking something else. Because the
+                              hit test runs over CDP, it stays truthful inside
+                              shadow roots (in-page elementFromPoint would
+                              report the host). hitUnavailable explains why hit
+                              is missing if it is. Also returns {x, y, navigated,
+                              settledMs}; hit + x/y together let a script assert
+                              "I am about to click 暂存离开" and abort otherwise.
   type <tab> <params>         Insert text into input/textarea/contenteditable
                               ({selector,text[,mode][,waitFor]}); mode:
                               replace(default)/append/insert;
@@ -125,7 +138,7 @@ Page commands (tab required):
                               cross-origin frames
   list_elements <tab> [params]
                               List interactive elements with generated selectors
-                              ({filter,text,max,visible}[,frame]); filter:
+                              ({filter,text,max,visible,closed}[,frame]); filter:
                               button|link|input|select|textarea|label|editable|upload
                               (comma-separated); text: substring match on element
                               text; max: output cap 1-200 (default 50, truncation
@@ -134,6 +147,41 @@ Page commands (tab required):
                               its frame url when not in the top frame); {frame} narrows
                               to top/one frame. Pierces open shadow DOM. Use this when
                               you cannot find an element - get a map first.
+                              {closed:true} ALSO lists interactive elements inside
+                              CLOSED shadow roots (invisible to every in-page channel)
+                              — these come back with backendNodeId + inClosedShadowRoot
+                              and NO selector (a closed root has no stable path), and
+                              are listed FIRST so a small max cannot silently drop
+                              them; returns closedCount; if the closed pass could not
+                              run, closedError says so (never a silent 0). Off by
+                              default: without it the output is unchanged. If
+                              truncation dropped closed items, a warning says how many.
+  get_rect <tab> [params]     Authoritative element geometry, in the SAME coordinate
+                              space as real_click {x,y} (top-level viewport CSS px) —
+                              reading centerCss here and feeding it to real_click
+                              hits that same element. {selector|text|exact|all|
+                              waitStableMs|scroll}[,frame]; or {selectors:[".a",".b"]}
+                              for a batch (one round trip, per-item code, one debugger
+                              attach for all fallbacks); or {backendNodeId} for elements
+                              inside a closed shadow root. Returns x/y/width/height
+                              (unchanged) plus rectCss, centerCss, tag, class, text,
+                              visible, covered, hitTest (what the center point actually
+                              hits — CDP-based, so it is truthful inside shadow roots),
+                              matchCount, allMatches[] (ambiguous TEXT matches; each with
+                              rectCss/visible/priority, priority 0 = the one plain
+                              {text} would click), waitStable {waited,stable},
+                              backendNodeId, inClosedShadowRoot, source.
+                              Closed shadow roots are pierced automatically when the
+                              in-page channels find nothing (no opt-in needed).
+                              Errors are distinguishable by code: not-found (really
+                              absent) / unreachable-subtree (exists, but has no usable
+                              geometry) / cdp-unavailable (another debugger client is
+                              attached). Being covered is NOT an error: see covered.
+  get_viewport <tab>          Viewport truth for screenshot math: {viewportCss:{w,h},
+                              dpr, scrollCss:{x,y}, screenCss:{w,h}, devicePixelRatio,
+                              isTop, url}. dpr agrees with screenshot's (imagePx.w /
+                              viewportCss.w). Reads the frame you route to (default:
+                              top frame) and reports isTop honestly.
   get_js_errors <tab>         Get accumulated JS errors (aggregated across frames)
   clear_js_errors <tab>       Clear accumulated JS errors
 
@@ -155,8 +203,19 @@ Troubleshooting only (enabled per session):
                               top frame). Turn the option back off after
                               troubleshooting.
 
-  screenshot <tab> <params>   Capture a page screenshot
-                              ({path: "/tmp/shot.png"} saves PNG locally)
+  screenshot <tab> <params>   Capture a page screenshot ({path} saves the PNG there).
+                              CLI prints JSON, not just the path:
+                              {path, bytes, imagePx:{w,h}, viewportCss:{w,h}, dpr,
+                              scale, chromeInsetCss:{top,left}, scrollCss:{x,y},
+                              mapping}. imagePx is the PNG's real pixel size and
+                              mapping tells you how to convert image pixels to
+                              CSS px (divide by dpr) — the same space real_click
+                              takes. imagePx.w / dpr === viewportCss.w always
+                              holds, and chromeInsetCss is {0,0}: the capture
+                              contains the page viewport only, no browser UI.
+                              If those invariants ever fail at runtime, a
+                              warning field says so instead of a wrong mapping.
+                              Without {path} it writes ./screenshot.png.
   scroll <tab> <params>       Scroll window/iframe ({y} or {x,y}; {frame} picks iframe),
                               or to an element / inside a scrollable container
                               ({selector}[,y][,block]) — pierces shadow DOM
@@ -167,6 +226,16 @@ frame param (optional, for element commands that search iframes):
   {frame: 0}                  first top-level iframe (0-based index)
   {frame: {url: "substring"}} first frame whose url contains the substring
                               (most reliable for cross-origin iframes)
+
+Coordinates — ONE space, promised in four places:
+  real_click {x,y}  =  get_rect.centerCss  =  list_elements coordinates  =
+  screenshot math (imagePx / dpr) — all top-level viewport CSS px, the unit
+  getBoundingClientRect() uses in the top frame. Read a center here, feed it
+  there, hit that element; an offset that comes from anywhere else (a raw
+  screenshot pixel, a page-absolute position) must be divided by dpr and/or
+  have the scroll subtracted first. Elements inside iframes are reported in
+  the SAME top-level space (frame offsets already added), so a coordinate
+  never needs adjusting by hand.
 
 Settle — impact-aware returns (click/type/keyboard/trigger/upload_file/
 upload_dragdrop/paste_rich/set_cursor/scroll/real_click):
@@ -205,6 +274,14 @@ Examples:
   cda send abc get_prop current '{"selector":"#title","prop":"innerHTML"}'
   cda send abc list_elements current '{"filter":"upload","visible":true}'
   cda send abc list_elements current '{"text":"发布","max":10}'
+  cda send abc list_elements current '{"closed":true}'          # also list buttons inside closed shadow roots
+  cda send abc get_rect current '{"text":"暂存离开"}'
+  cda send abc get_rect current '{"selectors":[".a",".b",".c"]}'  # batch, one round trip
+  cda send abc get_rect current '{"selector":".x"}' --field "centerCss"   # -> {centerCss:{x,y}} feed straight to real_click
+  cda send abc get_rect current '{"backendNodeId":1234}'        # element found via list_elements {closed:true}
+  cda send abc get_viewport current
+  cda send abc real_click current '{"selector":"#submit"}' --field "hit.text"   # confirm what you are about to click
+  cda send abc screenshot current '{"path":"/tmp/shot.png"}'
   cda send abc exec current '{"code":"document.title"}'
   cda send abc exec current '{"code":"window.__INITIAL_STATE__.user"}'  # needs the plugin's allow-exec option enabled (troubleshooting only)`;
 
@@ -277,7 +354,7 @@ function buildMessage(action: string, args: string[]): Record<string, unknown> {
       console.error("Usage: cda --server <url> send <nodeId> <command> [tabId] [params]");
       console.error("");
       console.error("Browser commands (no tab): open <url> | list_tabs | close_tab <id> | refresh <id>");
-      console.error("Page commands (tab required): click | real_click | type | keyboard | trigger | upload_file | upload_dragdrop | paste_rich | set_cursor | get_cursor | show | hide | get_text | get_prop | get_page_info | list_elements | get_js_errors | clear_js_errors | screenshot | scroll");
+      console.error("Page commands (tab required): click | real_click | type | keyboard | trigger | upload_file | upload_dragdrop | paste_rich | set_cursor | get_cursor | show | hide | get_text | get_prop | get_rect | get_viewport | get_page_info | list_elements | get_js_errors | clear_js_errors | screenshot | scroll");
       console.error("Troubleshooting only (needs plugin option enabled): exec");
       console.error("");
       console.error("Example: cda send abc123 get_page_info current");
@@ -399,7 +476,12 @@ const cmdParams = ((msg as { payload?: { params?: Record<string, unknown> } }).p
 if (fields.length > 0 && msg.type === "cli" && (msg.payload as { action?: string } | undefined)?.action === "send") {
   const sendPayload = msg.payload as { params?: Record<string, unknown> };
   if (!sendPayload.params) sendPayload.params = {};
-  sendPayload.params._field = fields;
+  // screenshot 例外：base64 是 CLI 写盘用的原料，裁剪在扩展侧发生 → 必须强制带上它，
+  // 否则 `screenshot --field "imagePx,..."` 会把 data 一起裁掉，文件静默不落盘
+  // （实测踩过：命令成功返回、终端打印了元数据、磁盘上什么都没有）。
+  // 打印前 CLI 会把 data 剔掉，几 MB 的 base64 依旧不会进终端
+  const wanted = cmdName === "screenshot" && !fields.includes("data") ? ["data", ...fields] : fields;
+  sendPayload.params._field = wanted;
 }
 
 const ws = new WebSocket(server);
@@ -420,7 +502,9 @@ ws.on("open", () => {
 });
 
 ws.on("message", (raw: Buffer) => {
-  let res: { type: string; id?: string; payload?: { success: boolean; data?: unknown; error?: string; message?: string } };
+  // code：机器可读错误码（not-found / unreachable-subtree / cdp-unavailable …），
+  // 让脚本能区分「不存在」「存在但不可达」——不再从人类可读文案里猜
+  let res: { type: string; id?: string; payload?: { success: boolean; data?: unknown; error?: string; code?: string; message?: string } };
   try {
     res = JSON.parse(raw.toString());
   } catch {
@@ -441,13 +525,33 @@ ws.on("message", (raw: Buffer) => {
 
   if (res.payload.success) {
     const data = res.payload.data;
-    // screenshot 命令：data 是 base64 PNG，解码写文件
-    if (cmdName === "screenshot" && typeof data === "string" && data.length > 0) {
+    // screenshot：扩展回 {data:<base64 PNG>, imagePx, viewportCss, dpr, scale,
+    // chromeInsetCss, scrollCss, mapping}（老版本扩展回裸 base64 字符串，两条都支持）。
+    // 写盘后打印 JSON——含 path、**不含 base64**：调用方要的是 mapping（图像素→CSS px），
+    // 几 MB 的 base64 打出来只会淹没它
+    const shotMeta = cmdName === "screenshot" && data !== null && typeof data === "object" ? (data as Record<string, unknown>) : null;
+    const shotB64 =
+      cmdName !== "screenshot" ? ""
+      : typeof data === "string" ? data
+      : typeof shotMeta?.data === "string" ? (shotMeta.data as string)
+      : "";
+    if (shotB64.length > 0) {
       const outPath = (cmdParams.path as string) || "screenshot.png";
       const fs = require("fs") as typeof import("fs");
-      const buf = Buffer.from(data, "base64");
+      const buf = Buffer.from(shotB64, "base64");
       fs.writeFileSync(outPath, buf);
-      console.log(`Screenshot saved: ${outPath} (${buf.length} bytes)`);
+      if (shotMeta) {
+        const meta: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(shotMeta)) if (k !== "data") meta[k] = v;
+        console.log(JSON.stringify({ path: outPath, bytes: buf.length, ...meta }, null, 2));
+      } else {
+        console.log(`Screenshot saved: ${outPath} (${buf.length} bytes)`);
+      }
+    } else if (cmdName === "screenshot") {
+      // 没拿到 base64 = 没有图可写。**绝不静默**：调用方以为存了图、磁盘上却没有，
+      // 是这条命令最坏的失败方式（后面的图像分析会拿着一份旧文件跑）
+      console.error("Error: screenshot returned no image data — nothing was written");
+      process.exit(1);
     } else if (data !== undefined && data !== null) {
       if (Array.isArray(data)) {
         if (data.length === 0) {
@@ -466,7 +570,9 @@ ws.on("message", (raw: Buffer) => {
       }
     }
   } else {
-    console.error(`Error: ${res.payload.error || "unknown"}`);
+    // 错误码放前面，脚本/agent 一眼能看出失败类别（not-found / unreachable-subtree /
+    // cdp-unavailable …）——「元素不存在」和「存在但对所有通道不可寻址」不该长得一样
+    console.error(`Error${res.payload.code ? ` [${res.payload.code}]` : ""}: ${res.payload.error || "unknown"}`);
     process.exit(1);
   }
 

@@ -48,11 +48,13 @@ your command → server → Chrome extension → execute in the page → structu
 | Capability | What it does |
 |---|---|
 | 🖱️ Page actions | Open / refresh / close tabs, click, type, scroll, screenshot — most interactions a browser can do |
-| 🔥 Real clicks (`real_click`) | Sends a complete, genuine mouse event chain, breaking through sites that ignore synthetic events (a synthetic click that looks successful but never fires); supports multi-level hover paths |
+| 🔥 Real clicks (`real_click`) | Sends a complete, genuine mouse event chain, breaking through sites that ignore synthetic events (a synthetic click that looks successful but never fires); supports multi-level hover paths; **returns a `hit` receipt** naming the element it actually clicked, so a wrong coordinate is reported instead of silently clicking something else |
+| 📐 Element geometry (`get_rect`) | Authoritative rect and centre, **in the very same coordinate space as `real_click {x,y}`** (top-level viewport CSS px): feed `centerCss` straight to real_click and you hit that element. Includes occlusion (`covered`/`hitTest`), text-ambiguity detail (`matchCount`/`allMatches`, `priority:0` = the one `click` would pick), `waitStableMs`, and batch `{selectors:[...]}` |
+| 📏 Viewport truth (`get_viewport`) | Viewport size / dpr / scroll in one read — the authority for screenshot math (`imagePx.w / dpr === viewportCss.w`), fresh on every call |
 | 📝 Rich text | `type` writes plain text verbatim (no auto paragraphing); `paste_rich` pastes styled HTML — font size / color / bold / layout live in the markup, handed to the page as-is |
 | 🖼️ File uploads | `upload_file` injects a base64 image into a file input and triggers upload, bypassing the native file dialog |
 | 🎯 Drag-drop uploads (`upload_dragdrop`) | Drags a file into an upload area that has no file input and only accepts drops, dispatching dragenter/dragover/drop |
-| 📸 Page screenshots | Pixel-accurate "what you see" screenshot, saved to a local PNG — spot overlays, floating layers, scroll position |
+| 📸 Page screenshots | Pixel-accurate "what you see" screenshot, saved to a local PNG — **plus conversion metadata** (`imagePx` / `viewportCss` / `dpr` / `chromeInsetCss` / `scrollCss` / `mapping`), so the relation between image pixels and CSS coordinates is measured, not guessed |
 | 🐛 JS error collection | Keeps collecting `error` + `unhandledrejection` from page load; query or clear anytime |
 | ⚡ Selective fields (`--field`) | Every command returning an object supports dot-path projection (`--field "clickDesc.selector,settledMs,currentTab.url"`) — only requested fields are collected and returned; faster commands, leaner output |
 | ⏳ Impact-aware returns | Action commands wait for their impact to land before returning (event-driven via DOM mutations/long tasks, no fixed sleep; `settledMs` reports the wait). For late-arriving effects, pass a `waitFor` predicate (50ms polling, returns the moment the condition holds — reliable even on background tabs) |
@@ -60,6 +62,7 @@ your command → server → Chrome extension → execute in the page → structu
 | 🔍 Read-only property (`get_prop`) | Read an element property's exact raw value (`value` / `checked` / `innerHTML` / …); read-only, never executes — verify a type really landed, check a checkbox state, compare raw content |
 | 🔎 State-aware | Detects page navigations, newly opened tabs, and iframe changes, so a command returns the world *after* the action, not a bare event |
 | 🌘 Shadow DOM support | Every element command transparently pierces open shadow roots (DevTools `#shadow-root` paths / `>>>` / bare-selector fallback); `get_page_info` html includes shadow content by default |
+| 🕳️ Closed shadow roots | A subtree created with `attachShadow({mode:"closed"})` is invisible to every in-page channel — `document.querySelector` can't see it, and neither can arbitrary injected JS. cda reaches it at the protocol level instead: `list_elements {"closed":true}` enumerates (each item carries a `backendNodeId`, no selector), and `get_rect` / `click` / `real_click` / `get_prop` / `get_text` accept `{"backendNodeId":N}` — geometry and hit testing stay truthful there |
 | 🔁 High availability | Auto-reconnect, per-tab serial command queue, automatic content-script re-injection |
 | 🌐 Multi-browser | One server connects to multiple browser clients; target any one by node name |
 
@@ -201,13 +204,42 @@ cda send OfficePC real_click current '{"selector":"#submit"}'
 # Multi-level hover: sweep through the trigger point first (open the hover
 # menu), then click the menu item
 cda send OfficePC real_click current '{"selector":".toolbar-menu","approach":[[720,224],[767,201],[811,200],[830,240]]}'
+
+# A coordinate click reports what it actually hit
+cda send OfficePC real_click current '{"x":214,"y":1008}'
+# → { x:214, y:1008, navigated:false, settledMs:612,
+#     hit:{ tag:"button", class:"d-button", text:"Save draft", backendNodeId:4211 } }
+```
+
+### Element geometry: where coordinates come from
+
+Taking a coordinate used to mean screenshotting, finding a landmark in the image, reverse-engineering scale and offset, then extrapolating — a chain of assumptions that dies the moment the page is redesigned. Now you just measure:
+
+```bash
+# 1. Measure: centerCss is exactly what real_click takes
+cda send OfficePC get_rect current '{"text":"Publish","exact":true}' --field "centerCss,covered,hitTest.text"
+# → { centerCss:{x:214,y:1008}, covered:false, hitTest:{text:"Publish"} }
+
+# 2. Ambiguous substring? See who is who first (priority 0 = what click {"text":...} picks)
+cda send OfficePC get_rect current '{"text":"Publish","all":true}' --field "matchCount,allMatches.text,allMatches.priority"
+
+# 3. Click with a receipt
+cda send OfficePC real_click current '{"x":214,"y":1008}' --field "hit,navigated"
+
+# Batch: several elements in one round trip
+cda send OfficePC get_rect current '{"selectors":["#title","#cover",".submit"]}' --field "items.selector,items.centerCss"
 ```
 
 ### Screenshot to confirm page state
 
 ```bash
 cda send OfficePC screenshot current '{"path":"/tmp/shot.png"}'
-# Screenshot saved: /tmp/shot.png (… bytes)
+# → { path:"/tmp/shot.png", bytes:284113,
+#     imagePx:{w:2880,h:1626}, viewportCss:{w:1440,h:813}, dpr:2, scale:2,
+#     chromeInsetCss:{top:0,left:0}, scrollCss:{x:0,y:500},
+#     mapping:"imagePx = (cssViewportPx + chromeInsetCss) * dpr; css = imagePx / dpr" }
+# image pixels → CSS: css = imagePx / dpr (the capture is strictly 1:1 with the
+# viewport — no browser UI, so chromeInsetCss is always {0,0})
 ```
 
 ### Scroll, scrape a table, check for errors
@@ -240,7 +272,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | Command | Usage | Description |
 |---|---|---|
 | `click` | `send <id> click <tab> <params>` | Click an element (selector / text / coordinates) |
-| `real_click` | `send <id> real_click <tab> <params>` | Genuine real click (works on sites that ignore synthetic events); supports an `approach` hover path |
+| `real_click` | `send <id> real_click <tab> <params>` | Genuine real click (works on sites that ignore synthetic events); supports an `approach` hover path and `{backendNodeId}` targeting; **returns a `hit` receipt** (the element actually clicked) plus `navigated`, so coordinate clicks can be asserted and aborted |
 | `type` | `send <id> type <tab> <params>` | Type text; supports input/textarea and rich-text editing areas |
 | `keyboard` | `send <id> keyboard <tab> <params>` | Send a key press to an element (`{selector,key}`; selector optional, defaults to the focused element); optional `ctrl`/`shift`/`alt`/`meta` modifiers |
 | `trigger` | `send <id> trigger <tab> <params>` | Dispatch an event on an element (`{selector,event}`): `blur` for form validation, `change`+`value` to pick a `<select>` option (React controlled components included), custom events; `focus`/`blur` move real focus (form validation works); settle + waitFor semantics |
@@ -251,11 +283,13 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | `get_cursor` | `send <id> get_cursor <tab> <params>` | Read the caret position inside an editor (`{selector}`): `{inEditor,row,col,text}` — 0-based row, col offset within the line text, text = the line containing the caret; caret not in the editor → inEditor:false + nulls |
 | `get_text` | `send <id> get_text <tab> [selector]` | Get an element's / the page's text |
 | `get_prop` | `send <id> get_prop <tab> <params>` | Read an element property's exact raw value (`{selector\|text, prop}`); read-only, never calls methods; scalars returned as-is; non-JSON-safe object values error loudly instead of silently turning empty |
+| `get_rect` | `send <id> get_rect <tab> <params>` | **Authoritative element geometry**: `{selector\|text\|xpath}` / batch `{selectors:[...]}` / `{backendNodeId}` → `centerCss` (**same coordinate space as `real_click {x,y}`**) + `covered`/`hitTest` occlusion + `matchCount`/`allMatches` text ambiguity (`priority:0` = the one `click` picks) + `waitStableMs`; pierces closed shadow roots automatically; error codes distinguish `not-found` / `unreachable-subtree` / `cdp-unavailable` |
+| `get_viewport` | `send <id> get_viewport <tab>` | **Viewport truth**: `{viewportCss, dpr, scrollCss, screenCss}` (read-only) — the authority for screenshot math and coordinate checks |
 | `get_page_info` | `send <id> get_page_info <tab> [--field ...]` | Get page info (url / title / iframes) |
-| `list_elements` | `send <id> list_elements <tab> <params>` | Page element map: list interactive elements (generated selector / visibility / coordinates / accept) with filter/text/max/visible; pierces shadow DOM, aggregates all frames by default — run it first when you can't find an element |
+| `list_elements` | `send <id> list_elements <tab> <params>` | Page element map: list interactive elements (generated selector / visibility / coordinates / accept) with filter/text/max/visible; pierces shadow DOM, aggregates all frames by default — run it first when you can't find an element. Add `{"closed":true}` to also list elements inside **closed shadow roots** (carrying `backendNodeId`, no selector, listed first) |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | Get accumulated JS errors |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | Clear accumulated JS errors |
-| `screenshot` | `send <id> screenshot <tab> <params>` | Page screenshot; `{"path":"/tmp/s.png"}` saves locally |
+| `screenshot` | `send <id> screenshot <tab> <params>` | Page screenshot; `{"path":"/tmp/s.png"}` saves locally. The CLI prints `{path, bytes, imagePx, viewportCss, dpr, scale, chromeInsetCss, scrollCss, mapping}` — image and conversion metadata together |
 | `scroll` | `send <id> scroll <tab> <params>` | Scroll: window/iframe (via `frame`) or `{"selector":...}` to an element (scrollable container / scrollIntoView, pierces shadow DOM); smooth, returns once the DOM settles |
 | `exec` | `send <id> exec <tab> <params>` | ⚠ **Troubleshooting only, high risk**: run arbitrary JS in the page's MAIN world (`{"code":"document.title"}`) — can read the page's own JS globals; console semantics (returns the last statement's value), Promises auto-awaited, only JSON-serializable values come back. Disabled by default — you must first tick the plugin option "允许 exec 命令（仅排查问题）" on the extension options page, otherwise the command is rejected with a clear error. Turn the option back off after troubleshooting; details in `cli/help.md` |
 
@@ -269,9 +303,27 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 {"selector": "xpath://btn"}          // XPath prefix
 {"selector": "xhs-btn > #shadow-root > div > button"}  // DevTools shadow path
 {"selector": "xhs-btn >>> button"}   // pierce all shadow levels
+{"backendNodeId": 4211}              // element inside a closed shadow root (from list_elements {"closed":true})
+{"text": "Publish", "exact": true}    // exact text match (whole string), no substring false positives
 ```
 
-All element commands automatically pierce **open shadow roots**: if a bare selector (or `xpath:` / `text`) misses in light DOM, cda searches every open shadow root in document order (nested included). `real_click` works on shadow-DOM elements too. Closed shadow roots stay inaccessible — fall back to coordinate clicks (`real_click {"x":..., "y":...}`). `get_page_info --field html` includes shadow content by default: open roots appear inline as `<template shadowrootmode="open">` inside their hosts; pages without shadow DOM output exactly as before.
+All element commands automatically pierce **open shadow roots**: if a bare selector (or `xpath:` / `text`) misses in light DOM, cda searches every open shadow root in document order (nested included). `real_click` works on shadow-DOM elements too.
+
+**Closed shadow roots** (`attachShadow({mode:"closed"})`) are a different story: they are invisible to every in-page channel — not just `querySelector`, but any injected JS as well (which is why "just allow arbitrary JS execution" doesn't solve them). cda reaches them at the protocol level:
+
+```bash
+# 1. Enumerate interactive elements inside closed roots (opt-in via "closed":true;
+#    items carry a backendNodeId and no selector, and are listed first)
+cda send OfficePC list_elements current '{"closed":true}' --field "closedCount,elements.text,elements.backendNodeId,elements.inClosedShadowRoot"
+
+# 2. Measure (elements inside closed roots get authoritative geometry and occlusion too)
+cda send OfficePC get_rect current '{"backendNodeId":4211}' --field "centerCss,covered"
+
+# 3. Act: click / real_click / get_prop / get_text all accept backendNodeId
+cda send OfficePC click current '{"backendNodeId":4211}' --field "clickDesc,settledMs"
+```
+
+A closed root exposes no stable path, so such items have no `selector` — the `backendNodeId` forms an "enumerate → verify → measure → act" loop that touches neither coordinates nor screenshots. `get_rect` also falls back to closed roots automatically for ordinary queries when every in-page channel reports "not found". Piercing covers the top frame plus **same-origin** iframes; closed roots inside cross-origin OOPIFs are not covered yet (they surface as `not-found`, so assert on `hit` in that case). `get_page_info --field html` includes shadow content by default — open roots appear inline as `<template shadowrootmode="open">` inside their hosts, **closed ones do not** (browsers don't expose their content); pages without shadow DOM output exactly as before.
 
 ### Params for the other commands
 
@@ -328,7 +380,7 @@ cda send OfficePC click current '{"selector":"#refresh"}' --field "iframeChanges
 cda send OfficePC type current '{"selector":"#title","text":"hi"}' --field "settledMs"
 ```
 
-Supported by **every command returning an object**: `click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`set_cursor`/`get_cursor`/`scroll`/`show`/`hide`/`get_prop`/`get_page_info`/`list_elements`/`get_js_errors`/`real_click`/`open` (for `get_prop`, when the value is a plain object). Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and `get_prop` scalar values pass through as-is — neither has fields to filter.
+Supported by **every command returning an object**: `click`/`type`/`keyboard`/`trigger`/`upload_file`/`upload_dragdrop`/`paste_rich`/`set_cursor`/`get_cursor`/`scroll`/`show`/`hide`/`get_prop`/`get_rect`/`get_viewport`/`get_page_info`/`list_elements`/`get_js_errors`/`real_click`/`open` (for `get_prop`, when the value is a plain object). Paths are comma-separated, dotted for nested projection: `--field a.b` returns `{a: {b: value}}` (so `res.a.b` always works in scripts); array segments project per item (`newTabs.url` → `{newTabs: [url, ...]}`); missing paths are ignored. `get_text` returns a plain string and `get_prop` scalar values pass through as-is — neither has fields to filter.
 
 ### 4. State awareness — commands return the world after the action
 
@@ -349,6 +401,43 @@ Supported by **every command returning an object**: `click`/`type`/`keyboard`/`t
 ### 6. JS error collection
 
 Persistent collection starts on page load (`window.onerror` + `unhandledrejection`) and never blocks commands. Errors accumulate until you query them with `get_js_errors` or clear them with `clear_js_errors`; you can also pass `jsErrors` through any `--field`-enabled command to get them alongside the result.
+
+### 7. Geometry truth: coordinates and screenshot math, measured
+
+The most fragile step in browser automation is "obtain a coordinate". The old way — screenshot, find a landmark (say the red button in the sidebar), reverse-engineer the scale and the vertical offset, extrapolate — hard-codes two assumptions: that a fixed-position landmark exists, and that the image↔viewport relation is known. Break either and the whole route fails *silently*: you click a neighbouring button and the command still returns success.
+
+Now four places speak **one** coordinate space (top-level viewport CSS px):
+
+| Source | Meaning |
+|---|---|
+| `real_click {"x","y"}` | where the mouse goes down |
+| `get_rect.centerCss` | the element's centre |
+| `list_elements` `x`/`y` | element coordinates |
+| `screenshot`'s `imagePx / dpr` | a pixel measured in the image, converted back to CSS |
+
+```bash
+cda send OfficePC get_viewport current     # how big is the viewport, what dpr, how far scrolled
+cda send OfficePC get_rect current '{"text":"Publish"}' --field "centerCss,covered,hitTest"
+cda send OfficePC real_click current '{"x":214,"y":1008}' --field "hit"   # receipt: what got clicked
+```
+
+- **Occlusion is measured**: `hitTest` is the element the centre point *actually* hits (same semantics as `click`'s `clickDesc.coveredBy`), so an overlay blocking your target is named rather than inferred
+- **Ambiguity is measured**: `{"text":"Publish"}` matches substrings, so it can hit both "Publish" and "Publish note"; `matchCount`/`allMatches` list every candidate, with `priority: 0` being the one `click` picks and the rest the silently ignored siblings. Use `{"exact":true}` to match the whole string
+- **A wrong click is no longer silent**: `real_click` samples the hit target *before* pressing the mouse down and returns it as `hit` — a script can assert "I am about to click Publish" and abort otherwise
+- **Errors are distinguishable**: `not-found` (genuinely absent) / `unreachable-subtree` (exists but unusable geometry) / `cdp-unavailable` (another debugger client holds the tab); the CLI prints `Error [code]: message` instead of flattening everything into "no match"
+
+#### ⚠️ Two viewport spaces: attaching the debugger makes the viewport shorter
+
+While `chrome.debugger` is attached, Chrome shows an "extension is debugging this browser" infobar, and the page's **layout viewport is one infobar shorter than without it** (measured: 1440×749 → 1440×693). Commands therefore fall into two viewport spaces:
+
+| Channel | Viewport space |
+|---|---|
+| `get_viewport`, `list_elements` (default), `click {"x","y"}`, `get_rect`'s in-page channel | **in-page** (no debugger attached — full height) |
+| `real_click`, `screenshot`, any command taking `backendNodeId`, `get_rect`'s fallback channel | **attached** (debugger attached — one infobar shorter) |
+
+Content anchored to the top has the same coordinates in both spaces; `position:fixed` footers, vertically centred blocks and `vh`-sized elements differ by exactly that infobar's height — which is precisely the class of element a publish page's footer belongs to. The infobar animates in, so the difference keeps changing while it does; **this is one real cause of "the coordinate was right but the click landed nowhere"**.
+
+At every attach point cda **waits for the infobar to actually appear — for the viewport to drop below its in-page height — before measuring or dispatching**, so **within one command the coordinate and the action always share a space**. The test is deliberately "did it get shorter", not "did the numbers stop moving": the infobar shows up a beat after the attach, so a reading can be perfectly stable and still be the pre-infobar one (most likely on the first attach of a browser session). cda therefore uses the in-page viewport height as the reference and waits for the drop until it times out; if a session never shows the infobar at all, it measures anyway and flags the result with `viewportNote` saying the coordinates belong to the in-page space. The only rule for callers: **never carry a coordinate across channels** — don't validate `screenshot` against `get_viewport` or vice versa, and don't use one to compensate coordinates you computed yourself.
 
 ---
 
@@ -394,14 +483,17 @@ Cross-origin iframes expose only `src` and `sameOrigin: false`; same-origin ones
 | `set_cursor` | `{ selector, position, row, col, text, settledMs }` (row 0-based; col offset within the line text; text = the line containing the caret — read-back is authoritative) |
 | `get_cursor` | `{ selector, inEditor, row, col, text }` (caret not in the editor → `inEditor:false` + nulls, not an error) |
 | `get_prop` | the exact property value (string/number/boolean as-is; plain objects returned with the matched frame; values that can't survive JSON error loudly) |
-| `list_elements` | `{ count, truncated, elements: [{tag, text, visible, x, y, w, h, selector, …}] }` |
+| `list_elements` | `{ count, truncated, elements: [{tag, text, visible, x, y, w, h, selector, …}] }`; with `closed:true` also `closedCount`, and closed-root items carry `backendNodeId` + `inClosedShadowRoot` and no `selector` |
+| `get_rect` | `{ x, y, width, height, rectCss, centerCss, tag, class, text, visible, covered, hitTest, matchCount, allMatches?, waitStable?, backendNodeId?, inClosedShadowRoot?, source }` (batch: `{ count, items:[{selector, …}] }`, each item carrying its own `code`) |
+| `get_viewport` | `{ viewportCss:{w,h}, scrollCss:{x,y}, dpr, devicePixelRatio, screenCss:{w,h}, isTop, url, visualViewportCss? }` |
 | `type` / `clear_js_errors` | `{ success: true }` |
 | `upload_file` / `upload_dragdrop` | `{ success: true, data: { filename, size, mime } }` (`upload_dragdrop` with `trusted:true`: `{ filename, x, y, trusted, settledMs }` — no size/mime) |
 | `scroll` | `{ success: true, data: { scrollX, scrollY } }` |
 | `get_js_errors` | `{ errors: [{message, source, lineno}], count }` |
 | `close_tab` | `{ success: true, data: { tabId } }` |
 | `list_tabs` | `[{ id, title, url, active }]` |
-| `screenshot` | saved locally as PNG; prints the path and byte count |
+| `real_click` | on top of `click`, adds `hit` (actual target `{tag, class, text, backendNodeId, inClosedShadowRoot}`), `hitUnavailable?`, `x`/`y`, `navigated`, `settledMs` |
+| `screenshot` | saves a local PNG and prints JSON: `{ path, bytes, imagePx, viewportCss, dpr, scale, chromeInsetCss, scrollCss, mapping, viewportSource }` (`viewportCss` is derived from the image, so `imagePx.w / dpr === viewportCss.w` always holds and `chromeInsetCss` is always `{0,0}` — the capture is strictly 1:1 with the viewport, no browser UI; a mismatch on either axis is reported truthfully in `warning`, and a missing image makes the CLI exit with an error rather than silently writing nothing) |
 
 ---
 

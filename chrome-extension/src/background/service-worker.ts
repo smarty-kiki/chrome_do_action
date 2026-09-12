@@ -1,5 +1,35 @@
 import { WsClient, ConnectionStatus } from "../ws/client";
 import type { Message, CommandMessage } from "../ws/types";
+import {
+  attachDebugger,
+  detachDebugger,
+  enableDomains,
+  readPiercedTree,
+  uncoveredIframeNote,
+  findByTextInTree,
+  querySelectorInTree,
+  selectorKind,
+  describeElements,
+  describeBackendNode,
+  boxOf,
+  hitTestAt,
+  toHitDescription,
+  isSelfOrDescendant,
+  scrollIntoView,
+  dispatchSyntheticClick,
+  textOf,
+  propertyOf,
+  viewportFacts,
+  waitViewportStable,
+  listClosedInteractive,
+  CdpUnavailableError,
+  StaleNodeError,
+  type CdpSend,
+  type PiercedTree,
+  type PiercedElement,
+  type ElementFacts,
+  type ViewportWait,
+} from "./cdp-elements";
 
 interface StoredConfig {
   nodeName: string;
@@ -45,6 +75,386 @@ function cdpSend(tabId: number, method: string, params?: Record<string, unknown>
       reject(err);
     }
   });
+}
+
+// ─────────── CDP 兜底通道（不可寻址子树的唯一出路；只读命令用）───────────
+//
+// 页面内通道（content script）对 closed shadow root 完全不可见——不是权限问题，
+// 页面自己的 JS 用 document.querySelector 同样 notFound，所以放开 exec 也解决不了。
+// 只有 DOM 协议层能穿进去。这里只封装「attach → 穿刺树 → 交付 → 一定 detach」，
+// 元素语义都在 cdp-elements.ts 里。
+
+/** 错误码：与「元素不存在」区分开的三种结论（今天统一 not-found 会掩盖根因） */
+const ERR_NOT_FOUND = "not-found";                 // 页面里确实没有这个元素
+const ERR_UNREACHABLE = "unreachable-subtree";     // 存在且可见可点，但对本通道不可寻址/无几何
+const ERR_CDP = "cdp-unavailable";                 // debugger 用不了（DevTools 占用、受限页面）
+
+/** 把 CDP 层的异常映射成错误码；返回 undefined 表示不是CDP 类问题（按原样冒泡） */
+function cdpErrorCode(err: unknown): string | undefined {
+  if (err instanceof CdpUnavailableError) return ERR_CDP;
+  if (err instanceof StaleNodeError) return ERR_UNREACHABLE;
+  return undefined;
+}
+
+/**
+ * 「没有 debugger 时」的顶层视口高度——附加态视口的对照基准。
+ * 走页面内通道（content script，不开 debugger），在 attach **之前**问一次，几毫秒。
+ * 拿不到（没有 content script / 受限页面 / 超时）返回 null，调用方退回「只等安定」的老行为。
+ */
+async function inPageViewportHeight(tabId: number): Promise<number | null> {
+  const { response } = await sendToFrame(
+    tabId, 0,
+    { type: "execute_command", payload: { command: "get_viewport", params: {} } },
+    1200,
+  );
+  const d = response?.data as { viewportCss?: { h?: number } } | undefined;
+  const h = d?.viewportCss?.h;
+  return typeof h === "number" && h > 0 ? h : null;
+}
+
+/** 本 Chrome 会话里「debugger 信息条不会出现」（用户把它关掉了）的记忆，避免每条命令都白等。 */
+const INFOBAR_SUPPRESSED_KEY = "debuggerInfobarSuppressed";
+
+/**
+ * 每次 attach 之后、任何测量或派发之前调这里。它比裸的 waitViewportStable 多做一件事：
+ * 先取「没有 debugger 时」的视口高作对照，**确认信息条已经出现**（或确认本会话等不到它），
+ * 这样量到的几何与调用方稍后下手的时刻才落在同一个视口空间里。
+ *
+ * 为什么必须有（实测）：信息条的出现是滞后的，**同一 Chrome 会话的第一条 CDP 命令**最容易
+ * 量在"信息条还没冒出来"的空间里——重启 Chrome 后第一条 `get_rect` 量到 749（y=717），
+ * 紧接着的 `screenshot` 量到 693；调用方拿 717 去 `real_click`，派发时按钮已上移到 645..677，
+ * 于是"成功返回、按钮不动"。给对照高度后，命令会等视口真的变矮（信息条出现）才认这份几何。
+ *
+ * 代价：每条 CDP 命令多一次页面内往返（几毫秒）。对照高度拿不到、或本会话已确认等不到
+ * 信息条时，退回「只等安定」，行为与之前一致。
+ */
+async function settleAttachedViewport(send: CdpSend, tabId: number): Promise<ViewportWait> {
+  const flags = await chrome.storage.session
+    .get(INFOBAR_SUPPRESSED_KEY)
+    .catch(() => ({} as Record<string, unknown>));
+  const suppressed = (flags as Record<string, unknown>)[INFOBAR_SUPPRESSED_KEY] === true;
+  const baseline = suppressed ? null : await inPageViewportHeight(tabId);
+  const wait = await waitViewportStable(send, { inPageViewportH: baseline });
+  if (baseline !== null && wait.sawInfobar === false) {
+    // 等了 2.5s 视口都没变矮：本会话大概率不会再有信息条了（用户关掉过）。
+    // 记一笔，后续命令不必每条都白等——反正整个会话都量在同一个（无信息条的）空间里。
+    chrome.storage.session.set({ [INFOBAR_SUPPRESSED_KEY]: true }).catch(() => {});
+  }
+  return wait;
+}
+
+/**
+ * CDP 兜底脚手架：attach → enable → 取穿刺树 → 交付给 fn → finally detach。
+ * 只有页面内通道全部失败（或调用方显式给了 backendNodeId）时才走这里——常规路径零开销。
+ * attach 失败抛 CdpUnavailableError，由调用方映射成 `cdp-unavailable`（不是「元素不存在」）。
+ */
+async function withPiercedTree<T>(
+  tabId: number,
+  fn: (send: CdpSend, tree: PiercedTree) => Promise<T>,
+): Promise<T> {
+  await attachDebugger(tabId);
+  try {
+    const send: CdpSend = (method, params, timeoutMs) => cdpSend(tabId, method, params, timeoutMs);
+    await enableDomains(send);
+    // 信息条动画期间量到的矩形，与调用方稍后真正下手的时刻不在同一视口——先等信息条出现并安定再量
+    // （树的 viewport / scroll 一并取自安定后的读数，见 readPiercedTree）
+    const wait = await settleAttachedViewport(send, tabId);
+    const tree = await readPiercedTree(send);
+    // 把"这份几何落在哪个视口空间"如实带给下游：信息条没出现时它就和页面内通道同一个空间
+    tree.viewportSettled = wait.settled;
+    tree.sawInfobar = wait.sawInfobar;
+    return await fn(send, tree);
+  } finally {
+    await detachDebugger(tabId);
+  }
+}
+
+/**
+ * 把 CDP 通道描述的某个元素整理成与页面内 get_rect **同一形状**的返回。
+ * 形状一致是硬要求：调用方不该因为元素藏在闭包里就换一套读法解析结果。
+ * `source` 如实标注这份几何是从哪条通道来的。
+ */
+async function rectPayloadFromFacts(
+  send: CdpSend,
+  tree: PiercedTree,
+  facts: ElementFacts,
+): Promise<Record<string, unknown>> {
+  const rectCss = facts.rectCss;
+  const centerCss = facts.centerCss;
+  // 命中测试必须走 CDP：in-page 的 elementFromPoint 在闭包上会把结果 retarget 成宿主，
+  // 得到的"遮挡结论"是假的
+  const hit = centerCss ? await hitTestAt(send, tree, centerCss.x, centerCss.y) : null;
+  const covered =
+    !!hit && hit.backendNodeId !== facts.backendNodeId &&
+    !(await isSelfOrDescendant(send, facts.backendNodeId, hit.backendNodeId));
+  return {
+    x: centerCss ? Math.round(centerCss.x) : 0,
+    y: centerCss ? Math.round(centerCss.y) : 0,
+    width: rectCss ? Math.round(rectCss.w) : 0,
+    height: rectCss ? Math.round(rectCss.h) : 0,
+    rectCss,
+    centerCss,
+    tag: facts.tag,
+    class: facts.class ?? "",
+    text: facts.text,
+    visible: facts.visible,
+    covered,
+    hitTest: hit ? toHitDescription(hit) : null,
+    backendNodeId: facts.backendNodeId,
+    inClosedShadowRoot: facts.inClosedShadowRoot,
+    source: "cdp-pierced",
+    // 这份几何是在**附加了 debugger 的视口**里量的（信息条占掉顶部一条，见 waitViewportStable）。
+    // 带上它，调用方才能发现「这里的视口比 get_viewport 报的矮」并据此配对：
+    // CDP 通道的坐标配 real_click / click {backendNodeId} / screenshot 换算；
+    // 页面内通道（get_viewport / list_elements 普通条目 / click {x,y}）是另一个空间。
+    // 同一页面里两者对底部/垂直居中/vh 类元素会差一个信息条的高度（实测 56px）。
+    viewportCss: tree.viewport,
+    // 信息条**没**出现时（本会话它不会来了，多半被用户关掉），这份几何恰好与页面内通道同空间——
+    // 如实说出来，调用方才知道该拿它配谁（此时配 click {x,y} / get_viewport 是对的）。
+    ...(tree.sawInfobar === false
+      ? { viewportNote: "measured with NO debugger infobar (same space as get_viewport / click {x,y}) — the infobar did not appear in this browser session, so bottom-anchored coordinates here match the in-page channels" }
+      : {}),
+    ...(facts.frameUrl ? { frameUrl: facts.frameUrl } : {}),
+  };
+}
+
+/**
+ * 文本/选择器在穿刺树里定位。CSS 选择器逐 root 精确查（`DOM.querySelectorAll`），
+ * `xpath:` / `>>>` 这类路径式选择器**无法寻址闭包**（闭包内拼不出稳定路径）——
+ * 与其给一个含糊的 notFound，不如明说这个选择器穿不进闭包。
+ */
+async function locateInTree(
+  send: CdpSend,
+  tree: PiercedTree,
+  params: Record<string, unknown>,
+): Promise<{ hits: PiercedElement[]; allMatches?: Record<string, unknown>[]; truncated?: boolean; note?: string }> {
+  const backendNodeId = params.backendNodeId;
+  if (typeof backendNodeId === "number") {
+    const known = tree.byBackendId.get(backendNodeId);
+    // 树里没有（命中落在别的 target，或页面刚刚变了）也要能描述——describeBackendNode 会造壳
+    return { hits: known ? [known] : [syntheticTarget(backendNodeId)], allMatches: undefined };
+  }
+  const selector = typeof params.selector === "string" ? params.selector : "";
+  if (selector) {
+    const kind = selectorKind(selector);
+    if (kind !== "css") {
+      return { hits: [], note: `"${kind}"-style selectors (xpath: / >>> / #shadow-root) cannot address nodes inside a closed shadow root — closed shadow roots have no stable path. Use a plain CSS selector or a text query instead.` };
+    }
+    const { hits, error } = await querySelectorInTree(send, tree, selector);
+    if (error) return { hits: [], note: error };
+    return { hits, allMatches: undefined };
+  }
+  const text = typeof params.text === "string" ? params.text : "";
+  if (!text) return { hits: [] };
+  const hits = findByTextInTree(tree, { text, exact: params.exact === true });
+  return { hits };
+}
+
+/** 单条查询的结论。ok:false 时 code 是给调用方判断用的机器可读错误码（可能缺省=非 CDP 类错误） */
+type CommandOutcome =
+  | { ok: true; data: Record<string, unknown>; note?: string }
+  | { ok: false; code?: string; error: string };
+
+/** allMatches 的输出上限（all:true 时放宽）；describe 上限要比它大，否则"第一个可见的"可能选错 */
+const MATCH_LIMIT = 20;
+const MATCH_LIMIT_ALL = 100;
+const DESCRIBE_LIMIT = 60;
+const DESCRIBE_LIMIT_ALL = 100;
+
+/** 闭包内元素在返回里的身份标记（两条通道共用同一组字段名） */
+function identityOf(facts: ElementFacts | null, backendNodeId: number): Record<string, unknown> {
+  return {
+    backendNodeId,
+    inClosedShadowRoot: facts?.inClosedShadowRoot === true,
+  };
+}
+
+/**
+ * `{backendNodeId}` 直连：一次 attach 完成「定位 → 动作」。
+ * 为什么必须单独开这条路：closed shadow root 里的节点在页面内**拼不出选择器**，
+ * 页面内通道对它无解——backendNodeId 是唯一能跨越闭包的寻址方式。
+ * 返回形状与同名页面内命令保持一致，调用方在两条通道间切换不用改解析代码。
+ */
+async function byBackendNodeId(
+  tabId: number,
+  command: string,
+  params: Record<string, unknown>,
+): Promise<CommandOutcome> {
+  const backendNodeId = params.backendNodeId as number;
+  try {
+    return await withPiercedTree(tabId, async (send, tree) => {
+      const facts = await describeBackendNode(send, tree, backendNodeId);
+      if (command === "get_text") {
+        const text = await textOf(send, backendNodeId);
+        return { ok: true as const, data: { text, ...identityOf(facts, backendNodeId) } };
+      }
+      if (command === "get_prop") {
+        const prop = typeof params.prop === "string" ? params.prop : "";
+        if (!prop) return { ok: false as const, error: '"prop" is required with "backendNodeId"' };
+        const r = await propertyOf(send, backendNodeId, prop);
+        return r.ok
+          ? { ok: true as const, data: { prop, value: r.value, ...identityOf(facts, backendNodeId) } }
+          : { ok: false as const, error: r.error };
+      }
+      if (command === "click") {
+        // 合成点击穿出闭包（composed:true）：与页面内 click 同款事件序列，只是从协议层发起
+        const pt = await dispatchSyntheticClick(send, backendNodeId);
+        if (!pt) return { ok: false as const, code: ERR_UNREACHABLE, error: `backendNodeId ${backendNodeId} did not accept a synthetic click` };
+        // 坐标与命中测试一律用**协议层的 quad**：它已经是顶层视口 CSS px（与 get_rect.centerCss /
+        // real_click {x,y} 同口径）。dispatchSyntheticClick 返回的是元素所在 frame 的局部坐标——
+        // iframe 内元素会差一个 frame 偏移，只在拿不到 quad 时才退回使用
+        const box = await boxOf(send, backendNodeId).catch(() => null);
+        const cx = box?.centerCss.x ?? pt.cx;
+        const cy = box?.centerCss.y ?? pt.cy;
+        const hitTest = await hitTestAt(send, tree, cx, cy).catch(() => null);
+        const covered = !!hitTest && !(await isSelfOrDescendant(send, backendNodeId, hitTest.backendNodeId));
+        return {
+          ok: true as const,
+          data: {
+            clickDesc: {
+              x: Math.round(cx), y: Math.round(cy),
+              tag: facts?.tag,
+              ...(facts?.class ? { class: facts.class } : {}),
+              backendNodeId,
+              inClosedShadowRoot: facts?.inClosedShadowRoot === true,
+              ...(covered && hitTest ? { coveredBy: toHitDescription(hitTest) } : {}),
+            },
+          },
+        };
+      }
+      // get_rect
+      if (!facts) return { ok: false as const, code: ERR_NOT_FOUND, error: `backendNodeId ${backendNodeId} does not exist in the pierced DOM (page changed — re-run list_elements for a fresh id)` };
+      if (!facts.visible) {
+        return {
+          ok: false as const,
+          code: ERR_UNREACHABLE,
+          error: `backendNodeId ${backendNodeId} (${facts.tag}) exists but has no usable geometry (zero-size or hidden) — reachable in the tree, not usable as a coordinate target`,
+        };
+      }
+      return { ok: true as const, data: await rectPayloadFromFacts(send, tree, facts) };
+    });
+  } catch (err) {
+    const code = cdpErrorCode(err);
+    const detail = err instanceof Error ? err.message : String(err);
+    return { ok: false, code, error: code ? detail : `backendNodeId lookup failed: ${detail}` };
+  }
+}
+
+/**
+ * 页面内通道取单个元素的矩形。批量与兜底判定共用。
+ * 返回 `responded:false` = 所有 frame 都没有 content script 响应（页面没加载完/受限），
+ * 这与 notFound（CS 明确答复"没有这个元素"）是两回事，不能混为一谈。
+ */
+async function rectViaContentScript(
+  tabId: number,
+  params: Record<string, unknown>,
+  timeoutMs = 5000,
+): Promise<{ data?: Record<string, unknown>; responded: boolean }> {
+  const frames = await resolveSearchFrames(tabId, params.frame);
+  let responded = false;
+  for (const f of frames) {
+    const { response } = await sendToFrame(tabId, f.frameId, {
+      type: "execute_command",
+      payload: { command: "get_rect", params },
+    }, timeoutMs);
+    if (!response) continue;
+    responded = true;
+    if (response.notFound) continue;
+    return { data: response.data as Record<string, unknown>, responded };
+  }
+  return { responded };
+}
+
+/**
+ * CDP 兜底：**一次 attach、一棵穿刺树**把若干条查询一起解掉（attach + 全量穿刺才是贵的部分，
+ * 批量查询因此只付一次）。每条查询：定位 → 可见者优先 → 几何 → 命中测试 → 歧义报告。
+ * 返回的 Map 对每个 key 都有结论（成功、或带错误码的失败）——绝不静默漏项。
+ */
+async function resolveRectsViaCdp(tabId: number, queries: { key: string; params: Record<string, unknown> }[]): Promise<Map<string, CommandOutcome>> {
+  const out = new Map<string, CommandOutcome>();
+  const describeLimit = queries.some((q) => q.params.all === true) ? DESCRIBE_LIMIT_ALL : DESCRIBE_LIMIT;
+  try {
+    await withPiercedTree(tabId, async (send, tree) => {
+      const boundaryNote = uncoveredIframeNote(tree);
+      for (const q of queries) {
+        const located = await locateInTree(send, tree, q.params);
+        if (located.note) {
+          out.set(q.key, { ok: false, code: ERR_UNREACHABLE, error: located.note });
+          continue;
+        }
+        if (located.hits.length === 0) {
+          out.set(q.key, { ok: false, code: ERR_NOT_FOUND, error: `Element not found: ${q.params.text || q.params.selector}` });
+          continue;
+        }
+        const described = located.hits.slice(0, describeLimit);
+        const facts = await describeElements(send, described);
+        // 与页面内 findByText 同规则：可见者中排第一的那个才是目标，不可见的不算候选
+        const primary = facts.find((f) => f.visible);
+        if (!primary) {
+          out.set(q.key, {
+            ok: false,
+            code: ERR_UNREACHABLE,
+            error: `Element exists in the pierced DOM (${located.hits.length} match(es)) but none of the first ${described.length} has usable geometry (zero-size or hidden) — reachable in the tree, not usable as a coordinate target`,
+          });
+          continue;
+        }
+        const payload = await rectPayloadFromFacts(send, tree, primary);
+        const matchCount = located.hits.length;
+        const allMatches: Record<string, unknown>[] = [];
+        const limit = q.params.all === true ? MATCH_LIMIT_ALL : MATCH_LIMIT;
+        let truncated = located.hits.length > described.length;
+        if (q.params.text && (q.params.all === true || matchCount > 1)) {
+          let priority = 0;
+          for (const f of facts) {
+            if (allMatches.length >= limit) { truncated = true; break; }
+            const r = f.rectCss;
+            allMatches.push({
+              tag: f.tag,
+              class: f.class ?? "",
+              text: f.text,
+              rectCss: r,
+              visible: f.visible,
+              // priority 只在可见候选间计数：0 = 文本定位会选中的那个（与页面内同口径）
+              ...(f.visible ? { priority: priority++ } : {}),
+              backendNodeId: f.backendNodeId,
+              inClosedShadowRoot: f.inClosedShadowRoot,
+            });
+          }
+        }
+        out.set(q.key, {
+          ok: true,
+          data: {
+            ...(typeof q.params.selector === "string" ? { selector: q.params.selector } : {}),
+            ...payload,
+            matchCount,
+            ...(allMatches.length ? { allMatches } : {}),
+            ...(truncated ? { truncated: true } : {}),
+            ...(boundaryNote ? { boundary: boundaryNote } : {}),
+          },
+        });
+      }
+    });
+  } catch (err) {
+    const code = cdpErrorCode(err);
+    const detail = err instanceof Error ? err.message : String(err);
+    for (const q of queries) {
+      if (out.has(q.key)) continue;
+      out.set(q.key, {
+        ok: false,
+        code,
+        error: code ? detail : `CDP fallback failed: ${detail}`,
+      });
+    }
+  }
+  return out;
+}
+
+/** 树里没有的节点也要能描述——造一个只带 id 的壳（几何/文字仍从活 DOM 读） */
+function syntheticTarget(backendNodeId: number): PiercedElement {
+  return {
+    nodeId: 0, backendNodeId, tag: "", nodeName: "", attributes: {},
+    inClosedShadowRoot: false, text: "", visibleText: "", inBody: true, children: [],
+  };
 }
 
 async function moveMouseInSteps(tabId: number, tx: number, ty: number): Promise<void> {
@@ -398,6 +808,9 @@ async function runDebugRealClick(
       } catch {
         // 窗口激活失败不阻断，继续尝试点击
       }
+      // 等视口安定再按下（浮层是页面内画的坐标，附加态视口比它量的时候矮一条信息条；
+      // 顶部锚定的静态内容不受影响，底部锚定/vh 类元素会差这一个信息条的高度——如实记在这）
+      await settleAttachedViewport((method, p, timeoutMs) => cdpSend(tabId, method, p, timeoutMs), tabId);
       const clickPoint = { x, y, button: "left" as const, clickCount: 1 };
       await moveMouseInSteps(tabId, x, y);
       // 短暂停留让 hover/样式生效（与远程路径的 120ms 一致）
@@ -574,7 +987,7 @@ async function sendToTab(
   const needNewTabs = fieldFilter.length === 0 || fieldFilter.some(f => f === "newTabs" || f.startsWith("newTabs."));
   const needBeforeInfo = isClick && needIframe;
 
-  const sendResult = (payload: { commandId: string; success: boolean; data?: unknown; error?: string }): void => {
+  const sendResult = (payload: { commandId: string; success: boolean; data?: unknown; error?: string; code?: string }): void => {
     // 统一出口过滤：success 时按 _field 点路径投影（getFullPageInfo 等只控制采集，输出裁剪在这里）
     wsClient.send({
       type: "command_result",
@@ -641,12 +1054,18 @@ async function sendToTab(
     // frame 汇总」；top/数字/{url} 只扫目标 frame。元素带 frame 归属（非顶层标注 url），
     // 汇总后统一按 max 截断
     const max = typeof params.max === "number" && Number.isFinite(params.max) ? Math.min(Math.max(1, Math.floor(params.max)), 200) : 50;
+    // closed:true 是**开关式**新增：默认关，既有输出逐字不变；开了才多一趟 CDP。
+    // closed 参数在 SW 层消费，不下发给 content script（它不认识、会按未知参数报错）
+    const closed = params.closed === true;
+    const csParams = { ...params };
+    delete csParams.closed;
+    const csMsg = { type: "execute_command", id: cmd.id, payload: { command, params: csParams } };
     const doCollect = async (): Promise<{ elements: Record<string, unknown>[]; responded: boolean }> => {
       const frames = await resolveSearchFrames(tabId, params.frame);
       const elements: Record<string, unknown>[] = [];
       let responded = false;
       for (const f of frames) {
-        const { response } = await sendToFrame(tabId, f.frameId, msg, 5000);
+        const { response } = await sendToFrame(tabId, f.frameId, csMsg, 5000);
         if (response) responded = true;
         const els = (response?.data as { elements?: Record<string, unknown>[] } | undefined)?.elements;
         if (!Array.isArray(els)) continue;
@@ -666,14 +1085,46 @@ async function sendToTab(
         injectError = e instanceof Error ? e.message : String(e);
       }
     }
-    const truncated = elements.length > max;
+    // closed shadow root 内的交互元素：页面内通道**枚举不到**（这就是根因 A 在 list_elements 上的形态）。
+    // 条目排在前面：开了 closed:true 的调用方要的正是这些——排在末尾会被 max 截断整个吞掉，
+    // 那就等于功能没生效却看不出来。条目没有 selector（闭包内拼不出稳定选择器），用 backendNodeId 定位
+    let closedItems: Record<string, unknown>[] = [];
+    let closedError: string | undefined;
+    if (closed) {
+      const filters = typeof params.filter === "string"
+        ? params.filter.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+        : [];
+      try {
+        closedItems = await withPiercedTree(tabId, (send, tree) =>
+          listClosedInteractive(send, tree, {
+            filters,
+            text: typeof params.text === "string" ? params.text : "",
+            visibleOnly: params.visible === true,
+            hiddenOnly: params.visible === false,
+          }));
+      } catch (e) {
+        // 拿不到就说拿不到：静默返回 0 条会被读成「闭包里没有元素」，正是要根治的假阴性
+        closedError = cdpErrorCode(e) ? `${cdpErrorCode(e)}: ${e instanceof Error ? e.message : String(e)}` : e instanceof Error ? e.message : String(e);
+      }
+    }
+    const all = closed ? [...closedItems, ...elements] : elements;
+    const truncated = all.length > max;
+    const kept = truncated ? all.slice(0, max) : all;
+    // 截断把闭包条目挤掉一部分时如实点名——这是「开了开关却看不到闭包按钮」的唯一成因
+    const droppedClosed = closedItems.filter((it) => !kept.includes(it)).length;
+    const warnings: string[] = [];
+    // 仅注入失败且仍无响应时出现：提示是 CS 不可达而非页面确实无元素
+    if (injectError && !responded) warnings.push(`content script injection failed: ${injectError}`);
+    if (droppedClosed > 0) warnings.push(`${droppedClosed} closed-shadow element(s) were dropped by "max": ${max} — raise "max" to see them`);
     sendResult({
       commandId: cmd.id!, success: true,
       data: {
-        count: truncated ? max : elements.length, truncated,
-        elements: truncated ? elements.slice(0, max) : elements,
-        // 仅注入失败且仍无响应时出现：提示是 CS 不可达而非页面确实无元素
-        ...(injectError && !responded ? { warning: `content script injection failed: ${injectError}` } : {}),
+        count: kept.length, truncated,
+        total: all.length,
+        elements: kept,
+        ...(warnings.length ? { warning: warnings.join("; ") } : {}),
+        ...(closed ? { closedCount: closedItems.length } : {}),
+        ...(closedError ? { closedError } : {}),
       },
     });
     onDone?.();
@@ -697,7 +1148,29 @@ async function sendToTab(
       onDone?.();
       return;
     }
-    sendResult({ commandId: cmd.id!, success: response?.success ?? false, data: response?.data, error: response?.error });
+    sendResult({ commandId: cmd.id!, success: response?.success ?? false, data: response?.data, error: response?.error, code: response?.code });
+    onDone?.();
+    return;
+  }
+
+  // get_viewport：视口真值。与 scroll 同路由（缺省顶层 frame）——截图换算是拿顶层视口算的，
+  // 子 frame 的 innerWidth/innerHeight 换算不了顶层截图，所以路由到哪个 frame 就只答哪个 frame
+  // 的视口（isTop 会如实为 false，不冒充）
+  if (command === "get_viewport") {
+    const frames = await resolveSearchFrames(tabId, params.frame);
+    const f = frames[0];
+    if (!f) {
+      sendResult({ commandId: cmd.id!, success: false, error: "No matching frame for get_viewport" });
+      onDone?.();
+      return;
+    }
+    const { response } = await sendToFrame(tabId, f.frameId, msg, 5000);
+    if (!response) {
+      sendResult({ commandId: cmd.id!, success: false, error: "get_viewport timed out: no response from the target frame" });
+      onDone?.();
+      return;
+    }
+    sendResult({ commandId: cmd.id!, success: response.success, data: response.data, error: response.error, code: response.code });
     onDone?.();
     return;
   }
@@ -713,7 +1186,7 @@ async function sendToTab(
   const destructive = new Set(["click", "type", "keyboard", "trigger", "upload_file", "upload_dragdrop", "paste_rich", "set_cursor"]);
   const isSlow = destructive.has(command);
 
-  let response: { success: boolean; data?: unknown; error?: string; notFound?: boolean; navigated?: boolean } | undefined;
+  let response: FrameResponse | undefined;
   let matchedFrame: SearchFrame | undefined;
   // 写命令执行中失联：动作可能已执行、结果未知 → 事后核实，绝不猜测
   let lostContact: { frame: SearchFrame; reason: "timeout" | "portclosed" } | undefined;
@@ -760,8 +1233,64 @@ async function sendToTab(
     }
   }
 
-  // 先搜索：页面已有 content script（manifest 注入）就直接应答，绝不重复注入
-  await doSearch();
+  // backendNodeId 直连（枚举 → 核对 → 取矩形 → 下手 的闭环）：闭包内拼不出选择器，
+  // 页面内通道对它无解，只有穿刺树能寻址——不走页面内通道，直接用 CDP 定位。
+  // 拿到结果后**并入常规流程**（response 已定 → 跳过下面的搜索与注入），
+  // 于是 click 的导航判定 / currentTab / 新标签后处理照常生效，不用另写一套返回组装
+  const backendNodeId = typeof params.backendNodeId === "number" ? params.backendNodeId : undefined;
+  if (backendNodeId !== undefined && !isCoordinateClick) {
+    const outcome = await byBackendNodeId(tabId, command, params);
+    response = outcome.ok
+      ? { success: true, data: outcome.data }
+      : { success: false, error: outcome.error, code: outcome.code };
+  }
+
+  // get_rect 批量：一次 CLI 往返拿多个结果。每项先走页面内通道，落空**且**没响应的项
+  // 共用一次 CDP attach（attach + 全量穿刺才是贵的部分，批量因此只付一次）
+  if (command === "get_rect" && params.selectors !== undefined && backendNodeId === undefined) {
+    const selectors = params.selectors;
+    if (!Array.isArray(selectors) || selectors.some((s) => typeof s !== "string")) {
+      sendResult({ commandId: cmd.id!, success: false, error: '"selectors" must be an array of strings' });
+      onDone?.();
+      return;
+    }
+    // 批量与单条定位参数混用是调用方写错了：静默取其一等于给一个不是他要的答案
+    if (params.selector !== undefined || params.text !== undefined) {
+      sendResult({ commandId: cmd.id!, success: false, error: '"selectors" cannot be combined with "selector" or "text" — pass one or the other' });
+      onDone?.();
+      return;
+    }
+    const items: Record<string, unknown>[] = [];
+    const needCdp: { key: string; params: Record<string, unknown> }[] = [];
+    for (const [i, sel] of (selectors as string[]).entries()) {
+      const oneParams: Record<string, unknown> = { ...params, selector: sel };
+      delete oneParams.selectors;
+      const viaCs = await rectViaContentScript(tabId, oneParams);
+      if (viaCs.data) items[i] = { selector: sel, ...viaCs.data };
+      else needCdp.push({ key: String(i), params: oneParams });
+    }
+    if (needCdp.length) {
+      const resolved = await resolveRectsViaCdp(tabId, needCdp);
+      for (const q of needCdp) {
+        const outcome = resolved.get(q.key);
+        const sel = q.params.selector as string;
+        // 批量里单条失败不中断整批：该项带自己的错误码，其余项照常给出几何
+        items[Number(q.key)] = outcome?.ok
+          ? { selector: sel, ...outcome.data }
+          : { selector: sel, found: false, code: outcome?.code ?? ERR_NOT_FOUND, error: outcome?.error ?? `Element not found: ${sel}` };
+      }
+    }
+    sendResult({ commandId: cmd.id!, success: true, data: { count: items.length, items } });
+    onDone?.();
+    return;
+  }
+
+  // 先搜索：页面已有 content script（manifest 注入）就直接应答，绝不重复注入。
+  // response 已被上面两条直连分支定下时跳过搜索——但注入重试仍可能需要对空结果补救（不会发生：
+  // response 已定即代表有结论），所以整体一起跳过
+  if (!response) {
+    await doSearch();
+  }
 
   // 没有任何 frame 响应且命令确定未执行（全是 noreceiver：动态 frame / 页面加载早期）：
   // 注入一次后重试；一旦 lostContact（可能已执行）绝不再发第二次命令
@@ -773,6 +1302,58 @@ async function sendToTab(
       injectError = e instanceof Error ? e.message : String(e);
     }
     await doSearch();
+  }
+
+  // 页面内通道答复成功、但调用方要的是**歧义全貌**（`all:true`）时，光报页面内的候选是不够的：
+  // 闭包内的同名命中对页面内通道根本不存在，实测 `get_rect {"text":"发布","all":true}`
+  // 因此报成 matchCount:1（只剩侧栏「发布笔记」），而闭包里的页脚「发布」才是要点到的那个——
+  // 歧义报告漏掉这一半，等于把根因藏起来。这里补一次 CDP 通道，把闭包内的命中**追加**进
+  // allMatches（页面内那份保持原位：priority 0 仍是 click {text} 会选中的那个，语义不变）。
+  if (response?.success && command === "get_rect" && params.all === true && typeof params.text === "string") {
+    const alive = await chrome.tabs.get(tabId).then(() => true).catch(() => false);
+    if (alive) {
+      const outcome = (await resolveRectsViaCdp(tabId, [{ key: "0", params }])).get("0");
+      const closed = (outcome?.ok ? (outcome.data.allMatches as Record<string, unknown>[] | undefined) : undefined)
+        ?.filter((m) => m.inClosedShadowRoot === true) ?? [];
+      if (closed.length) {
+        const data = response.data as Record<string, unknown>;
+        const existing = Array.isArray(data.allMatches) ? (data.allMatches as Record<string, unknown>[]) : [];
+        // priority 顺延：页面内可见候选已占了 0..n-1，闭包内的可见命中共用同一套计数
+        let priority = existing.filter((m) => typeof m.priority === "number").length;
+        const merged = [
+          ...existing,
+          ...closed.map((m) => ({ ...m, ...(m.visible ? { priority: priority++ } : {}), source: "cdp-pierced" })),
+        ];
+        const inPageCount = typeof data.matchCount === "number" ? data.matchCount : 0;
+        response = {
+          success: true,
+          data: {
+            ...data,
+            allMatches: merged,
+            matchCount: inPageCount + closed.length,
+            // 两半来源不同，说清楚：页面内通道看不见闭包，闭包条目只能用 backendNodeId 下手
+            matchCountNote: `${inPageCount} match(es) from the in-page channel + ${closed.length} from the CDP-pierced channel (closed shadow roots; use backendNodeId to act on those)`,
+          },
+        };
+      }
+    }
+  }
+
+  // CDP 兜底：页面内通道**全 frame 都答复"没有这个元素"**时，这不等于元素不存在——
+  // 闭包内（以及页面内寻址不到的）子树对页面内通道就是"不存在"，而这正是本组需求要根治的根因。
+  // 只有 hadResponse 才兜底：页面从头到尾没响应时，结论应该是「CS 不可达」而不是假装搜过了
+  if (!response && command === "get_rect" && hadResponse) {
+    const alive = await chrome.tabs.get(tabId).then(() => true).catch(() => false);
+    if (alive) {
+      const outcome = (await resolveRectsViaCdp(tabId, [{ key: "0", params }])).get("0");
+      if (outcome?.ok) {
+        response = { success: true, data: outcome.data };
+      } else if (outcome?.code) {
+        // 找到过（unreachable）与真没有（not-found）走不同错误码，不再统一 no match
+        response = { success: false, error: outcome.error, code: outcome.code };
+      }
+      // outcome 无 code = CDP 侧非预期异常：不吞，落到下面的通用错误里如实带出
+    }
   }
 
   // —— 结果整合 ——
@@ -913,6 +1494,11 @@ async function sendToTab(
         ...(typeof response?.data === "object" && response?.data !== null ? response.data : {}),
         ...frameAttribution,
       };
+      // 顶层兜底导航判断：CS 没报导航、但顶层 URL 确实变了（整页重载 / CS 侧的 beforeunload
+      // 没挂上）就如实改报 navigated:true。只做 false→true 的**证实性**升级，从不当场改回 false
+      if (result.navigated !== true && tab?.url && afterInfo?.url && afterInfo.url !== tab.url) {
+        result.navigated = true;
+      }
       if (needCurrent) result.currentTab = afterInfo;
       if (needIframe) {
         const iframeChanges = beforeFullInfo && afterInfo
@@ -921,7 +1507,7 @@ async function sendToTab(
         if (iframeChanges.length > 0) result.iframeChanges = iframeChanges;
       }
       if (needNewTabs && newTabInfos.length > 0) result.newTabs = newTabInfos;
-      sendResult({ commandId: cmd.id!, success: response?.success ?? false, data: result, error: response?.error });
+      sendResult({ commandId: cmd.id!, success: response?.success ?? false, data: result, error: response?.error, code: response?.code });
       onDone?.();
       return;
     }
@@ -937,7 +1523,7 @@ async function sendToTab(
     const data = dataIsPlainObj
       ? { ...(response.data as Record<string, unknown>), ...(skipFrameMerge ? {} : frameAttribution) }
       : response?.data;
-    sendResult({ commandId: cmd.id!, success: response?.success ?? false, data, error: response?.error });
+    sendResult({ commandId: cmd.id!, success: response?.success ?? false, data, error: response?.error, code: response?.code });
     onDone?.();
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
@@ -1042,6 +1628,10 @@ async function getFrameTree(tabId: number): Promise<SearchFrame[]> {
   return frames;
 }
 
+/** content script 的应答形状。`code` 是机器可读错误码（not-found / unreachable-subtree / …），
+ *  调用方靠它区分「不存在」「不可达」「被遮挡」，而不是从人类可读文案里猜 */
+type FrameResponse = { success: boolean; data?: unknown; error?: string; code?: string; notFound?: boolean; navigated?: boolean };
+
 // 向指定 frame 发消息的 Promise 封装。无响应分三类（原实现全归为 missing，导致
 // click 对任意失败都编造"导航成功"）：
 //   noreceiver —— 该 frame 没有 listener（content script 未注入/刚被导航走）：
@@ -1054,7 +1644,7 @@ function sendToFrame(
   msg: Record<string, unknown>,
   timeoutMs = 1200,
 ): Promise<{
-  response?: { success: boolean; data?: unknown; error?: string; notFound?: boolean; navigated?: boolean };
+  response?: FrameResponse;
   missing?: { reason: "noreceiver" | "portclosed" | "timeout" };
 }> {
   return new Promise((resolve) => {
@@ -1071,9 +1661,7 @@ function sendToFrame(
           resolve({ missing: { reason } });
           return;
         }
-        resolve({
-          response: r as { success: boolean; data?: unknown; error?: string; notFound?: boolean; navigated?: boolean },
-        });
+        resolve({ response: r as FrameResponse });
       });
     } catch {
       clearTimeout(timer);
@@ -1668,6 +2256,24 @@ async function autoConnect(): Promise<void> {
  * 流程：content script 获取元素中心坐标（iframe 内同源自动换算为顶层坐标；跨域走 CDP 定位）
  *      -> debugger 附加页面 -> Input.dispatchMouseEvent 发送完整序列。
  */
+/**
+ * 从 base64 PNG 头部读像素尺寸（IHDR）。只为换算元数据服务，不引图像库：
+ * 签名 8 字节 + 长度/类型 8 字节 + IHDR 的宽高各 4 字节 = 24 字节，取前 64 个 base64 字符足够。
+ * 解不出来返回 null（如实降级，不猜一个尺寸填进去）。
+ */
+function pngSize(base64: string): { w: number; h: number } | null {
+  try {
+    const head = atob(base64.slice(0, 64));
+    if (head.slice(0, 8) !== "\x89PNG\r\n\x1a\n") return null;
+    if (head.slice(12, 16) !== "IHDR") return null;
+    const be32 = (o: number): number =>
+      ((head.charCodeAt(o) << 24) | (head.charCodeAt(o + 1) << 16) | (head.charCodeAt(o + 2) << 8) | head.charCodeAt(o + 3)) >>> 0;
+    return { w: be32(16), h: be32(20) };
+  } catch {
+    return null;
+  }
+}
+
 async function handleRealClick(cmd: CommandMessage): Promise<void> {
   const params = cmd.payload.params || {};
   let tabId = params.tabId as number | undefined;
@@ -1676,7 +2282,7 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
   const approach = params.approach as [number, number][] | undefined;
   const fieldFilter = ((params as Record<string, unknown>)._field as string[] | undefined) || [];
 
-  function sendResult(payload: { success: boolean; data?: unknown; error?: string }): void {
+  function sendResult(payload: { success: boolean; data?: unknown; error?: string; code?: string }): void {
     wsClient.send({
       type: "command_result",
       payload: { commandId: cmd.id!, ...payload, data: payload.success ? applyFieldFilter(payload.data, fieldFilter) : payload.data },
@@ -1701,10 +2307,57 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
     if (cmd.payload.command === "screenshot") {
       await chrome.debugger.attach({ tabId }, "1.3");
       try {
+        const send: CdpSend = (method, p, timeoutMs) => cdpSend(tabId!, method, p, timeoutMs);
+        // 先等信息条出现、视口安定再拍：信息条浮出时视口在变，拍到的图与同时测到的视口
+        // 不是同一个尺寸（实测：同一页面连续三次拍到 741/744/736 的视口高、而稳定值是 693
+        // ——差的就是动画相位；同一会话里第一条命令还可能整条都量在信息条出现之前）
+        await settleAttachedViewport(send, tabId);
         const result = await cdpSend(tabId, "Page.captureScreenshot", {
           format: "png",
         }) as { data?: string };
-        sendResult({ success: true, data: result?.data ?? null });
+        const base64 = result?.data ?? "";
+        // 换算元数据：这是「截图 → CSS 坐标」这条路线唯一的权威来源。
+        // 不变量 imagePx == viewportCss × dpr 由构造成立（Page.captureScreenshot 只含页面视口，
+        // 不含浏览器 UI），所以 chromeInsetCss 恒为 0——不是"不确定的偏移"，是可断言的事实。
+        // viewportCss 直接**从图里反推**（imagePx / dpr）：图是这次拍到的既成事实，
+        // 拿另一时刻测到的视口去描述它才是错的（上面那三个数字就是这么来的）。
+        // 另外再测一次附加态视口做交叉校验，对不上就带 warning 如实报告：
+        // 宁可不给映射，也不给一个错的映射
+        const measured = await viewportFacts(send);
+        const imagePx = pngSize(base64);
+        const warnings: string[] = [];
+        if (!imagePx) warnings.push("could not read the PNG header — imagePx unknown, do NOT convert image coordinates to CSS");
+        const dpr = measured.dpr;
+        const viewportCss = imagePx
+          ? { w: imagePx.w / dpr, h: imagePx.h / dpr }
+          : measured.viewportCss;
+        if (imagePx) {
+          if (Math.abs(viewportCss.w - measured.viewportCss.w) > 1) {
+            warnings.push(`the captured image is ${viewportCss.w} CSS px wide but the viewport measured ${measured.viewportCss.w} — the page layout changed during capture, so the 1:1 image↔viewport mapping is NOT verified for this shot, do NOT use image→CSS conversion here`);
+          }
+          if (Math.abs(viewportCss.h - measured.viewportCss.h) > 1) {
+            warnings.push(`the captured image is ${viewportCss.h} CSS px tall but the viewport measured ${measured.viewportCss.h} — the page layout changed during capture (the debugger infobar animates), re-capture if exact height matters`);
+          }
+        }
+        sendResult({
+          success: true,
+          data: {
+            data: base64, // CLI 拆包写盘用，不打印（几 MB 的 base64 不该进终端）
+            ...(imagePx ? { imagePx } : {}),
+            viewportCss,
+            dpr,
+            // imagePx.w / dpr === viewportCss.w 由构造恒成立（viewportCss 就是从 imagePx 反推的）
+            scale: dpr,
+            chromeInsetCss: { top: 0, left: 0 },
+            scrollCss: measured.scrollCss,
+            // 这一条是本次拍照所依据的视口（附加态）。它与 get_viewport 报的（无 debugger 态）
+            // 可能差一个信息条的高度：底部锚定 / 垂直居中 / vh 类元素在两者里位置不同，
+            // 换算出来的坐标要配 real_click（同样附加 debugger）用，不要配页面内 click {x,y}
+            viewportSource: "measured while the debugger was attached (what this image covers); get_viewport reports the viewport without a debugger attached — the two differ by the debugger infobar height when they differ at all",
+            mapping: "css = image / dpr — image (0,0) is the viewport's top-left corner (the screenshot contains no browser UI: no infobar, no tabs)",
+            ...(warnings.length ? { warning: warnings.join("; ") } : {}),
+          },
+        });
       } finally {
         await chrome.debugger.detach({ tabId }).catch(() => {});
       }
@@ -1712,19 +2365,27 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
     }
 
     // 定位参数校验：无任何定位方式时提前报具体错误（否则兜底文案是 "Could not locate element: unknown"）
-    if (params.x == null && params.y == null && !selector && !params.text) {
-      sendResult({ success: false, error: 'real_click needs "selector", "text", or {x, y}' });
+    const backendNodeId = typeof params.backendNodeId === "number" ? params.backendNodeId : undefined;
+    if (params.x == null && params.y == null && !selector && !params.text && backendNodeId === undefined) {
+      sendResult({ success: false, error: 'real_click needs "selector", "text", {x, y}, or {backendNodeId}' });
       return;
     }
 
     // 1. 确定点击目标坐标：优先直接 x/y；否则按 frame 搜索定位元素。
     //    同源 iframe：get_rect 已换算顶层视口坐标；跨域 iframe：get_rect 标记 crossOrigin，
     //    记下 frameId，附加 debugger 后用 CDP getContentQuads 精确定位。
+    //    backendNodeId：页面内通道根本寻址不到（闭包内拼不出选择器），坐标同样只能在附加后从穿刺树取
     let x = params.x as number | undefined;
     let y = params.y as number | undefined;
     let cdpFrameId: number | undefined;
     let hitFrame: SearchFrame | undefined; // 元素命中的 frame（点击后向它发 wait_for_settle）
-    if (x == null || y == null) {
+    // 坐标是不是页面内通道量的？是的话附加 debugger 之后必须**重量一次**：
+    // 页面内通道没有 debugger（视口 749），点击派发时信息条已占掉顶部一条（视口 693）——
+    // 同一条坐标在底部锚定的元素上会差一个信息条的高度，量一次点一次必然打偏。
+    let coordsFromInPage = false;
+    if (backendNodeId !== undefined) {
+      // 下面 attach 后与跨域 iframe 走同一条 CDP 定位路径，这里不做任何页面内尝试
+    } else if (x == null || y == null) {
       const frames = await resolveSearchFrames(tabId, params.frame);
       for (const f of frames) {
         const r = await sendToFrame(tabId, f.frameId, {
@@ -1740,6 +2401,7 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         }
         x = d?.x;
         y = d?.y;
+        coordsFromInPage = true;
         hitFrame = f;
         break;
       }
@@ -1751,9 +2413,61 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
 
     // 2. 附加 debugger
     await chrome.debugger.attach({ tabId }, "1.3");
+    // 命中回执（hit）与 backendNodeId 定位都要用穿刺树。取树失败**不阻断点击**——
+    // 回执缺失要如实上报（hitUnavailable），绝不能让它变成点击失败
+    const send: CdpSend = (method, p, timeoutMs) => cdpSend(tabId!, method, p, timeoutMs);
+    let pierced: PiercedTree | undefined;
+    let piercedError: string | undefined;
     try {
-      // 2.1 跨域 iframe：CDP 在目标 frame 上下文里定位元素中心（顶层视口坐标）
-      if (cdpFrameId != null) {
+      await enableDomains(send);
+      // 先等信息条出现并安定，再量坐标 / 取树——量到的和点到的是同一个视口
+      await settleAttachedViewport(send, tabId);
+      pierced = await readPiercedTree(send);
+    } catch (e) {
+      piercedError = e instanceof Error ? e.message : String(e);
+    }
+    // 2.0 页面内量出来的坐标必须在**附加态视口**里重量一次（见 coordsFromInPage 的由来）。
+    //     重量走同一个页面内通道即可：它现在跑在信息条已经占位的布局里，给出的就是附加态坐标。
+    //     量不到（元素在附加后消失/移位到不可见）就如实报错，不拿旧坐标硬点。
+    if (coordsFromInPage && hitFrame) {
+      const r = await sendToFrame(tabId, hitFrame.frameId, {
+        type: "execute_command",
+        payload: { command: "get_rect", params: { selector, text: params.text, scroll: true } },
+      }, 8000);
+      const d = r.response?.data as { x?: number; y?: number } | undefined;
+      if (typeof d?.x === "number" && typeof d?.y === "number") {
+        x = d.x;
+        y = d.y;
+      }
+    }
+    let hitDesc: Record<string, unknown> | undefined;
+    let hitUnavailable: string | undefined;
+    let urlBeforeClick = ""; // 导航判定的基准：必须是**按下之前**的 URL
+    try {
+      // 2.1a backendNodeId（闭包内节点）：滚进视口 → 取 quad 中心（顶层视口坐标，与 real_click {x,y} 同口径）
+      if (backendNodeId !== undefined) {
+        if (!pierced) {
+          sendResult({ success: false, code: ERR_CDP, error: `Cannot resolve backendNodeId ${backendNodeId}: the pierced DOM is unavailable (${piercedError || "unknown"})` });
+          return;
+        }
+        await scrollIntoView(send, backendNodeId);
+        const box = await boxOf(send, backendNodeId);
+        if (!box) {
+          sendResult({
+            success: false, code: ERR_UNREACHABLE,
+            error: `backendNodeId ${backendNodeId} exists in the pierced DOM but has no usable geometry (zero-size or hidden) — reachable in the tree, not usable as a click target`,
+          });
+          return;
+        }
+        x = box.centerCss.x;
+        y = box.centerCss.y;
+        // settle / frame 归属：按事实里的 frameUrl 找到对应 frame（找不到就退回顶层）
+        const facts = await describeBackendNode(send, pierced, backendNodeId);
+        if (facts?.frameUrl) {
+          const frames = await resolveSearchFrames(tabId, undefined);
+          hitFrame = frames.find((f) => f.url === facts.frameUrl);
+        }
+      } else if (cdpFrameId != null) {
         const point = await getElementCenterViaCdp(tabId, cdpFrameId, params);
         if (!point) {
           sendResult({ success: false, error: `Could not locate element in iframe via CDP: ${selector}` });
@@ -1777,6 +2491,9 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       //    CDP 的 mousePressed+mouseReleased 会自动产生 click，无需显式发 click
       const clickPoint = { x, y, button: "left" as const, clickCount: 1 };
 
+      // 导航基准：按下前抓（点击瞬间就跳转的页面，点后再抓就已经是新 URL 了）
+      urlBeforeClick = (await chrome.tabs.get(tabId).catch(() => null))?.url || "";
+
       // 3.0 渐进移动到 approach 路径各点（模拟真实鼠标轨迹，逐级触发 hover）
       if (approach && approach.length) {
         for (const [ax, ay] of approach) {
@@ -1788,6 +2505,23 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       await moveMouseInSteps(tabId, x, y);
       // 3.2 短暂停留，让 hover/样式生效（有 approach 时等 popover 展开）
       await new Promise((r) => setTimeout(r, approach && approach.length ? 400 : 120));
+      // 3.25 命中回执：在鼠标按下**之前**问协议层「这个坐标下面到底是谁」。
+      // 必须在此刻问——点击会改变页面（弹层/导航/重渲染），点完再问就是另一个页面了。
+      // 也只能在协议层问：in-page 的 elementFromPoint 对 shadow 一律 retarget 成宿主，答不出真话
+      if (pierced) {
+        try {
+          const hit = await hitTestAt(send, pierced, x, y);
+          if (hit) {
+            hitDesc = toHitDescription(hit);
+          } else {
+            hitUnavailable = "nothing at that point (the coordinate is outside the page, or over a native control CDP does not report)";
+          }
+        } catch (e) {
+          hitUnavailable = e instanceof Error ? e.message : String(e);
+        }
+      } else {
+        hitUnavailable = `pierced DOM unavailable (${piercedError || "unknown"})`;
+      }
       // 3.3 按下（触发 mousedown + focus）
       await cdpSend(tabId, "Input.dispatchMouseEvent", {
         type: "mousePressed", ...clickPoint,
@@ -1805,8 +2539,8 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
     // 原实现只对元素命中时 settle——x/y 坐标点击完全跳过 settle，waitFor 被静默忽略。
     // 坐标点击同样有影响：settle 目标 = 命中 frame ?? 顶层 frame
     const settleFrameId = hitFrame ? hitFrame.frameId : 0;
-    const tabBefore = await chrome.tabs.get(tabId).catch(() => null);
-    const beforeUrl = tabBefore?.url || "";
+    // 导航基准 = 按下**之前**的 URL（原来在点击之后才抓，点击瞬间就跳转的页面会被判成未导航）
+    const beforeUrl = urlBeforeClick;
     const { response: settleResp, missing } = await sendToFrame(tabId, settleFrameId, {
       type: "execute_command",
       payload: { command: "wait_for_settle", params: { timeout: 3000, wait_for: params.waitFor } },
@@ -1835,7 +2569,8 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         sendResult({
           success: true,
           data: {
-            x, y, trusted: true, settleLost: true,
+            x, y, trusted: true, settleLost: true, navigated: true,
+            ...(hitDesc ? { hit: hitDesc } : {}),
             ...(params.waitFor ? { waitFor: { settled: false, skipped: "page navigated after the click — condition not evaluated" } } : {}),
           },
         });
@@ -1846,15 +2581,23 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         sendResult({ success: false, error: "waitFor could not be verified: content script unresponsive after the real click (the click itself was dispatched)" });
         return;
       }
-      sendResult({ success: true, data: { x, y, trusted: true, settleLost: true } });
+      sendResult({ success: true, data: { x, y, trusted: true, settleLost: true, ...(hitDesc ? { hit: hitDesc } : {}) } });
       return;
     }
 
     // CS 正常响应：settle 结果（含 waitFor 谓词结果）如实透传
+    // navigated 用**点击前**抓的 URL 比对（同一 thread 内最可靠的一条导航证据）
+    const urlAfter = (await chrome.tabs.get(tabId).catch(() => null))?.url || "";
+    const navigated = !!beforeUrl && !!urlAfter && urlAfter !== beforeUrl;
     sendResult({
       success: true,
       data: {
-        x, y, trusted: true,
+        x, y, trusted: true, navigated,
+        // 命中回执：点到的到底是谁。给错坐标时调用方可以在**造成后果之前**断言并中止
+        ...(hitDesc ? { hit: hitDesc } : {}),
+        // 回执缺失如实上报（CDP 不可用 / 坐标处无节点），不静默省略成"看起来没这功能"
+        ...(hitUnavailable ? { hitUnavailable } : {}),
+        ...(backendNodeId !== undefined ? { backendNodeId } : {}),
         ...(settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...(settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {}) } : {}),
       },
     });
@@ -1938,6 +2681,8 @@ async function handleTrustedDrop(cmd: CommandMessage): Promise<void> {
     let y = params.y as number | undefined;
     let cdpFrameId: number | undefined;
     let hitFrame: SearchFrame | undefined;
+    // 同 real_click：页面内通道量的坐标，附加 debugger 之后必须在附加态视口里重量
+    let coordsFromInPage = false;
     if (x == null || y == null) {
       if (!selector && !params.text) {
         sendResult({ success: false, error: 'upload_dragdrop (trusted mode) needs "selector", "text", or {x, y}' });
@@ -1958,6 +2703,7 @@ async function handleTrustedDrop(cmd: CommandMessage): Promise<void> {
         }
         x = d?.x;
         y = d?.y;
+        coordsFromInPage = true;
         hitFrame = f;
         break;
       }
@@ -1970,6 +2716,21 @@ async function handleTrustedDrop(cmd: CommandMessage): Promise<void> {
     // 2. 附加 debugger（显示"正在调试此浏览器"提示条——与 real_click 相同的已知表现）
     await chrome.debugger.attach({ tabId }, "1.3");
     try {
+      // 2.0 等信息条出现并安定再定位：坐标要用在附加态视口里量出来的那份（同 real_click）
+      await settleAttachedViewport((method, p, timeoutMs) => cdpSend(tabId!, method, p, timeoutMs), tabId!);
+      // 页面内量出来的坐标要在附加态视口里重量一次（同 real_click：底部锚定的放置目标
+      // 会因信息条而整体上移，照旧坐标拖过去会落在别的元素上）
+      if (coordsFromInPage && hitFrame) {
+        const r = await sendToFrame(tabId, hitFrame.frameId, {
+          type: "execute_command",
+          payload: { command: "get_rect", params: { selector, text: params.text, scroll: true } },
+        }, 8000);
+        const d = r.response?.data as { x?: number; y?: number } | undefined;
+        if (typeof d?.x === "number" && typeof d?.y === "number") {
+          x = d.x;
+          y = d.y;
+        }
+      }
       // 2.1 跨域 iframe：CDP 在目标 frame 上下文里定位元素中心（顶层视口坐标）
       if (cdpFrameId != null) {
         const point = await getElementCenterViaCdp(tabId, cdpFrameId, params);

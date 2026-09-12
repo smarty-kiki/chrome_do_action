@@ -256,6 +256,20 @@ async function collectIframes(fields: string[]): Promise<{ index: number; src: s
   return iframes;
 }
 
+// 覆盖层 / 顶部命中元素的可读描述。click 的 clickDesc.coveredBy 与 get_rect 的 hitTest
+// 共用这一处口径——同一份「谁盖在谁上面」的描述，不该有两个版本。
+// tag + 类（最多 3 个）+ 文本原样带出（不 trim 不截断）：报告也是文字，
+// 调用方拿去跟页面比对必须一致。
+function describeLayer(top: Element): Record<string, unknown> {
+  const htmlTop = top as HTMLElement;
+  const desc: Record<string, unknown> = { tag: top.tagName.toLowerCase() };
+  const cls = Array.from(htmlTop.classList).slice(0, 3).join(".");
+  if (cls) desc.class = cls;
+  const txt = htmlTop.textContent || "";
+  if (txt) desc.text = txt;
+  return desc;
+}
+
 async function handleCommand(
   payload: { command: string; params?: Record<string, unknown> },
 ): Promise<{ success: boolean; data?: unknown; error?: string; notFound?: boolean }> {
@@ -265,10 +279,13 @@ async function handleCommand(
   try {
     switch (command) {
       case "click": {
-        const known = ["text", "selector", "x", "y", "frame", "waitFor"];
+        const known = ["text", "selector", "x", "y", "frame", "waitFor", "exact"];
         const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
         if (unknown.length) {
-          return { success: false, error: `Unknown click parameter(s): ${unknown.join(", ")} (expected text, selector, x, y, waitFor)` };
+          return { success: false, error: `Unknown click parameter(s): ${unknown.join(", ")} (expected text, selector, x, y, waitFor, exact)` };
+        }
+        if (params.exact !== undefined && typeof params.exact !== "boolean") {
+          return { success: false, error: `"exact" must be a boolean (got ${JSON.stringify(params.exact)})` };
         }
         if (params.x !== undefined && typeof params.x !== "number") {
           return { success: false, error: `"x" must be a number (got ${JSON.stringify(params.x)})` };
@@ -321,21 +338,9 @@ async function handleCommand(
           return { visible: true };
         };
 
-        // 报告覆盖层 / 顶部命中元素的可读描述（tag + 类 + 前 200 字符文本，够定位即可）
-        const describeLayer = (top: Element): Record<string, unknown> => {
-          const htmlTop = top as HTMLElement;
-          const desc: Record<string, unknown> = { tag: top.tagName.toLowerCase() };
-          const cls = Array.from(htmlTop.classList).slice(0, 3).join(".");
-          if (cls) desc.class = cls;
-          // 覆盖层文字原样带出（不 trim 不截断）：报告也是文字——调用方拿去跟页面比对必须一致
-          const txt = htmlTop.textContent || "";
-          if (txt) desc.text = txt;
-          return desc;
-        };
-
         if (params.text) {
           const text = params.text as string;
-          const found = findByText(text);
+          const found = findByText(text, params.exact === true);
           if (!found) return { success: false, notFound: true, error: `No element found with text: ${text}` };
           el = found;
           const { cx, cy } = dispatchFullClick(el);
@@ -384,10 +389,13 @@ async function handleCommand(
         // 只读查询元素属性（innerHTML/value/checked/…）。返回的是元素的真实属性值：
         // 字符串/数字/布尔直接透传，对象只收 JSON 无损的普通数据（保真性由
         // nonJsonableReason 保证——不能把丢数据的东西悄悄发回去）
-        const known = ["selector", "text", "prop", "frame"];
+        const known = ["selector", "text", "prop", "frame", "exact"];
         const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
         if (unknown.length) {
-          return { success: false, error: `Unknown get_prop parameter(s): ${unknown.join(", ")} (expected selector, text, prop, frame)` };
+          return { success: false, error: `Unknown get_prop parameter(s): ${unknown.join(", ")} (expected selector, text, prop, frame, exact)` };
+        }
+        if (params.exact !== undefined && typeof params.exact !== "boolean") {
+          return { success: false, error: `"exact" must be a boolean (got ${JSON.stringify(params.exact)})` };
         }
         const prop = params.prop;
         if (typeof prop !== "string" || !prop) {
@@ -403,7 +411,7 @@ async function handleCommand(
           return { success: false, error: 'Need "selector" or "text" parameter' };
         }
         // text 优先（与 get_rect 一致）：两者都给时按文本定位
-        const el = (params.text ? findByText(params.text as string) : findElement(params.selector as string)) as Element | null;
+        const el = (params.text ? findByText(params.text as string, params.exact === true) : findElement(params.selector as string)) as Element | null;
         if (!el) return { success: false, notFound: true, error: `Element not found: ${(params.text ?? params.selector) as string}` };
         const tag = el.tagName.toLowerCase();
         if (!(prop in el)) {
@@ -429,14 +437,32 @@ async function handleCommand(
       }
 
       case "get_rect": {
-        // 获取元素在视口中的坐标（供 real_click 真实点击使用）。
+        // 元素几何真值。**坐标口径 = 顶层视口 CSS 像素**，与 real_click {x,y} 完全同口径，
+        // 这是本命令存在的全部理由：调用方读到的中心点，原样喂给 real_click 必须点到同一个元素。
         // iframe 内元素的 getBoundingClientRect 相对 iframe 自身视口，
         // 沿 window.parent 链累加每层 frameElement 的偏移换算为顶层视口坐标；
         // 跨域边界无法读父 frame（getBoundingClientRect 抛 SecurityError）→ 标记 crossOrigin，
         // 返回 iframe 本地坐标，由 service worker 走 CDP getContentQuads 精确定位。
+        const known = ["selector", "text", "frame", "scroll", "all", "waitStableMs", "exact"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown get_rect parameter(s): ${unknown.join(", ")} (expected selector, text, exact, all, waitStableMs, scroll)` };
+        }
         const selector = params.selector as string;
         if (!selector && !params.text) return { success: false, error: 'Need "selector" or "text" parameter' };
-        const el = (params.text ? findByText(params.text as string) : findElement(selector)) as HTMLElement | null;
+        if (params.exact !== undefined && typeof params.exact !== "boolean") {
+          return { success: false, error: `"exact" must be a boolean (got ${JSON.stringify(params.exact)})` };
+        }
+        if (params.all !== undefined && typeof params.all !== "boolean") {
+          return { success: false, error: `"all" must be a boolean (got ${JSON.stringify(params.all)})` };
+        }
+        if (params.waitStableMs !== undefined && (typeof params.waitStableMs !== "number" || params.waitStableMs < 0)) {
+          return { success: false, error: `"waitStableMs" must be a non-negative number (got ${JSON.stringify(params.waitStableMs)})` };
+        }
+        const exact = params.exact === true;
+        const el = (params.text ? findByText(params.text as string, exact) : findElement(selector)) as HTMLElement | null;
+        // 找不到 ≠ 不存在：这里给的是页面内通道的结论，service worker 会据此再走 CDP 兜底，
+        // 对「可见可点但对本通道不可寻址」的子树给出结论（而不是一句 no match 了事）
         if (!el) return { success: false, notFound: true, error: `Element not found: ${params.text || selector}` };
         // scroll:true（real_click 专用）：先滚进视口再测坐标——real_click 按坐标派发
         // CDP 真实鼠标事件，目标在视口外时坐标落在页面外，点击会静默落空。
@@ -444,6 +470,30 @@ async function handleCommand(
         // 立即测量仍拿到动画前的旧坐标。
         if (params.scroll === true) {
           el.scrollIntoView({ block: "center", behavior: "instant" });
+        }
+        // waitStableMs：矩形连续 N ms 不变才算定稿（懒加载/动画/字体回流都会让矩形漂移，
+        // 量到中间态就等于给了一个之后会失效的坐标）。超时则如实报 stable:false，不假装稳定。
+        let stable: { waited: number; stable: boolean } | null = null;
+        if (typeof params.waitStableMs === "number" && params.waitStableMs > 0) {
+          const started = Date.now();
+          let last = el.getBoundingClientRect();
+          let unchangedSince = started;
+          const deadline = started + params.waitStableMs + 5000;
+          stable = { waited: 0, stable: false };
+          while (Date.now() < deadline) {
+            await throttleSafeTimer(50).promise;
+            const now = el.getBoundingClientRect();
+            if (now.left !== last.left || now.top !== last.top || now.width !== last.width || now.height !== last.height) {
+              last = now;
+              unchangedSince = Date.now();
+              continue;
+            }
+            if (Date.now() - unchangedSince >= params.waitStableMs) {
+              stable = { waited: Date.now() - started, stable: true };
+              break;
+            }
+          }
+          if (!stable.stable) stable.waited = Date.now() - started;
         }
         const rect = el.getBoundingClientRect();
         const lx = rect.left + rect.width / 2;
@@ -463,6 +513,66 @@ async function handleCommand(
           }
           win = win.parent;
         }
+        // 顶层视口矩形：跨域时加不上父 frame 偏移，只能退回本 frame 的矩形（并标 crossOrigin）
+        const rectCss = crossOrigin
+          ? { x: rect.left, y: rect.top, w: rect.width, h: rect.height }
+          : { x: rect.left + (x - lx), y: rect.top + (y - ly), w: rect.width, h: rect.height };
+        const centerCss = { x: rectCss.x + rectCss.w / 2, y: rectCss.y + rectCss.h / 2 };
+
+        // 目标在 shadow 内时，document.elementFromPoint 会被 retarget 成宿主元素
+        // （open/closed 都一样）——那不是遮挡，是"本通道看不进 shadow 内部"。
+        // 同 shadow root 内的相互遮挡本通道**根本测不到**，所以如实标注 shadowRetargeted，
+        // 让调用方知道这个 hitTest 不足为凭，需要真值时走 CDP 通道。
+        const hostChain: Element[] = [];
+        for (let n: Node | null = el; n;) {
+          const root = n.getRootNode();
+          if (root instanceof ShadowRoot) {
+            hostChain.push(root.host);
+            n = root.host;
+          } else break;
+        }
+        const top = document.elementFromPoint(lx, ly);
+        const hitTest = top ? { ...describeLayer(top), ...(hostChain.length ? { shadowRetargeted: true } : {}) } : null;
+        const covered =
+          !!top &&
+          top !== el &&
+          !el.contains(top) &&
+          !hostChain.some((h) => h === top || h.contains(top));
+
+        // 歧义报告：click {text} 命中多个候选时静默取第一个，正是「点错按钮」的成因。
+        // 只在 matchCount > 1（有歧义）或显式 all:true 时带出明细，避免长返回；
+        // 上限可调，超出如实标 truncated。
+        const allMatches: Record<string, unknown>[] = [];
+        let matchCount = 1;
+        let truncated = false;
+        if (params.text) {
+          const candidates = findAllByText(params.text as string, exact);
+          matchCount = candidates.length;
+          if (params.all === true || matchCount > 1) {
+            const limit = params.all === true ? 100 : 20;
+            let priority = 0;
+            for (const cand of candidates) {
+              if (allMatches.length >= limit) {
+                truncated = true;
+                break;
+              }
+              const hEl = cand as HTMLElement;
+              const vis = isVisible(hEl);
+              const r = hEl.getBoundingClientRect();
+              allMatches.push({
+                tag: cand.tagName.toLowerCase(),
+                class: Array.from(hEl.classList).slice(0, 3).join("."),
+                text: (hEl.textContent || "").trim().replace(/\s+/g, " "),
+                rectCss: { x: r.left, y: r.top, w: r.width, h: r.height },
+                visible: vis,
+                // priority 只在可见候选间计数：0 = click {text} 会点的那个。
+                // 不可见的候选点不到，因此不给 priority（不是 0，也不是被跳过）
+                ...(vis ? { priority: priority++ } : {}),
+              });
+            }
+          }
+        }
+
         return {
           success: true,
           data: {
@@ -472,6 +582,50 @@ async function handleCommand(
             width: Math.round(rect.width),
             height: Math.round(rect.height),
             ...(crossOrigin ? { crossOrigin: true, localX: Math.round(lx), localY: Math.round(ly) } : {}),
+            // 以下为增补字段（既有字段语义与取值未变：x/y = Math.round(centerCss)）
+            rectCss,
+            centerCss,
+            tag: el.tagName.toLowerCase(),
+            class: Array.from(el.classList).slice(0, 3).join("."),
+            text: (el.textContent || "").trim().replace(/\s+/g, " "),
+            visible: isVisible(el),
+            covered,
+            hitTest,
+            matchCount,
+            ...(allMatches.length ? { allMatches } : {}),
+            ...(truncated ? { truncated: true } : {}),
+            ...(stable ? { waitStable: stable } : {}),
+          },
+        };
+      }
+
+      case "get_viewport": {
+        // 视口真值：截图换算与坐标校验的权威来源（与 screenshot 的元数据必须自洽：
+        // imagePx.w / dpr === viewportCss.w）。
+        // 注意这是**本 frame** 的视口——service worker 默认把本命令路由到顶层 frame，
+        // 传 frame 时 isTop 会如实为 false，避免拿子 frame 的数字去换算顶层截图。
+        const known = ["frame"];
+        const unknown = Object.keys(params).filter((k) => !k.startsWith("_") && !known.includes(k));
+        if (unknown.length) {
+          return { success: false, error: `Unknown get_viewport parameter(s): ${unknown.join(", ")} (expected no parameters)` };
+        }
+        const vv = window.visualViewport;
+        return {
+          success: true,
+          data: {
+            viewportCss: { w: window.innerWidth, h: window.innerHeight },
+            scrollCss: {
+              x: Math.round(window.scrollX),
+              y: Math.round(window.scrollY),
+            },
+            dpr: window.devicePixelRatio,
+            screenCss: { w: window.screen.width, h: window.screen.height },
+            devicePixelRatio: window.devicePixelRatio,
+            isTop: window === window.top,
+            url: location.href,
+            ...(vv
+              ? { visualViewportCss: { w: vv.width, h: vv.height, scale: vv.scale, offsetLeft: vv.offsetLeft, offsetTop: vv.offsetTop } }
+              : {}),
           },
         };
       }
@@ -1551,17 +1705,26 @@ function evalTextXPath(xpath: string, context: Document | ShadowRoot | Element):
   return null;
 }
 
-function findByText(text: string): Element | null {
+// 文本 XPath 并集（四个分支的顺序就是 click {text} 的优先序：button → a → input(value)
+// → 最深的通用命中元素）。exact=true 时把 `contains(...)` 换成整串相等——注意比的是
+// 「折叠空白后的字符串值」，所以嵌套 <span> 的按钮整串仍然相等，这正是按文本点击要的语义。
+// shadow tree 内没有 body，用 bodyXpath 去掉 //body// 前缀的变体。
+function buildTextXPath(text: string, exact: boolean): { bodyXpath: string; shadowXpath: string } {
   const q = xpathStr(text);
   const hidden = "self::script or self::style or self::noscript or self::template or self::head or self::title or self::meta or self::svg or self::path";
+  const cond = exact ? `normalize-space(.) = ${q}` : `contains(normalize-space(.), ${q})`;
+  const valCond = exact ? `@value = ${q}` : `contains(@value, ${q})`;
   const bodyXpath = [
-    `//body//button[contains(normalize-space(.), ${q})]`,
-    `//body//a[contains(normalize-space(.), ${q})]`,
-    `//body//input[contains(@value, ${q})]`,
-    `//body//*[not(${hidden})][contains(normalize-space(.), ${q}) and not(./*[not(${hidden})][contains(normalize-space(.), ${q})])]`,
+    `//body//button[${cond}]`,
+    `//body//a[${cond}]`,
+    `//body//input[${valCond}]`,
+    `//body//*[not(${hidden})][${cond} and not(./*[not(${hidden})][${cond}])]`,
   ].join(" | ");
-  const shadowXpath = bodyXpath.split("//body//").join("//");
+  return { bodyXpath, shadowXpath: bodyXpath.split("//body//").join("//") };
+}
 
+function findByText(text: string, exact = false): Element | null {
+  const { bodyXpath, shadowXpath } = buildTextXPath(text, exact);
   const hit = evalTextXPath(bodyXpath, document);
   if (hit) return hit;
   // light DOM 未命中 → 按文档序搜索所有 open shadow root（含嵌套）
@@ -1570,6 +1733,45 @@ function findByText(text: string): Element | null {
     if (h) return h;
   }
   return null;
+}
+
+// evalTextXPath 的"全都要"版本：不提前返回，保留 XPath 并集自带的文档序与去重
+function evalTextXPathAll(xpath: string, context: Document | ShadowRoot | Element): Element[] {
+  if (context instanceof ShadowRoot) {
+    const out: Element[] = [];
+    for (const child of Array.from(context.children)) out.push(...evalTextXPathAll(xpath, child));
+    return out;
+  }
+  const result = document.evaluate(xpath, context, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
+  const out: Element[] = [];
+  let el = result.iterateNext();
+  while (el) {
+    out.push(el as Element);
+    el = result.iterateNext();
+  }
+  return out;
+}
+
+// 全部候选，顺序与 findByText 完全一致（light DOM 的 XPath 并集 → 各 open shadow root）。
+// click {text} 选中的是这一串里**第一个可见**的，所以 priority 只在可见候选间计数：
+// priority 0 就是 click {text} 现在会点的那个，其余是它此前被静默忽略的兄弟——
+// 「点错了但没人知道」正是「左侧栏发布笔记 盖掉 页脚发布」那类事故的成因。
+function findAllByText(text: string, exact: boolean): Element[] {
+  const { bodyXpath, shadowXpath } = buildTextXPath(text, exact);
+  const seen = new Set<Element>();
+  const out: Element[] = [];
+  const push = (els: Element[]) => {
+    for (const el of els) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      out.push(el);
+    }
+  };
+  push(evalTextXPathAll(bodyXpath, document));
+  for (const sr of openShadowRootsDeep(document)) {
+    push(evalTextXPathAll(shadowXpath, sr));
+  }
+  return out;
 }
 
 // get_prop 对象值保真检查：返回值要穿过 CS→SW→server→CLI 的 JSON 链路，途中丢数据
