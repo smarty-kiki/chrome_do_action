@@ -587,8 +587,12 @@
     }
   }
   async function hitTestAt(send, tree, x, y) {
-    const px = Math.round(x + tree.scroll.x);
-    const py = Math.round(y + tree.scroll.y);
+    const fresh = await send("Page.getLayoutMetrics").catch(() => null);
+    const lv = fresh?.cssLayoutViewport;
+    const scrollX = typeof lv?.pageX === "number" ? Math.round(lv.pageX) : tree.scroll.x;
+    const scrollY = typeof lv?.pageY === "number" ? Math.round(lv.pageY) : tree.scroll.y;
+    const px = Math.round(x + scrollX);
+    const py = Math.round(y + scrollY);
     let loc = null;
     try {
       loc = await send("DOM.getNodeForLocation", { x: px, y: py });

@@ -326,7 +326,10 @@ async function handleCommand(
         // 返回派发坐标（rect 中心），供可点性探测使用。
         const dispatchFullClick = (target: Element, x?: number, y?: number): { cx: number; cy: number } => {
           if (x === undefined || y === undefined) {
-            (target as HTMLElement).scrollIntoView({ block: "center" });
+            // 一律 behavior:"instant"：页面 CSS scroll-behavior:smooth 会让这次滚动异步进行，
+            // 下面紧跟的 getBoundingClientRect 就量在动画半路——返回的坐标描述的是"还在动的
+            // 页面上的位置"，调用方拿着它再点就会落空。与 scroll / get_rect{scroll:true} 同款处理。
+            (target as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" });
           }
           const rect = (target as HTMLElement).getBoundingClientRect();
           const cx = x ?? rect.left + rect.width / 2;
@@ -1488,22 +1491,27 @@ async function handleCommand(
         const x = (params.x as number) ?? 0;
         const y = (params.y as number) ?? 0;
         const selector = params.selector as string | undefined;
+        // 一律 behavior:"instant"：本命令的约定是**返回时滚动已经落地**，而平滑滚动是
+        // 合成器上的异步动画，DOM/长任务都安静了它可能还在跑——等 DOM 稳定等不到它，
+        // 返回的就成了半路的位置（实测：请求 y=2400 返回 2384，之后又自己走到 2400），
+        // 调用方拿着这个数继续算坐标，就会落在还在动的页面上（拖放/点击实测因此落空）。
+        // 与 get_rect {scroll:true} 同款处理；滚动后再等 DOM 稳定，供懒加载内容出现。
         if (selector) {
           const el = findElement(selector) as HTMLElement | null;
           if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
           if (el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth) {
-            el.scrollTo({ top: y, left: x, behavior: "smooth" });
+            el.scrollTo({ top: y, left: x, behavior: "instant" });
             await waitForSettled(3000);
             return { success: true, data: { scrollTarget: "container", scrollX: el.scrollLeft, scrollY: el.scrollTop } };
           }
           const block = (["start", "center", "end", "nearest"] as string[]).includes(params.block as string)
             ? (params.block as ScrollLogicalPosition)
             : "center";
-          el.scrollIntoView({ behavior: "smooth", block });
+          el.scrollIntoView({ behavior: "instant", block });
           await waitForSettled(3000);
           return { success: true, data: { scrollTarget: "element", scrolledIntoView: selector } };
         }
-        window.scrollTo({ top: y, left: x, behavior: "smooth" });
+        window.scrollTo({ top: y, left: x, behavior: "instant" });
         await waitForSettled(3000);
         return { success: true, data: { scrollX: window.scrollX, scrollY: window.scrollY } };
       }

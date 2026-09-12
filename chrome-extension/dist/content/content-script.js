@@ -203,7 +203,7 @@
           let clickDesc = {};
           const dispatchFullClick = (target, x, y) => {
             if (x === void 0 || y === void 0) {
-              target.scrollIntoView({ block: "center" });
+              target.scrollIntoView({ block: "center", behavior: "instant" });
             }
             const rect = target.getBoundingClientRect();
             const cx = x ?? rect.left + rect.width / 2;
@@ -1183,16 +1183,16 @@
             const el = findElement(selector);
             if (!el) return { success: false, notFound: true, error: `Element not found: ${selector}` };
             if (el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth) {
-              el.scrollTo({ top: y, left: x, behavior: "smooth" });
+              el.scrollTo({ top: y, left: x, behavior: "instant" });
               await waitForSettled(3e3);
               return { success: true, data: { scrollTarget: "container", scrollX: el.scrollLeft, scrollY: el.scrollTop } };
             }
             const block = ["start", "center", "end", "nearest"].includes(params.block) ? params.block : "center";
-            el.scrollIntoView({ behavior: "smooth", block });
+            el.scrollIntoView({ behavior: "instant", block });
             await waitForSettled(3e3);
             return { success: true, data: { scrollTarget: "element", scrolledIntoView: selector } };
           }
-          window.scrollTo({ top: y, left: x, behavior: "smooth" });
+          window.scrollTo({ top: y, left: x, behavior: "instant" });
           await waitForSettled(3e3);
           return { success: true, data: { scrollX: window.scrollX, scrollY: window.scrollY } };
         }

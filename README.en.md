@@ -290,7 +290,7 @@ Page commands need a tab (`current` or a numeric tabId); browser commands don't.
 | `get_js_errors` | `send <id> get_js_errors <tab>` | Get accumulated JS errors |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | Clear accumulated JS errors |
 | `screenshot` | `send <id> screenshot <tab> <params>` | Page screenshot; `{"path":"/tmp/s.png"}` saves locally. The CLI prints `{path, bytes, imagePx, viewportCss, dpr, scale, chromeInsetCss, scrollCss, mapping}` — image and conversion metadata together |
-| `scroll` | `send <id> scroll <tab> <params>` | Scroll: window/iframe (via `frame`) or `{"selector":...}` to an element (scrollable container / scrollIntoView, pierces shadow DOM); smooth, returns once the DOM settles |
+| `scroll` | `send <id> scroll <tab> <params>` | Scroll: window/iframe (via `frame`) or `{"selector":...}` to an element (scrollable container / scrollIntoView, pierces shadow DOM); **returns with the page already at the new position** (the `scrollX`/`scrollY` it reports are final), then waits for the DOM to be quiet |
 | `exec` | `send <id> exec <tab> <params>` | ⚠ **Troubleshooting only, high risk**: run arbitrary JS in the page (`{"code":"document.title"}`) — can read the page's own JS globals; console semantics (returns the last statement's value), Promises auto-awaited, only JSON-serializable values come back. Disabled by default — you must first tick the plugin option "允许 exec 命令（仅排查问题）" on the extension options page, otherwise the command is rejected with a clear error. Turn the option back off after troubleshooting; details in `cli/help.md` |
 
 ### Locating an element for click / real_click
@@ -387,7 +387,7 @@ Supported by **every command returning an object**: `click`/`type`/`keyboard`/`t
 - **Navigation detection**: if a click causes navigation, the command **waits for the new page to finish loading** and returns its full info (with a `navigated` flag)
 - **New-tab detection**: the tab list is compared before/after a click to catch `target="_blank"` popups, and each new tab is awaited until loaded
 - **iframe change detection**: all iframe `src`s are captured before/after a click and diffed into `iframeChanges` (`srcChanged` / `beforeSrc` / `afterSrc`)
-- **DOM-settling wait**: after scrolling, the command waits for the page to be quiet before returning (3s timeout cap)
+- **Landed on return**: a scroll command only returns once the page has actually reached the new position — its `scrollX`/`scrollY` are final, not a mid-flight reading — and then waits for the page to be quiet (3s timeout cap)
 
 ### 5. Reliability
 

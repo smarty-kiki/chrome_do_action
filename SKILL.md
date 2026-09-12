@@ -99,7 +99,7 @@ nohup node dist/server.js --port 12345 > /tmp/cda-server.log 2>&1 &
 | `screenshot` | `send <id> screenshot <tab> '{"path":"/tmp/shot.png"}'` | 截图（只读），操作前确认页面真实状态。CLI 打印 JSON：`{path, bytes, imagePx, viewportCss, dpr, scale, chromeInsetCss, scrollCss, mapping, viewportSource}`——图与换算元数据一起回。`imagePx.w / dpr === viewportCss.w` 恒成立；`chromeInsetCss` 恒为 0（截图只含页面，不含浏览器界面）；两轴对不上会在 `warning` 里如实报告，写盘失败会明确报错退出（不会静默什么都没写） |
 | `get_js_errors` | `send <id> get_js_errors <tab>` | 获取页面 JS 报错（跨所有 frame 聚合，每条带 `source` 定位来源 frame） |
 | `clear_js_errors` | `send <id> clear_js_errors <tab>` | 清空已收集的 JS 报错，配合 get_js_errors 重新计数 |
-| `scroll` | `send <id> scroll <tab> '{"y":500}'` | 滚动页面：无 selector 滚窗口/iframe（`frame` 参数指定）；`{"selector":"..."}` 滚到元素（可滚动容器内滚、普通元素 scrollIntoView，穿透 shadow） |
+| `scroll` | `send <id> scroll <tab> '{"y":500}'` | 滚动页面：无 selector 滚窗口/iframe（`frame` 参数指定）；`{"selector":"..."}` 滚到元素（可滚动容器内滚、普通元素 scrollIntoView，穿透 shadow）。**返回时已滚到位**（返回的 `scrollX`/`scrollY` 是终值） |
 | `exec` | `send <id> exec <tab> '{"code":"document.title"}'` | ⚠ **仅排查问题使用（高风险，勿当常规手段）**：在页面里执行任意 JS 并返回结果，能读页面自身 JS 全局变量。需要先在插件配置页勾选「允许 exec 命令（仅排查问题）」（默认关闭），未启用即被拒绝报错。常规操作一律用上面具体命令（click/get_prop/list_elements 等），不要用 exec 注入任意代码替代 |
 
 ### 关键技巧

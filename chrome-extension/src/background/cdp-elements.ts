@@ -712,6 +712,12 @@ export async function isSelfOrDescendant(
  * 传视口坐标会报 `No node found at given location`（实测踩过）。
  * in-page 的 elementFromPoint 在 closed shadow 上会把结果 retarget 成宿主元素，
  * 只有这条通道是真实的。
+ *
+ * 滚动量**此刻重取**，不用树里的快照：取树之后页面可能已经滚过（real_click 按 backendNodeId
+ * 定位时会先 scrollIntoViewIfNeeded；提示条出现/消失还会改变可滚动范围，底部整页被顶/放 56px），
+ * 拿旧快照换算出的页面坐标是**另一个点**——回执于是报出别的元素、或者说"那儿什么都没有"，
+ * 而点击用的视口坐标本来是对的（实测踩过：点中闭包里的「发布」，回执报 .main）。
+ * 重取失败就退回快照：宁可略旧，也不能因为一次量不到就把回执整个丢掉。
  */
 export async function hitTestAt(
   send: CdpSend,
@@ -719,8 +725,14 @@ export async function hitTestAt(
   x: number,
   y: number,
 ): Promise<(ElementFacts & { frameId?: string }) | null> {
-  const px = Math.round(x + tree.scroll.x);
-  const py = Math.round(y + tree.scroll.y);
+  const fresh = (await send("Page.getLayoutMetrics").catch(() => null)) as {
+    cssLayoutViewport?: { pageX?: number; pageY?: number };
+  } | null;
+  const lv = fresh?.cssLayoutViewport;
+  const scrollX = typeof lv?.pageX === "number" ? Math.round(lv.pageX) : tree.scroll.x;
+  const scrollY = typeof lv?.pageY === "number" ? Math.round(lv.pageY) : tree.scroll.y;
+  const px = Math.round(x + scrollX);
+  const py = Math.round(y + scrollY);
   let loc: { backendNodeId?: number; frameId?: string } | null = null;
   try {
     loc = (await send("DOM.getNodeForLocation", { x: px, y: py })) as { backendNodeId?: number; frameId?: string };

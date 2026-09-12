@@ -381,7 +381,7 @@ cda send OfficePC click current '{"backendNodeId":4211}' --field "clickDesc,sett
 cda send OfficePC scroll current '{"y": 99999}'
 ```
 
-滚动后等 DOM 稳定再返回，适合配合 `get_text` 提取新加载的内容。
+返回时滚动已经到位、DOM 也已稳定，适合配合 `get_text` 提取新加载的内容。
 
 ### 监听 JS 错误
 
@@ -842,7 +842,7 @@ send <id> hide <tabId>       // 无参数：还原全部被 show 的元素
 
 - 无 `selector`：滚窗口（缺省顶层 / `frame` 指定的 iframe）
 - 有 `selector`：目标元素经 shadow 穿透查找；元素自身可滚动（scrollHeight > clientHeight）时容器内滚动，否则 scrollIntoView
-- 滚动后等 DOM 稳定才返回（事件驱动：DOM 安静 250ms 即放行，无影响约 0.6s，最长 3s 超时兜底，语义同「等影响落地」）
+- **返回时滚动已经落地**（返回的 `scrollX`/`scrollY` 就是终值，不是半路的位置），随后等 DOM 稳定（事件驱动：DOM 安静 250ms 即放行，无影响约 0.6s，最长 3s 超时兜底，语义同「等影响落地」）
 
 ### screenshot
 
