@@ -847,6 +847,14 @@
       }
     });
   }
+  function withStepTimeout(step, ms, p) {
+    return Promise.race([
+      p,
+      new Promise(
+        (_, reject) => setTimeout(() => reject(new Error(`step "${step}" did not settle within ${ms}ms`)), ms)
+      )
+    ]);
+  }
   var ERR_NOT_FOUND = "not-found";
   var ERR_UNREACHABLE = "unreachable-subtree";
   var ERR_CDP = "cdp-unavailable";
@@ -868,15 +876,28 @@
   }
   var INFOBAR_SUPPRESSED_KEY = "debuggerInfobarSuppressed";
   async function settleAttachedViewport(send, tabId) {
-    const flags = await chrome.storage.session.get(INFOBAR_SUPPRESSED_KEY).catch(() => ({}));
-    const suppressed = flags[INFOBAR_SUPPRESSED_KEY] === true;
-    const baseline = suppressed ? null : await inPageViewportHeight(tabId);
-    const wait = await waitViewportStable(send, { inPageViewportH: baseline });
-    if (baseline !== null && wait.sawInfobar === false) {
-      chrome.storage.session.set({ [INFOBAR_SUPPRESSED_KEY]: true }).catch(() => {
-      });
+    const baseline = await inPageViewportHeight(tabId);
+    const flags = await withStepTimeout(
+      "read the infobar-suppression flag",
+      2e3,
+      chrome.storage.session.get(INFOBAR_SUPPRESSED_KEY)
+    ).catch(() => ({}));
+    const suppressed = baseline !== null && flags[INFOBAR_SUPPRESSED_KEY] === true;
+    if (!suppressed) {
+      const wait = await waitViewportStable(send, { inPageViewportH: baseline });
+      if (baseline !== null && wait.sawInfobar === false) {
+        chrome.storage.session.set({ [INFOBAR_SUPPRESSED_KEY]: true }).catch(() => {
+        });
+      }
+      return wait;
     }
-    return wait;
+    const recheck = await waitViewportStable(send, { inPageViewportH: baseline, maxMs: 500 });
+    if (recheck.sawInfobar === true) {
+      chrome.storage.session.remove(INFOBAR_SUPPRESSED_KEY).catch(() => {
+      });
+      return await waitViewportStable(send, { inPageViewportH: baseline });
+    }
+    return { ...recheck, settled: true, sawInfobar: false };
   }
   async function withPiercedTree(tabId, fn) {
     await attachDebugger(tabId);
@@ -919,9 +940,10 @@
       // 页面内通道（get_viewport / list_elements 普通条目 / click {x,y}）是另一个空间。
       // 同一页面里两者对底部/垂直居中/vh 类元素会差一个信息条的高度（实测 56px）。
       viewportCss: tree.viewport,
-      // 信息条**没**出现时（本会话它不会来了，多半被用户关掉），这份几何恰好与页面内通道同空间——
-      // 如实说出来，调用方才知道该拿它配谁（此时配 click {x,y} / get_viewport 是对的）。
-      ...tree.sawInfobar === false ? { viewportNote: "measured with NO debugger infobar (same space as get_viewport / click {x,y}) \u2014 the infobar did not appear in this browser session, so bottom-anchored coordinates here match the in-page channels" } : {},
+      // 这次附加**没**观察到视口变矮（本会话没有信息条，或者它早就浮在那里、这次没再改变什么）：
+      // 此时这份几何与页面内通道恰好同空间——如实说出来，调用方才知道该拿它配谁
+      // （此时配 click {x,y} / get_viewport 是对的）。判据是"没观察到差异"，不是"信息条不存在"。
+      ...tree.sawInfobar === false ? { viewportNote: "measured in the same viewport space as get_viewport / click {x,y} (no debugger-infobar difference observed in this attach) \u2014 bottom-anchored coordinates from the CDP channel and the in-page channels agree here" } : {},
       ...facts.frameUrl ? { frameUrl: facts.frameUrl } : {}
     };
   }
@@ -956,8 +978,15 @@
       inClosedShadowRoot: facts?.inClosedShadowRoot === true
     };
   }
+  var BACKEND_ID_COMMANDS = /* @__PURE__ */ new Set(["get_rect", "get_prop", "get_text", "click"]);
   async function byBackendNodeId(tabId, command, params) {
     const backendNodeId = params.backendNodeId;
+    if (!BACKEND_ID_COMMANDS.has(command)) {
+      return {
+        ok: false,
+        error: `{backendNodeId} is not supported by "${command}" \u2014 it works with get_rect / get_prop / get_text / click / real_click. Closed shadow root nodes have no selector, so commands that need one (type/keyboard/trigger/upload_*) cannot address them; if the element is inside an open shadow root, target it with a ">>>" selector instead`
+      };
+    }
     try {
       return await withPiercedTree(tabId, async (send, tree) => {
         const facts = await describeBackendNode(send, tree, backendNodeId);
@@ -1118,6 +1147,25 @@
       inBody: true,
       children: []
     };
+  }
+  async function moveMouseBounded(tabId, x, y, warnings) {
+    try {
+      await withStepTimeout(`move the mouse to ${x},${y}`, 15e3, moveMouseInSteps(tabId, x, y));
+    } catch (e) {
+      warnings.push(`the mouse move to (${x}, ${y}) did not finish (${e instanceof Error ? e.message : String(e)})`);
+    }
+  }
+  async function activateTabBounded(tabId) {
+    try {
+      const tab = await withStepTimeout("read the tab", 3e3, chrome.tabs.get(tabId));
+      if (tab.windowId != null) {
+        await withStepTimeout("focus the window", 3e3, chrome.windows.update(tab.windowId, { focused: true }));
+      }
+      await withStepTimeout("activate the tab", 3e3, chrome.tabs.update(tabId, { active: true }));
+      return void 0;
+    } catch (e) {
+      return `could not bring the tab to the front (${e instanceof Error ? e.message : String(e)}) \u2014 the action was dispatched anyway; if nothing happened, focus that window/tab and retry`;
+    }
   }
   async function moveMouseInSteps(tabId, tx, ty) {
     const dx = tx - lastMouseX;
@@ -1363,20 +1411,14 @@
     sendResponse(response ?? { success: false, error: "content script \u672A\u8FD4\u56DE\u7ED3\u679C" });
   }
   async function runDebugRealClick(tabId, x, y, chain, sendResponse) {
+    let debugClickWarning;
     try {
       await chrome.debugger.attach({ tabId }, "1.3");
       try {
-        try {
-          const tab = await chrome.tabs.get(tabId);
-          if (tab.windowId != null) {
-            await chrome.windows.update(tab.windowId, { focused: true });
-          }
-          await chrome.tabs.update(tabId, { active: true });
-        } catch {
-        }
+        debugClickWarning = await activateTabBounded(tabId);
         await settleAttachedViewport((method, p, timeoutMs) => cdpSend(tabId, method, p, timeoutMs), tabId);
         const clickPoint = { x, y, button: "left", clickCount: 1 };
-        await moveMouseInSteps(tabId, x, y);
+        await withStepTimeout("move the mouse to the target", 15e3, moveMouseInSteps(tabId, x, y));
         await new Promise((r) => setTimeout(r, 120));
         await cdpSend(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...clickPoint });
         await cdpSend(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...clickPoint });
@@ -1404,7 +1446,7 @@
         sendResponse({ success: false, error: "\u70B9\u51FB\u540E\u6807\u7B7E\u9875\u5DF2\u5173\u95ED\uFF0C\u7ED3\u679C\u672A\u77E5" });
         return;
       }
-      sendResponse({ success: true, data: { x, y, trusted: true, settleLost: true } });
+      sendResponse({ success: true, data: { x, y, trusted: true, settleLost: true, ...debugClickWarning ? { warning: debugClickWarning } : {} } });
       return;
     }
     const settleInfo = settleResp?.data;
@@ -1414,6 +1456,7 @@
         x,
         y,
         trusted: true,
+        ...debugClickWarning ? { warning: debugClickWarning } : {},
         ...settleInfo ? { settled: settleInfo.settled, settledMs: settleInfo.settledMs } : {}
       }
     });
@@ -2584,43 +2627,44 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           break;
         }
       }
-      if (x == null || y == null) {
+      if ((x == null || y == null) && backendNodeId === void 0) {
         sendResult({ success: false, error: `Could not locate element: ${selector || params.text || "unknown"}` });
         return;
       }
-      await chrome.debugger.attach({ tabId }, "1.3");
       const send = (method, p, timeoutMs) => cdpSend(tabId, method, p, timeoutMs);
       let pierced;
       let piercedError;
-      try {
-        await enableDomains(send);
-        await settleAttachedViewport(send, tabId);
-        pierced = await readPiercedTree(send);
-      } catch (e) {
-        piercedError = e instanceof Error ? e.message : String(e);
-      }
-      if (coordsFromInPage && hitFrame) {
-        const r = await sendToFrame(tabId, hitFrame.frameId, {
-          type: "execute_command",
-          payload: { command: "get_rect", params: { selector, text: params.text, scroll: true } }
-        }, 8e3);
-        const d = r.response?.data;
-        if (typeof d?.x === "number" && typeof d?.y === "number") {
-          x = d.x;
-          y = d.y;
-        }
-      }
       let hitDesc;
       let hitUnavailable;
       let urlBeforeClick = "";
+      const clickWarnings = [];
+      await chrome.debugger.attach({ tabId }, "1.3");
       try {
+        try {
+          await withStepTimeout("enable DOM/Runtime domains", 12e3, enableDomains(send));
+          await withStepTimeout("settle the attached viewport", 15e3, settleAttachedViewport(send, tabId));
+          pierced = await withStepTimeout("read the pierced DOM", 12e3, readPiercedTree(send));
+        } catch (e) {
+          piercedError = e instanceof Error ? e.message : String(e);
+        }
+        if (coordsFromInPage && hitFrame) {
+          const r = await sendToFrame(tabId, hitFrame.frameId, {
+            type: "execute_command",
+            payload: { command: "get_rect", params: { selector, text: params.text, scroll: true } }
+          }, 8e3);
+          const d = r.response?.data;
+          if (typeof d?.x === "number" && typeof d?.y === "number") {
+            x = d.x;
+            y = d.y;
+          }
+        }
         if (backendNodeId !== void 0) {
           if (!pierced) {
             sendResult({ success: false, code: ERR_CDP, error: `Cannot resolve backendNodeId ${backendNodeId}: the pierced DOM is unavailable (${piercedError || "unknown"})` });
             return;
           }
-          await scrollIntoView(send, backendNodeId);
-          const box = await boxOf(send, backendNodeId);
+          await withStepTimeout(`scroll backendNodeId ${backendNodeId} into view`, 12e3, scrollIntoView(send, backendNodeId));
+          const box = await withStepTimeout(`measure backendNodeId ${backendNodeId}`, 12e3, boxOf(send, backendNodeId));
           if (!box) {
             sendResult({
               success: false,
@@ -2631,9 +2675,9 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           }
           x = box.centerCss.x;
           y = box.centerCss.y;
-          const facts = await describeBackendNode(send, pierced, backendNodeId);
+          const facts = await withStepTimeout(`describe backendNodeId ${backendNodeId}`, 12e3, describeBackendNode(send, pierced, backendNodeId));
           if (facts?.frameUrl) {
-            const frames = await resolveSearchFrames(tabId, void 0);
+            const frames = await withStepTimeout("resolve the frame tree", 5e3, resolveSearchFrames(tabId, void 0));
             hitFrame = frames.find((f) => f.url === facts.frameUrl);
           }
         } else if (cdpFrameId != null) {
@@ -2645,27 +2689,29 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           x = point.x;
           y = point.y;
         }
-        try {
-          const tab = await chrome.tabs.get(tabId);
-          if (tab.windowId != null) {
-            await chrome.windows.update(tab.windowId, { focused: true });
-          }
-          await chrome.tabs.update(tabId, { active: true });
-        } catch {
+        if (x == null || y == null) {
+          sendResult({
+            success: false,
+            code: ERR_UNREACHABLE,
+            error: `No usable click point for ${selector || params.text || `backendNodeId ${backendNodeId}`}`
+          });
+          return;
         }
+        const activationIssue = await activateTabBounded(tabId);
+        if (activationIssue) clickWarnings.push(activationIssue);
         const clickPoint = { x, y, button: "left", clickCount: 1 };
-        urlBeforeClick = (await chrome.tabs.get(tabId).catch(() => null))?.url || "";
+        urlBeforeClick = (await withStepTimeout("read the tab URL", 3e3, chrome.tabs.get(tabId)).catch(() => null))?.url || "";
         if (approach && approach.length) {
           for (const [ax, ay] of approach) {
-            await moveMouseInSteps(tabId, ax, ay);
+            await moveMouseBounded(tabId, ax, ay, clickWarnings);
             await new Promise((r) => setTimeout(r, 150));
           }
         }
-        await moveMouseInSteps(tabId, x, y);
+        await moveMouseBounded(tabId, x, y, clickWarnings);
         await new Promise((r) => setTimeout(r, approach && approach.length ? 400 : 120));
         if (pierced) {
           try {
-            const hit = await hitTestAt(send, pierced, x, y);
+            const hit = await withStepTimeout("hit-test the click point", 8e3, hitTestAt(send, pierced, x, y));
             if (hit) {
               hitDesc = toHitDescription(hit);
             } else {
@@ -2697,12 +2743,12 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
       }, 8e3);
       const settleInfo = settleResp?.data;
       if (missing) {
-        const tabNow = await chrome.tabs.get(tabId).catch(() => null);
+        const tabNow = await withStepTimeout("read the tab", 3e3, chrome.tabs.get(tabId)).catch(() => null);
         if (!tabNow) {
           sendResult({ success: false, error: "Tab was closed during the real click \u2014 outcome unknown" });
           return;
         }
-        const frames = await getFrameTree(tabId);
+        const frames = await withStepTimeout("resolve the frame tree", 5e3, getFrameTree(tabId));
         const now = frames.find((f) => f.frameId === settleFrameId);
         const navigatedNow = !!beforeUrl && !!tabNow.url && tabNow.url !== beforeUrl || settleFrameId !== 0 && !now || !!now && !!hitFrame?.url && !!now.url && now.url !== hitFrame.url;
         if (navigatedNow) {
@@ -2715,6 +2761,7 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
               settleLost: true,
               navigated: true,
               ...hitDesc ? { hit: hitDesc } : {},
+              ...clickWarnings.length ? { warning: clickWarnings.join("; ") } : {},
               ...params.waitFor ? { waitFor: { settled: false, skipped: "page navigated after the click \u2014 condition not evaluated" } } : {}
             }
           });
@@ -2724,10 +2771,10 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           sendResult({ success: false, error: "waitFor could not be verified: content script unresponsive after the real click (the click itself was dispatched)" });
           return;
         }
-        sendResult({ success: true, data: { x, y, trusted: true, settleLost: true, ...hitDesc ? { hit: hitDesc } : {} } });
+        sendResult({ success: true, data: { x, y, trusted: true, settleLost: true, ...hitDesc ? { hit: hitDesc } : {}, ...clickWarnings.length ? { warning: clickWarnings.join("; ") } : {} } });
         return;
       }
-      const urlAfter = (await chrome.tabs.get(tabId).catch(() => null))?.url || "";
+      const urlAfter = (await withStepTimeout("read the tab URL", 3e3, chrome.tabs.get(tabId)).catch(() => null))?.url || "";
       const navigated = !!beforeUrl && !!urlAfter && urlAfter !== beforeUrl;
       sendResult({
         success: true,
@@ -2740,6 +2787,8 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           ...hitDesc ? { hit: hitDesc } : {},
           // 回执缺失如实上报（CDP 不可用 / 坐标处无节点），不静默省略成"看起来没这功能"
           ...hitUnavailable ? { hitUnavailable } : {},
+          // 链路里非致命但没按预期完成的步骤（窗口激活超时 / 鼠标轨迹没走完）
+          ...clickWarnings.length ? { warning: clickWarnings.join("; ") } : {},
           ...backendNodeId !== void 0 ? { backendNodeId } : {},
           ...settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {} } : {}
         }
@@ -2785,6 +2834,7 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
       return;
     }
     const filename = path.split(/[\\/]/).filter(Boolean).pop() || path;
+    const uploadWarnings = [];
     try {
       if (tabId == null) {
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -2852,15 +2902,9 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           x = point.x;
           y = point.y;
         }
-        try {
-          const tab = await chrome.tabs.get(tabId);
-          if (tab.windowId != null) {
-            await chrome.windows.update(tab.windowId, { focused: true });
-          }
-          await chrome.tabs.update(tabId, { active: true });
-        } catch {
-        }
-        await moveMouseInSteps(tabId, x, y);
+        const activationIssue = await activateTabBounded(tabId);
+        if (activationIssue) uploadWarnings.push(activationIssue);
+        await moveMouseBounded(tabId, x, y, uploadWarnings);
         await new Promise((r) => setTimeout(r, 120));
         const dragData = { files: [path], items: [], dragOperationsMask: 1 };
         await cdpSend(tabId, "Input.dispatchDragEvent", { type: "dragEnter", x, y, data: dragData });
@@ -2881,12 +2925,12 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
       }, 8e3);
       const settleInfo = settleResp?.data;
       if (missing) {
-        const tabNow = await chrome.tabs.get(tabId).catch(() => null);
+        const tabNow = await withStepTimeout("read the tab", 3e3, chrome.tabs.get(tabId)).catch(() => null);
         if (!tabNow) {
           sendResult({ success: false, error: "Tab was closed during the real drop \u2014 outcome unknown" });
           return;
         }
-        const frames = await getFrameTree(tabId);
+        const frames = await withStepTimeout("resolve the frame tree", 5e3, getFrameTree(tabId));
         const now = frames.find((f) => f.frameId === settleFrameId);
         const navigatedNow = !!beforeUrl && !!tabNow.url && tabNow.url !== beforeUrl || settleFrameId !== 0 && !now || !!now && !!hitFrame?.url && !!now.url && now.url !== hitFrame.url;
         if (navigatedNow) {
@@ -2899,6 +2943,7 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
               y,
               trusted: true,
               settleLost: true,
+              ...uploadWarnings.length ? { warning: uploadWarnings.join("; ") } : {},
               ...params.waitFor ? { waitFor: { settled: false, skipped: "page navigated after the drop \u2014 condition not evaluated" } } : {}
             }
           });
@@ -2908,7 +2953,7 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           sendResult({ success: false, error: "waitFor could not be verified: content script unresponsive after the real drop (the drop itself was dispatched)" });
           return;
         }
-        sendResult({ success: true, data: { selector, filename, x, y, trusted: true, settleLost: true } });
+        sendResult({ success: true, data: { selector, filename, x, y, trusted: true, settleLost: true, ...uploadWarnings.length ? { warning: uploadWarnings.join("; ") } : {} } });
         return;
       }
       sendResult({
@@ -2919,6 +2964,7 @@ ${detail.stack.split("\n").slice(0, 4).join("\n")}` : "";
           x,
           y,
           trusted: true,
+          ...uploadWarnings.length ? { warning: uploadWarnings.join("; ") } : {},
           ...settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {} } : {}
         }
       });

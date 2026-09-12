@@ -212,8 +212,9 @@ Web Components 站点（小红书创作后台等）把按钮/编辑器包在 sha
 - **closed shadow root 走 CDP 通道**（v0.28 起）：`attachShadow({mode:"closed"})` 造的子树对**页面内的一切**都不可见——不只 cda，`exec` 注入的任意 JS（`document.querySelector`）同样看不见它（这正是不该用 `exec` 当常规解法的原因之一：它在主世界跑，一样穿不进闭包）。cda 改为在协议层重查：
   - `list_elements {"closed": true}` —— 枚举闭包内的可交互元素（带 `backendNodeId`，无 `selector`）
   - `get_rect` —— 页面内通道全 frame 都报 notFound 时**自动**走 CDP 重查，命中即返回真值（无需开关）
-  - `click` / `real_click` / `get_prop` / `get_text` —— 接受 `{"backendNodeId": N}` 直接操作闭包内元素
+  - `click` / `real_click` / `get_rect` / `get_prop` / `get_text` —— 接受 `{"backendNodeId": N}` 直接操作闭包内元素
   - `real_click` 的 `hit` 回执同样走 CDP 命中测试，闭包内**不会被 retarget 成宿主**
+  - **不接受的命令会明确报错，不会静默兜底**：`type` / `keyboard` / `trigger` / `upload_*` 这类**需要选择器**的命令拿到 `backendNodeId` 会直接返回错误并列出可用命令——闭包内拿不到选择器，这些动作对闭包节点本来就无从下手，宁可报错也不给一份看着正常、其实什么都没做的返回。要输入闭包内的输入框：open shadow root 用 `>>>` 选择器；真闭包暂不支持输入
 - **边界（已知且明确）**：穿透覆盖顶层 frame 与**同源** iframe；跨域 OOPIF 内的闭包需要目标进程单独附加，当前未覆盖——真遇到时按 `not-found` 处理，用坐标兜底并在脚本里断言 `hit`
 - `get_page_info --field html` 的 html **默认包含 shadow DOM 内容**：open shadow root 以内联 `<template shadowrootmode="open">` 形式出现在宿主元素里；无 shadow 的页面输出与之前完全一致。**closed shadow root 不在 html 里**（浏览器不暴露其内容）
 
@@ -520,6 +521,7 @@ cda send OfficePC get_text current '{"selector":"table"}'
 - 命中测试走 CDP 协议层，**在 shadow root 内依然真实**——页面内 `elementFromPoint` 遇到 shadow 只会返回宿主元素，问不出闭包里的按钮
 - 于是脚本可以这样自保：点到「暂存离开」= 坐标算错 → **立即中止**，不再糊里糊涂中断发布流程
 - `hitUnavailable` 字段说明 `hit` 缺失的原因（如命中点不在任何可描述节点上）
+- `warning?` 只在链路里**非致命但没按预期完成**的步骤出现（窗口不可聚焦导致激活挂起被放弃、鼠标轨迹没走完）——点击照常派发，但"点了却没反应"时先看这里，它把原因写明了（`upload_dragdrop trusted` 同样有这个字段）
 - `navigated` 由点击前后的真实 URL 对比得出（click/real_click 都报），`settledMs` 是等页面稳定实际花掉的毫秒数
 
 给坐标前先用 `get_rect` 拿 `centerCss`，这是唯一不会错位的取坐标方式：
@@ -774,6 +776,7 @@ send <id> get_viewport <tab>        # 只读，不开 debugger
 - **元素范围**：可点击/可输入的常见元素（button/a/select/textarea/input/label、富文本编辑区、tabindex、常见交互 role），**穿透 open shadow DOM**；被 CSS 隐藏的（如 display:none 的 tab 页里的 file input）也会列出（`visible: false`）
 - **`{closed:true}` 列出 closed shadow root 内的元素**（**默认关闭，不开时输出与之前逐字一致**）：这类元素对**所有页面内通道都是「不存在」**的——`document.querySelector`、open-shadow 穿透、in-page 枚举全都看不到它们，但这不等于元素不在。开启后走 CDP 协议层枚举，条目**排在列表最前**（防止 `max` 把整块能力静默截掉），带 `backendNodeId` + `inClosedShadowRoot: true` 但**没有 `selector`**（闭包内拼不出稳定选择器，这是浏览器的设计而非 cda 的偷懒）
 - **怎么用这类条目**：把 `backendNodeId` 直接喂给 `click` / `real_click` / `get_rect` / `get_prop` / `get_text`，形成「枚举 → 核对 → 量矩形 → 下手」的闭环，全程不碰坐标也不碰截图
+- **边界**：能用 `backendNodeId` 的就是上面这五个命令。**`type` / `keyboard` / `trigger` / `upload_*` 拿到 `backendNodeId` 会明确报错**（不是静默忽略参数，也不是退化成量矩形）——它们要靠选择器才能定位到输入对象，闭包节点没有选择器，所以闭包内的输入框/上传控件暂不支持；这类元素若在 **open** shadow root 里，用 `>>>` 选择器即可
 - 闭包条目的 `x/y` 是在**附加态视口**（多一条 debugger 信息条，见「坐标口径」）里量的，与同一份返回里页面内条目的 `x/y` 不是同一空间——底部锚定的元素会差一条信息条的高度。**要动手就用 `backendNodeId`**（命令自己会在动手时重新量），别把这类坐标跨界喂给 `click {x,y}`
 - 返回 `closedCount`（闭包内元素条数）；闭包那一趟没跑成时 `closedError` 说明原因——**不会静默报 0**；若截断丢掉了闭包条目，`warning` 会写明丢了几条
 - **`selector` 由 cda 自动生成**，**可直接喂给 click/type/upload_file 等任何命令**；shadow 内的元素会带 `>>>` 连接符

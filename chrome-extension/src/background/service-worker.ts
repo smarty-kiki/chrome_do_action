@@ -77,6 +77,22 @@ function cdpSend(tabId: number, method: string, params?: Record<string, unknown>
   });
 }
 
+/**
+ * 给「可能永远不 settle 的 await」加一个上限。
+ * 部分 Chrome 扩展 API（`chrome.windows.update({focused:true})` / `chrome.tabs.update({active:true})`
+ * 在窗口不可聚焦、标签正在拖动一类的场景）会**既不 resolve 也不 reject**，一直挂在 pending 上——
+ * try/catch 抓不到挂起，只有 race 能把它变成一条**带步骤名**的错误。
+ * 超时只是放弃等待（底层操作无法取消），所以只给「失败可接受」或「超时必须失败」的步骤用。
+ */
+function withStepTimeout<T>(step: string, ms: number, p: Promise<T>): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`step "${step}" did not settle within ${ms}ms`)), ms),
+    ),
+  ]);
+}
+
 // ─────────── CDP 兜底通道（不可寻址子树的唯一出路；只读命令用）───────────
 //
 // 页面内通道（content script）对 closed shadow root 完全不可见——不是权限问题，
@@ -125,22 +141,43 @@ const INFOBAR_SUPPRESSED_KEY = "debuggerInfobarSuppressed";
  * 紧接着的 `screenshot` 量到 693；调用方拿 717 去 `real_click`，派发时按钮已上移到 645..677，
  * 于是"成功返回、按钮不动"。给对照高度后，命令会等视口真的变矮（信息条出现）才认这份几何。
  *
- * 代价：每条 CDP 命令多一次页面内往返（几毫秒）。对照高度拿不到、或本会话已确认等不到
- * 信息条时，退回「只等安定」，行为与之前一致。
+ * 代价：每条 CDP 命令多一次页面内往返（几毫秒）。对照高度拿不到时退回「只等安定」，
+ * 行为与之前一致（此时也如实回报 sawInfobar 缺席，而不是猜一个值）。
+ *
+ * 对照高度**每次都量**，哪怕记忆里说"本会话没有信息条"——它是判断这份几何落在哪个
+ * 视口空间的唯一依据，省掉它就只能给出一个不确定的 sawInfobar（实测过：那样返回里
+ * 的 viewportNote 会消失，调用方反而不知道两个空间是不是重合）。
+ * 有记忆时只做一次短核验：真看到变矮就说明记忆过期了，撤掉记忆、走正常等待。
  */
 async function settleAttachedViewport(send: CdpSend, tabId: number): Promise<ViewportWait> {
-  const flags = await chrome.storage.session
-    .get(INFOBAR_SUPPRESSED_KEY)
-    .catch(() => ({} as Record<string, unknown>));
-  const suppressed = (flags as Record<string, unknown>)[INFOBAR_SUPPRESSED_KEY] === true;
-  const baseline = suppressed ? null : await inPageViewportHeight(tabId);
-  const wait = await waitViewportStable(send, { inPageViewportH: baseline });
-  if (baseline !== null && wait.sawInfobar === false) {
-    // 等了 2.5s 视口都没变矮：本会话大概率不会再有信息条了（用户关掉过）。
-    // 记一笔，后续命令不必每条都白等——反正整个会话都量在同一个（无信息条的）空间里。
-    chrome.storage.session.set({ [INFOBAR_SUPPRESSED_KEY]: true }).catch(() => {});
+  const baseline = await inPageViewportHeight(tabId);
+  // storage 也要带上限：这是 attach 之后的步骤，挂在这里同样会把 debugger 留在附着态
+  const flags = await withStepTimeout(
+    "read the infobar-suppression flag",
+    2000,
+    chrome.storage.session.get(INFOBAR_SUPPRESSED_KEY),
+  ).catch(() => ({} as Record<string, unknown>));
+  // 拿不到对照高度就无从判断信息条，记忆帮不上忙：回退到「只等安定」
+  const suppressed =
+    baseline !== null && (flags as Record<string, unknown>)[INFOBAR_SUPPRESSED_KEY] === true;
+  if (!suppressed) {
+    const wait = await waitViewportStable(send, { inPageViewportH: baseline });
+    if (baseline !== null && wait.sawInfobar === false) {
+      // 等了 2.5s 视口都没变矮：本会话大概率不会再有信息条了（用户关掉过）。
+      // 记一笔，后续命令不必每条都白等——反正整个会话都量在同一个（无信息条的）空间里。
+      chrome.storage.session.set({ [INFOBAR_SUPPRESSED_KEY]: true }).catch(() => {});
+    }
+    return wait;
   }
-  return wait;
+  const recheck = await waitViewportStable(send, { inPageViewportH: baseline, maxMs: 500 });
+  if (recheck.sawInfobar === true) {
+    // 记忆说没有信息条、实际却变矮了：记忆过期，撤掉它并按正常路径重新等
+    chrome.storage.session.remove(INFOBAR_SUPPRESSED_KEY).catch(() => {});
+    return await waitViewportStable(send, { inPageViewportH: baseline });
+  }
+  // 核验期内读数一致、也没看到变矮：确认这份几何与页面内通道同空间，
+  // 明确给 sawInfobar:false 让下游带出 viewportNote（不是含糊的 undefined）
+  return { ...recheck, settled: true, sawInfobar: false };
 }
 
 /**
@@ -209,10 +246,11 @@ async function rectPayloadFromFacts(
     // 页面内通道（get_viewport / list_elements 普通条目 / click {x,y}）是另一个空间。
     // 同一页面里两者对底部/垂直居中/vh 类元素会差一个信息条的高度（实测 56px）。
     viewportCss: tree.viewport,
-    // 信息条**没**出现时（本会话它不会来了，多半被用户关掉），这份几何恰好与页面内通道同空间——
-    // 如实说出来，调用方才知道该拿它配谁（此时配 click {x,y} / get_viewport 是对的）。
+    // 这次附加**没**观察到视口变矮（本会话没有信息条，或者它早就浮在那里、这次没再改变什么）：
+    // 此时这份几何与页面内通道恰好同空间——如实说出来，调用方才知道该拿它配谁
+    // （此时配 click {x,y} / get_viewport 是对的）。判据是"没观察到差异"，不是"信息条不存在"。
     ...(tree.sawInfobar === false
-      ? { viewportNote: "measured with NO debugger infobar (same space as get_viewport / click {x,y}) — the infobar did not appear in this browser session, so bottom-anchored coordinates here match the in-page channels" }
+      ? { viewportNote: "measured in the same viewport space as get_viewport / click {x,y} (no debugger-infobar difference observed in this attach) — bottom-anchored coordinates from the CDP channel and the in-page channels agree here" }
       : {}),
     ...(facts.frameUrl ? { frameUrl: facts.frameUrl } : {}),
   };
@@ -275,12 +313,26 @@ function identityOf(facts: ElementFacts | null, backendNodeId: number): Record<s
  * 页面内通道对它无解——backendNodeId 是唯一能跨越闭包的寻址方式。
  * 返回形状与同名页面内命令保持一致，调用方在两条通道间切换不用改解析代码。
  */
+/** 能用 backendNodeId 定位的命令（real_click 在自己那条路径里单独处理）。其余命令给了这个参数必须报错 */
+const BACKEND_ID_COMMANDS = new Set(["get_rect", "get_prop", "get_text", "click"]);
+
 async function byBackendNodeId(
   tabId: number,
   command: string,
   params: Record<string, unknown>,
 ): Promise<CommandOutcome> {
   const backendNodeId = params.backendNodeId as number;
+  // 不做静默兜底：曾经这里对不支持的命令一路落到末尾的 get_rect 分支，于是 `type {backendNodeId}`
+  // 会返回一份看似正常的矩形、实际什么都没输入——静默假成功比报错危险得多
+  if (!BACKEND_ID_COMMANDS.has(command)) {
+    return {
+      ok: false as const,
+      error:
+        `{backendNodeId} is not supported by "${command}" — it works with get_rect / get_prop / get_text / click / real_click. ` +
+        `Closed shadow root nodes have no selector, so commands that need one (type/keyboard/trigger/upload_*) cannot address them; ` +
+        `if the element is inside an open shadow root, target it with a ">>>" selector instead`,
+    };
+  }
   try {
     return await withPiercedTree(tabId, async (send, tree) => {
       const facts = await describeBackendNode(send, tree, backendNodeId);
@@ -455,6 +507,41 @@ function syntheticTarget(backendNodeId: number): PiercedElement {
     nodeId: 0, backendNodeId, tag: "", nodeName: "", attributes: {},
     inClosedShadowRoot: false, text: "", visibleText: "", inBody: true, children: [],
   };
+}
+
+/**
+ * 渐进移动 + 整条轨迹的墙钟上限。moveMouseInSteps 每一步的 CDP 调用各自有 10s 上限，
+ * 但步数一多（目标离上次鼠标位置很远时最多上百步）累加同样能吃掉 server 的 60s 预算。
+ * 超时不算失败：鼠标位置只是 hover 链的铺垫，真正落到哪由显式 x/y 决定，
+ * 所以如实记一条 warning 后继续按下（不静默）。
+ */
+async function moveMouseBounded(tabId: number, x: number, y: number, warnings: string[]): Promise<void> {
+  try {
+    await withStepTimeout(`move the mouse to ${x},${y}`, 15000, moveMouseInSteps(tabId, x, y));
+  } catch (e) {
+    warnings.push(`the mouse move to (${x}, ${y}) did not finish (${e instanceof Error ? e.message : String(e)})`);
+  }
+}
+
+/**
+ * 激活窗口/tab（CDP 需窗口在前台才触发页面交互），**每一步都带上限**。
+ * chrome.windows.update({focused:true}) / chrome.tabs.update({active:true}) 在窗口不可聚焦
+ * （用户在别的 Space / 全屏应用里、标签正在拖动）时会一直停在 pending 上——不 reject，所以
+ * try/catch 抓不到。这类挂起过去的代价是：吃掉 server 的 60s 预算，并把 debugger 留在附着态
+ * （之后该 tab 的所有 CDP 命令都报 "Another debugger is already attached"，只能重载扩展解开）。
+ * 激活失败/超时不阻断点击或拖放本身，返回一行说明交给调用方如实上报（成功则返回 undefined）。
+ */
+async function activateTabBounded(tabId: number): Promise<string | undefined> {
+  try {
+    const tab = await withStepTimeout("read the tab", 3000, chrome.tabs.get(tabId));
+    if (tab.windowId != null) {
+      await withStepTimeout("focus the window", 3000, chrome.windows.update(tab.windowId, { focused: true }));
+    }
+    await withStepTimeout("activate the tab", 3000, chrome.tabs.update(tabId, { active: true }));
+    return undefined;
+  } catch (e) {
+    return `could not bring the tab to the front (${e instanceof Error ? e.message : String(e)}) — the action was dispatched anyway; if nothing happened, focus that window/tab and retry`;
+  }
 }
 
 async function moveMouseInSteps(tabId: number, tx: number, ty: number): Promise<void> {
@@ -796,23 +883,19 @@ async function runDebugRealClick(
 ): Promise<void> {
   // 复用远程 real_click 的 CDP 序列（attach → 激活窗口/tab → 渐进移动 → 停留 → 按下/松开）。
   // debugger attach 会显示"正在调试此浏览器"提示条——与远程 real_click 一致的已知表现。
+  let debugClickWarning: string | undefined;
   try {
     await chrome.debugger.attach({ tabId }, "1.3");
     try {
-      try {
-        const tab = await chrome.tabs.get(tabId);
-        if (tab.windowId != null) {
-          await chrome.windows.update(tab.windowId, { focused: true });
-        }
-        await chrome.tabs.update(tabId, { active: true });
-      } catch {
-        // 窗口激活失败不阻断，继续尝试点击
-      }
+      // 激活窗口/tab：带上限（挂起会把 debugger 留在附着态，见 activateTabBounded）。
+      // 这条调试链路的输入是浮层里手填的坐标，激活没成功时必须让用户看见——所以把说明并进结果
+      debugClickWarning = await activateTabBounded(tabId);
       // 等视口安定再按下（浮层是页面内画的坐标，附加态视口比它量的时候矮一条信息条；
       // 顶部锚定的静态内容不受影响，底部锚定/vh 类元素会差这一个信息条的高度——如实记在这）
       await settleAttachedViewport((method, p, timeoutMs) => cdpSend(tabId, method, p, timeoutMs), tabId);
       const clickPoint = { x, y, button: "left" as const, clickCount: 1 };
-      await moveMouseInSteps(tabId, x, y);
+      // 整条轨迹带上限（每步各自有 10s CDP 上限，步数一多累加同样能吃掉 60s 预算）
+      await withStepTimeout("move the mouse to the target", 15000, moveMouseInSteps(tabId, x, y));
       // 短暂停留让 hover/样式生效（与远程路径的 120ms 一致）
       await new Promise((r) => setTimeout(r, 120));
       await cdpSend(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...clickPoint });
@@ -844,7 +927,7 @@ async function runDebugRealClick(
       sendResponse({ success: false, error: "点击后标签页已关闭，结果未知" });
       return;
     }
-    sendResponse({ success: true, data: { x, y, trusted: true, settleLost: true } });
+    sendResponse({ success: true, data: { x, y, trusted: true, settleLost: true, ...(debugClickWarning ? { warning: debugClickWarning } : {}) } });
     return;
   }
   const settleInfo = settleResp?.data as { settled?: boolean; settledMs?: number } | undefined;
@@ -852,6 +935,7 @@ async function runDebugRealClick(
     success: true,
     data: {
       x, y, trusted: true,
+      ...(debugClickWarning ? { warning: debugClickWarning } : {}),
       ...(settleInfo ? { settled: settleInfo.settled, settledMs: settleInfo.settledMs } : {}),
     },
   });
@@ -2406,26 +2490,39 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         break;
       }
     }
-    if (x == null || y == null) {
+    // backendNodeId 例外：闭包内节点在页面内寻址不到，坐标只能等 attach 后从穿刺树取（见 2.1a），
+    // 所以这里不能因为「x/y 还没拿到」就提前失败
+    if ((x == null || y == null) && backendNodeId === undefined) {
       sendResult({ success: false, error: `Could not locate element: ${selector || params.text || "unknown"}` });
       return;
     }
 
-    // 2. 附加 debugger
-    await chrome.debugger.attach({ tabId }, "1.3");
-    // 命中回执（hit）与 backendNodeId 定位都要用穿刺树。取树失败**不阻断点击**——
-    // 回执缺失要如实上报（hitUnavailable），绝不能让它变成点击失败
     const send: CdpSend = (method, p, timeoutMs) => cdpSend(tabId!, method, p, timeoutMs);
     let pierced: PiercedTree | undefined;
     let piercedError: string | undefined;
+    let hitDesc: Record<string, unknown> | undefined;
+    let hitUnavailable: string | undefined;
+    let urlBeforeClick = ""; // 导航判定的基准：必须是**按下之前**的 URL
+    // 点击链路上「非致命但没按预期完成」的步骤（激活窗口超时、鼠标轨迹没走完…）：
+    // 不阻断点击，但必须如实带出去，否则"点成功了但页面没反应"就无从归因
+    const clickWarnings: string[] = [];
+    // 2. 附加 debugger —— 从这里到点击派发结束（2.1a 定位 → 3.x 鼠标事件）是一个整体：
+    //    无论中间哪一步报错**或挂起超时**，finally 都必须把 debugger 释放掉。
+    //    残留附着会把该 tab 的 CDP 通道锁死（之后所有命令都报 "Another debugger is already
+    //    attached"，只有重载扩展 / 重启 Chrome 能解开）——实测踩过一次：附加本身成功、
+    //    后面某步一直不 settle，整条通道就废了。所以 attach 必须在 try 里面。
+    await chrome.debugger.attach({ tabId }, "1.3");
     try {
-      await enableDomains(send);
-      // 先等信息条出现并安定，再量坐标 / 取树——量到的和点到的是同一个视口
-      await settleAttachedViewport(send, tabId);
-      pierced = await readPiercedTree(send);
-    } catch (e) {
-      piercedError = e instanceof Error ? e.message : String(e);
-    }
+      // 命中回执（hit）与 backendNodeId 定位都要用穿刺树。取树失败**不阻断点击**——
+      // 回执缺失要如实上报（hitUnavailable），绝不能让它变成点击失败
+      try {
+        await withStepTimeout("enable DOM/Runtime domains", 12000, enableDomains(send));
+        // 先等信息条出现并安定，再量坐标 / 取树——量到的和点到的是同一个视口
+        await withStepTimeout("settle the attached viewport", 15000, settleAttachedViewport(send, tabId));
+        pierced = await withStepTimeout("read the pierced DOM", 12000, readPiercedTree(send));
+      } catch (e) {
+        piercedError = e instanceof Error ? e.message : String(e);
+      }
     // 2.0 页面内量出来的坐标必须在**附加态视口**里重量一次（见 coordsFromInPage 的由来）。
     //     重量走同一个页面内通道即可：它现在跑在信息条已经占位的布局里，给出的就是附加态坐标。
     //     量不到（元素在附加后消失/移位到不可见）就如实报错，不拿旧坐标硬点。
@@ -2440,18 +2537,14 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         y = d.y;
       }
     }
-    let hitDesc: Record<string, unknown> | undefined;
-    let hitUnavailable: string | undefined;
-    let urlBeforeClick = ""; // 导航判定的基准：必须是**按下之前**的 URL
-    try {
       // 2.1a backendNodeId（闭包内节点）：滚进视口 → 取 quad 中心（顶层视口坐标，与 real_click {x,y} 同口径）
       if (backendNodeId !== undefined) {
         if (!pierced) {
           sendResult({ success: false, code: ERR_CDP, error: `Cannot resolve backendNodeId ${backendNodeId}: the pierced DOM is unavailable (${piercedError || "unknown"})` });
           return;
         }
-        await scrollIntoView(send, backendNodeId);
-        const box = await boxOf(send, backendNodeId);
+        await withStepTimeout(`scroll backendNodeId ${backendNodeId} into view`, 12000, scrollIntoView(send, backendNodeId));
+        const box = await withStepTimeout(`measure backendNodeId ${backendNodeId}`, 12000, boxOf(send, backendNodeId));
         if (!box) {
           sendResult({
             success: false, code: ERR_UNREACHABLE,
@@ -2462,9 +2555,10 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         x = box.centerCss.x;
         y = box.centerCss.y;
         // settle / frame 归属：按事实里的 frameUrl 找到对应 frame（找不到就退回顶层）
-        const facts = await describeBackendNode(send, pierced, backendNodeId);
+        const facts = await withStepTimeout(`describe backendNodeId ${backendNodeId}`, 12000, describeBackendNode(send, pierced, backendNodeId));
         if (facts?.frameUrl) {
-          const frames = await resolveSearchFrames(tabId, undefined);
+          // 帧树来自 chrome.webNavigation（扩展 API，不在 cdpSend 的超时覆盖内）：同样带上限
+          const frames = await withStepTimeout("resolve the frame tree", 5000, resolveSearchFrames(tabId, undefined));
           hitFrame = frames.find((f) => f.url === facts.frameUrl);
         }
       } else if (cdpFrameId != null) {
@@ -2476,33 +2570,37 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         x = point.x;
         y = point.y;
       }
-      // 2.2 激活窗口和标签页（CDP 鼠标事件需要窗口在前台才触发页面交互）
-      try {
-        const tab = await chrome.tabs.get(tabId);
-        if (tab.windowId != null) {
-          await chrome.windows.update(tab.windowId, { focused: true });
-        }
-        await chrome.tabs.update(tabId, { active: true });
-      } catch {
-        // 窗口激活失败不阻断，继续尝试点击
+      // 到这里点击坐标必然已确定（前面那条 guard 与两条定位分支共同保证）。显式收窄一次：
+      // 万一真有路径漏了点，如实报错，绝不带着 undefined 去 dispatch（那会静默点到 0,0）
+      if (x == null || y == null) {
+        sendResult({
+          success: false, code: ERR_UNREACHABLE,
+          error: `No usable click point for ${selector || params.text || `backendNodeId ${backendNodeId}`}`,
+        });
+        return;
       }
+      // 2.2 激活窗口和标签页（CDP 鼠标事件需要窗口在前台才触发页面交互）。
+      //     这一步是**已知会挂起**的（见 activateTabBounded）：超时/失败不阻断点击，
+      //     但必须如实记一条 warning 带出去，否则"点成功但页面没反应"就无从归因。
+      const activationIssue = await activateTabBounded(tabId);
+      if (activationIssue) clickWarnings.push(activationIssue);
       // 3. 发送完整真实鼠标事件序列（模拟真实物理点击的事件链）
       //    真实点击：mouseover/mouseenter（由 mouseMoved 触发）-> mousedown -> mouseup -> click
       //    CDP 的 mousePressed+mouseReleased 会自动产生 click，无需显式发 click
       const clickPoint = { x, y, button: "left" as const, clickCount: 1 };
 
       // 导航基准：按下前抓（点击瞬间就跳转的页面，点后再抓就已经是新 URL 了）
-      urlBeforeClick = (await chrome.tabs.get(tabId).catch(() => null))?.url || "";
+      urlBeforeClick = (await withStepTimeout("read the tab URL", 3000, chrome.tabs.get(tabId)).catch(() => null))?.url || "";
 
       // 3.0 渐进移动到 approach 路径各点（模拟真实鼠标轨迹，逐级触发 hover）
       if (approach && approach.length) {
         for (const [ax, ay] of approach) {
-          await moveMouseInSteps(tabId, ax, ay);
+          await moveMouseBounded(tabId, ax, ay, clickWarnings);
           await new Promise((r) => setTimeout(r, 150));
         }
       }
       // 3.1 鼠标渐进移动到元素中心（触发 mouseover/mouseenter/mousemove，激活 hover 状态）
-      await moveMouseInSteps(tabId, x, y);
+      await moveMouseBounded(tabId, x, y, clickWarnings);
       // 3.2 短暂停留，让 hover/样式生效（有 approach 时等 popover 展开）
       await new Promise((r) => setTimeout(r, approach && approach.length ? 400 : 120));
       // 3.25 命中回执：在鼠标按下**之前**问协议层「这个坐标下面到底是谁」。
@@ -2510,7 +2608,7 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
       // 也只能在协议层问：in-page 的 elementFromPoint 对 shadow 一律 retarget 成宿主，答不出真话
       if (pierced) {
         try {
-          const hit = await hitTestAt(send, pierced, x, y);
+          const hit = await withStepTimeout("hit-test the click point", 8000, hitTestAt(send, pierced, x, y));
           if (hit) {
             hitDesc = toHitDescription(hit);
           } else {
@@ -2552,12 +2650,12 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
     if (missing) {
       // settle 阶段与 CS 失联：点击本身（CDP trusted）已确定执行，失联只影响 settle/waitFor
       // 确认——核实 tab/frame 状态，按证实过的给结论，不编造 settle 结果
-      const tabNow = await chrome.tabs.get(tabId).catch(() => null);
+      const tabNow = await withStepTimeout("read the tab", 3000, chrome.tabs.get(tabId)).catch(() => null);
       if (!tabNow) {
         sendResult({ success: false, error: "Tab was closed during the real click — outcome unknown" });
         return;
       }
-      const frames = await getFrameTree(tabId);
+      const frames = await withStepTimeout("resolve the frame tree", 5000, getFrameTree(tabId));
       const now = frames.find((f) => f.frameId === settleFrameId);
       // frame 级导航判断（空 URL 不比较，避免 about:blank 假阳性）
       const navigatedNow =
@@ -2571,6 +2669,7 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
           data: {
             x, y, trusted: true, settleLost: true, navigated: true,
             ...(hitDesc ? { hit: hitDesc } : {}),
+            ...(clickWarnings.length ? { warning: clickWarnings.join("; ") } : {}),
             ...(params.waitFor ? { waitFor: { settled: false, skipped: "page navigated after the click — condition not evaluated" } } : {}),
           },
         });
@@ -2581,13 +2680,13 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         sendResult({ success: false, error: "waitFor could not be verified: content script unresponsive after the real click (the click itself was dispatched)" });
         return;
       }
-      sendResult({ success: true, data: { x, y, trusted: true, settleLost: true, ...(hitDesc ? { hit: hitDesc } : {}) } });
+      sendResult({ success: true, data: { x, y, trusted: true, settleLost: true, ...(hitDesc ? { hit: hitDesc } : {}), ...(clickWarnings.length ? { warning: clickWarnings.join("; ") } : {}) } });
       return;
     }
 
     // CS 正常响应：settle 结果（含 waitFor 谓词结果）如实透传
     // navigated 用**点击前**抓的 URL 比对（同一 thread 内最可靠的一条导航证据）
-    const urlAfter = (await chrome.tabs.get(tabId).catch(() => null))?.url || "";
+    const urlAfter = (await withStepTimeout("read the tab URL", 3000, chrome.tabs.get(tabId)).catch(() => null))?.url || "";
     const navigated = !!beforeUrl && !!urlAfter && urlAfter !== beforeUrl;
     sendResult({
       success: true,
@@ -2597,6 +2696,8 @@ async function handleRealClick(cmd: CommandMessage): Promise<void> {
         ...(hitDesc ? { hit: hitDesc } : {}),
         // 回执缺失如实上报（CDP 不可用 / 坐标处无节点），不静默省略成"看起来没这功能"
         ...(hitUnavailable ? { hitUnavailable } : {}),
+        // 链路里非致命但没按预期完成的步骤（窗口激活超时 / 鼠标轨迹没走完）
+        ...(clickWarnings.length ? { warning: clickWarnings.join("; ") } : {}),
         ...(backendNodeId !== undefined ? { backendNodeId } : {}),
         ...(settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...(settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {}) } : {}),
       },
@@ -2662,6 +2763,8 @@ async function handleTrustedDrop(cmd: CommandMessage): Promise<void> {
   }
   // 文件名取自路径 basename（真实文件拖入的语义；Windows 盘符路径按 / 和 \ 都切）
   const filename = path.split(/[\\/]/).filter(Boolean).pop() || path;
+  // 拖放链路上「非致命但没按预期完成」的步骤（激活窗口超时、鼠标轨迹没走完…）：如实带出去
+  const uploadWarnings: string[] = [];
 
   try {
     // tabId 为空时回退到当前激活 tab（server 对 "current" 不传 tabId），与页面级命令一致
@@ -2742,21 +2845,15 @@ async function handleTrustedDrop(cmd: CommandMessage): Promise<void> {
         y = point.y;
       }
       // 2.2 激活窗口和标签页（CDP 拖放需要窗口在前台才触发页面交互）
-      try {
-        const tab = await chrome.tabs.get(tabId);
-        if (tab.windowId != null) {
-          await chrome.windows.update(tab.windowId, { focused: true });
-        }
-        await chrome.tabs.update(tabId, { active: true });
-      } catch {
-        // 窗口激活失败不阻断，继续尝试拖放
-      }
+      //     与 real_click 同款：这一步会挂起，挂起会把 debugger 留在附着态（见 activateTabBounded）
+      const activationIssue = await activateTabBounded(tabId);
+      if (activationIssue) uploadWarnings.push(activationIssue);
       // 3. 发送 CDP 真实拖放序列
       //    真实拖入：鼠标先到目标点（渐进移动触发 hover 链），dragEnter 后页面放置层
       //    （微信媒体库的全屏放置层等）随事件挂载——事件间留间隙，drop 落在哪由页面
       //    hit-test 决定，与真人拖入同构。dragData.files = 磁盘绝对路径（items 空数组），
       //    浏览器在 drop 时按路径构造 File，事件 isTrusted=true。
-      await moveMouseInSteps(tabId, x, y);
+      await moveMouseBounded(tabId, x, y, uploadWarnings);
       await new Promise((r) => setTimeout(r, 120));
       const dragData = { files: [path], items: [], dragOperationsMask: 1 }; // 1 = copy
       await cdpSend(tabId, "Input.dispatchDragEvent", { type: "dragEnter", x, y, data: dragData });
@@ -2784,12 +2881,12 @@ async function handleTrustedDrop(cmd: CommandMessage): Promise<void> {
     if (missing) {
       // settle 阶段与 CS 失联：拖放本身（CDP trusted）已确定执行，失联只影响 settle/waitFor
       // 确认——核实 tab/frame 状态，按证实过的给结论，不编造 settle 结果
-      const tabNow = await chrome.tabs.get(tabId).catch(() => null);
+      const tabNow = await withStepTimeout("read the tab", 3000, chrome.tabs.get(tabId)).catch(() => null);
       if (!tabNow) {
         sendResult({ success: false, error: "Tab was closed during the real drop — outcome unknown" });
         return;
       }
-      const frames = await getFrameTree(tabId);
+      const frames = await withStepTimeout("resolve the frame tree", 5000, getFrameTree(tabId));
       const now = frames.find((f) => f.frameId === settleFrameId);
       // frame 级导航判断（空 URL 不比较，避免 about:blank 假阳性）
       const navigatedNow =
@@ -2804,6 +2901,7 @@ async function handleTrustedDrop(cmd: CommandMessage): Promise<void> {
             selector,
             filename,
             x, y, trusted: true, settleLost: true,
+            ...(uploadWarnings.length ? { warning: uploadWarnings.join("; ") } : {}),
             ...(params.waitFor ? { waitFor: { settled: false, skipped: "page navigated after the drop — condition not evaluated" } } : {}),
           },
         });
@@ -2814,7 +2912,7 @@ async function handleTrustedDrop(cmd: CommandMessage): Promise<void> {
         sendResult({ success: false, error: "waitFor could not be verified: content script unresponsive after the real drop (the drop itself was dispatched)" });
         return;
       }
-      sendResult({ success: true, data: { selector, filename, x, y, trusted: true, settleLost: true } });
+      sendResult({ success: true, data: { selector, filename, x, y, trusted: true, settleLost: true, ...(uploadWarnings.length ? { warning: uploadWarnings.join("; ") } : {}) } });
       return;
     }
 
@@ -2825,6 +2923,7 @@ async function handleTrustedDrop(cmd: CommandMessage): Promise<void> {
         selector,
         filename,
         x, y, trusted: true,
+        ...(uploadWarnings.length ? { warning: uploadWarnings.join("; ") } : {}),
         ...(settleInfo ? { settledMs: settleInfo.settledMs, settled: settleInfo.settled, ...(settleInfo.waitFor ? { waitFor: settleInfo.waitFor } : {}) } : {}),
       },
     });

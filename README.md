@@ -488,6 +488,7 @@ cda send OfficePC click current '{"backendNodeId":4211}' --field "clickDesc,sett
 ```
 
 - 闭包内拼不出稳定选择器（浏览器不暴露路径），所以这类条目只有 `backendNodeId`——把「枚举 → 核对 → 量矩形 → 下手」串成闭环，全程不碰坐标也不碰截图
+- 能用 `backendNodeId` 的就是上面这五个命令；`type` / `keyboard` / `trigger` / `upload_*` 传它会**明确报错**（它们需要选择器才能定位输入对象，闭包内给不出——报错好过静默不做事）、open shadow root 内的元素请改用 `>>>` 选择器
 - `get_rect` 对普通查询也会自动兜底到闭包内：页面内通道全 frame 都报「没有」时会重查协议层
 - 穿透覆盖顶层 frame 与**同源** iframe；跨域 OOPIF 内的闭包当前未覆盖，此时按 `not-found` 处理并在脚本里核对 `hit`
 - **html 默认包含 shadow 内容**：`get_page_info --field html` 中 open shadow root 以内联 `<template shadowrootmode="open">` 出现在宿主元素里；无 shadow 的页面输出与之前完全一致，**closed 的不在其中**（浏览器不暴露其内容）
@@ -545,7 +546,7 @@ cda send OfficePC click current '{"backendNodeId":4211}' --field "clickDesc,sett
 | `get_js_errors` | `{ errors: [{message, source, lineno}], count }` |
 | `close_tab` | `{ success: true, data: { tabId } }` |
 | `list_tabs` | `[{ id, title, url, active }]` |
-| `real_click` | 在 click 的基础上多 `hit`（实际命中 `{tag, class, text, backendNodeId, inClosedShadowRoot}`）、`hitUnavailable?`、`x`/`y`、`navigated`、`settledMs` |
+| `real_click` | 在 click 的基础上多 `hit`（实际命中 `{tag, class, text, backendNodeId, inClosedShadowRoot}`）、`hitUnavailable?`、`warning?`（非致命步骤没走完，如窗口激活超时）、`x`/`y`、`navigated`、`settledMs` |
 | `screenshot` | 本地保存 PNG，打印 JSON：`{ path, bytes, imagePx, viewportCss, dpr, scale, chromeInsetCss, scrollCss, mapping, viewportSource }`（`viewportCss` 由图像尺寸反推，故 `imagePx.w / dpr === viewportCss.w` 恒成立、`chromeInsetCss` 恒为 0——截图与视口严格 1:1，不含浏览器 UI；两轴对不上会在 `warning` 里如实报告，图没拿到则 CLI 报错退出，不会静默什么都没写） |
 
 ---

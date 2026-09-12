@@ -323,7 +323,7 @@ cda send OfficePC get_rect current '{"backendNodeId":4211}' --field "centerCss,c
 cda send OfficePC click current '{"backendNodeId":4211}' --field "clickDesc,settledMs"
 ```
 
-A closed root exposes no stable path, so such items have no `selector` — the `backendNodeId` forms an "enumerate → verify → measure → act" loop that touches neither coordinates nor screenshots. `get_rect` also falls back to closed roots automatically for ordinary queries when every in-page channel reports "not found". Piercing covers the top frame plus **same-origin** iframes; closed roots inside cross-origin OOPIFs are not covered yet (they surface as `not-found`, so assert on `hit` in that case). `get_page_info --field html` includes shadow content by default — open roots appear inline as `<template shadowrootmode="open">` inside their hosts, **closed ones do not** (browsers don't expose their content); pages without shadow DOM output exactly as before.
+A closed root exposes no stable path, so such items have no `selector` — the `backendNodeId` forms an "enumerate → verify → measure → act" loop that touches neither coordinates nor screenshots. Those five commands are the whole list: `type` / `keyboard` / `trigger` / `upload_*` **reject** `backendNodeId` with an explicit error (they need a selector to address the target, and a closed root has none — an error beats a silent no-op); for an **open** shadow root, use a `>>>` selector instead. `get_rect` also falls back to closed roots automatically for ordinary queries when every in-page channel reports "not found". Piercing covers the top frame plus **same-origin** iframes; closed roots inside cross-origin OOPIFs are not covered yet (they surface as `not-found`, so assert on `hit` in that case). `get_page_info --field html` includes shadow content by default — open roots appear inline as `<template shadowrootmode="open">` inside their hosts, **closed ones do not** (browsers don't expose their content); pages without shadow DOM output exactly as before.
 
 ### Params for the other commands
 
@@ -492,7 +492,7 @@ Cross-origin iframes expose only `src` and `sameOrigin: false`; same-origin ones
 | `get_js_errors` | `{ errors: [{message, source, lineno}], count }` |
 | `close_tab` | `{ success: true, data: { tabId } }` |
 | `list_tabs` | `[{ id, title, url, active }]` |
-| `real_click` | on top of `click`, adds `hit` (actual target `{tag, class, text, backendNodeId, inClosedShadowRoot}`), `hitUnavailable?`, `x`/`y`, `navigated`, `settledMs` |
+| `real_click` | on top of `click`, adds `hit` (actual target `{tag, class, text, backendNodeId, inClosedShadowRoot}`), `hitUnavailable?`, `warning?` (a non-fatal step did not complete, e.g. the window could not be focused), `x`/`y`, `navigated`, `settledMs` |
 | `screenshot` | saves a local PNG and prints JSON: `{ path, bytes, imagePx, viewportCss, dpr, scale, chromeInsetCss, scrollCss, mapping, viewportSource }` (`viewportCss` is derived from the image, so `imagePx.w / dpr === viewportCss.w` always holds and `chromeInsetCss` is always `{0,0}` — the capture is strictly 1:1 with the viewport, no browser UI; a mismatch on either axis is reported truthfully in `warning`, and a missing image makes the CLI exit with an error rather than silently writing nothing) |
 
 ---
