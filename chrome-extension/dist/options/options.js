@@ -1,5 +1,8 @@
 "use strict";
 (() => {
+  // src/ws/client.ts
+  var DEFAULT_SERVER_URL = "ws://127.0.0.1:12345";
+
   // src/options/options.ts
   var el = (id) => document.getElementById(id);
   var nodeNameInput = el("nodeName");
@@ -17,7 +20,7 @@
   async function init() {
     const result = await chrome.storage.local.get(["nodeName", "serverUrl", "autoConnect", "allowExec"]);
     nodeNameInput.value = result.nodeName || "";
-    serverUrlInput.value = result.serverUrl || "";
+    serverUrlInput.value = result.serverUrl || DEFAULT_SERVER_URL;
     autoConnect = result.autoConnect ?? true;
     updateToggleUI();
     allowExec = result.allowExec ?? false;

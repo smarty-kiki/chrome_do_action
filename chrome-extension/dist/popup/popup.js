@@ -1,5 +1,8 @@
 "use strict";
 (() => {
+  // src/ws/client.ts
+  var DEFAULT_SERVER_URL = "ws://127.0.0.1:12345";
+
   // src/popup/popup.ts
   var el = (id) => document.getElementById(id);
   var statusDot = el("statusDot");
@@ -14,7 +17,7 @@
   async function loadConfig() {
     const result = await chrome.storage.local.get(["nodeName", "serverUrl"]);
     nodeNameInput.value = result.nodeName || "";
-    serverUrlInput.value = result.serverUrl || "";
+    serverUrlInput.value = result.serverUrl || DEFAULT_SERVER_URL;
   }
   function updateUI(data) {
     statusDot.className = "dot " + data.status;

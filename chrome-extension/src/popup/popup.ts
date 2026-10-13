@@ -1,4 +1,5 @@
 import type { WsClient, ConnectionStatus } from "../ws/client";
+import { DEFAULT_SERVER_URL } from "../ws/client";
 
 const el = (id: string) => document.getElementById(id)!;
 
@@ -19,7 +20,7 @@ async function loadConfig() {
     serverUrl?: string;
   };
   nodeNameInput.value = result.nodeName || "";
-  serverUrlInput.value = result.serverUrl || "";
+  serverUrlInput.value = result.serverUrl || DEFAULT_SERVER_URL;
 }
 
 function updateUI(data: { status: string; retry?: { retryCount: number; maxRetries: number; nextRetryAt: number | null; retryIntervalMs: number } }) {

@@ -1,4 +1,5 @@
 import type { WsClient, ConnectionStatus } from "../ws/client";
+import { DEFAULT_SERVER_URL } from "../ws/client";
 
 const el = (id: string) => document.getElementById(id)!;
 
@@ -24,7 +25,7 @@ async function init() {
     allowExec?: boolean;
   };
   nodeNameInput.value = result.nodeName || "";
-  serverUrlInput.value = result.serverUrl || "";
+  serverUrlInput.value = result.serverUrl || DEFAULT_SERVER_URL;
   autoConnect = result.autoConnect ?? true;
   updateToggleUI();
   allowExec = result.allowExec ?? false;

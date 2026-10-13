@@ -14,6 +14,9 @@ const DEFAULT_OPTIONS: ReconnectOptions = {
   retryIntervalMs: 15000,
 };
 
+// 插件侧默认服务端地址，与 CLI 的 --server 默认值保持一致
+export const DEFAULT_SERVER_URL = "ws://127.0.0.1:12345";
+
 export interface RetryState {
   retryCount: number;
   maxRetries: number;

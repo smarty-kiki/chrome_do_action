@@ -5,6 +5,7 @@
     maxRetries: 3,
     retryIntervalMs: 15e3
   };
+  var DEFAULT_SERVER_URL = "ws://127.0.0.1:12345";
   var WsClient = class {
     constructor(options) {
       this.ws = null;
@@ -1212,7 +1213,7 @@
     if (!result.nodeName && !result.serverUrl) {
       await chrome.storage.local.set({
         nodeName: "",
-        serverUrl: "",
+        serverUrl: DEFAULT_SERVER_URL,
         autoConnect: true,
         allowExec: false
         // exec 高风险能力：默认关闭，仅在配置页显式勾选后可用

@@ -1,4 +1,4 @@
-import { WsClient, ConnectionStatus } from "../ws/client";
+import { WsClient, ConnectionStatus, DEFAULT_SERVER_URL } from "../ws/client";
 import type { Message, CommandMessage } from "../ws/types";
 import {
   attachDebugger,
@@ -589,7 +589,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   if (!result.nodeName && !result.serverUrl) {
     await chrome.storage.local.set({
       nodeName: "",
-      serverUrl: "",
+      serverUrl: DEFAULT_SERVER_URL,
       autoConnect: true,
       allowExec: false, // exec 高风险能力：默认关闭，仅在配置页显式勾选后可用
     });
